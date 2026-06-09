@@ -7,12 +7,23 @@ OptiTrack (Motive / NatNet) + NanoVNA / JNCRadio VNA-3G 同期計測スクリプ
 USB シリアル接続された NanoVNA(JNCRadio VNA-3G)から特定単一周波数の S11 を
 連続取得し、両者を同期して CSV に保存する。
 
-- OptiTrack: 高速更新（〜100-360Hz）。コールバックで「最新座標」を更新し続ける。
-- NanoVNA : 低速取得（1点 数十〜数百ms）。1点取れるたびにその瞬間の最新座標を
-            紐付けて CSV へ1行書き込む。
+計測対象は腕に配置した 3 つのリジッドボディ:
+  1. 上腕   (Upper Arm)
+  2. 関節   (Joint / 肘など)
+  3. 前腕   (Forearm)
+それぞれの [X, Y, Z] 座標を同時に取得し、S11 と紐付けて 1 行に記録する。
+
+- OptiTrack: 高速更新（〜100-360Hz）。コールバックで 3 点の「最新座標」を更新し続ける。
+- NanoVNA : 低速取得（1点 数十〜数百ms）。1点取れるたびにその瞬間の 3 点(計9値)の
+            最新座標をまとめて紐付け、CSV へ1行書き込む。
 - 速度差を吸収するためマルチスレッド + threading.Lock でスレッド安全に共有する。
 
-CSV ヘッダー: [Timestamp, Marker_X, Marker_Y, Marker_Z, S11_Real, S11_Imag, Z_R, Z_X]
+CSV ヘッダー:
+  [Timestamp,
+   UpperArm_X, UpperArm_Y, UpperArm_Z,
+   Joint_X,    Joint_Y,    Joint_Z,
+   Forearm_X,  Forearm_Y,  Forearm_Z,
+   S11_Real, S11_Imag, Z_R, Z_X]
 """
 
 import csv
@@ -38,43 +49,69 @@ Z0             = 50.0          # 特性インピーダンス [Ω]
 # --- OptiTrack (NatNet) ---
 NATNET_SERVER_IP = "127.0.0.1"  # 同一PCなので localhost
 NATNET_LOCAL_IP  = "127.0.0.1"  # 同一PCなので localhost
-TARGET_RIGID_BODY_ID = 1        # Motive 側で割り当てたリジッドボディの Streaming ID
+
+# 計測する 3 点のリジッドボディ Streaming ID(Motive 側の設定に合わせて変更)
+UPPER_ARM_ID = 1   # 上腕   (Upper Arm)
+JOINT_ID     = 2   # 関節   (Joint / 肘など)
+FOREARM_ID   = 3   # 前腕   (Forearm)
+
+# 内部処理で使う論理名 -> ID の対応表(ID からどの部位か逆引きする)
+BODY_IDS = {
+    "UpperArm": UPPER_ARM_ID,
+    "Joint":    JOINT_ID,
+    "Forearm":  FOREARM_ID,
+}
+# ID -> 論理名(コールバックでの逆引き用)
+_ID_TO_NAME = {bid: name for name, bid in BODY_IDS.items()}
 
 # --- 出力 ---
 OUTPUT_CSV = "sync_dataset.csv"
-CSV_HEADER = ["Timestamp", "Marker_X", "Marker_Y", "Marker_Z",
+CSV_HEADER = ["Timestamp",
+              "UpperArm_X", "UpperArm_Y", "UpperArm_Z",
+              "Joint_X",    "Joint_Y",    "Joint_Z",
+              "Forearm_X",  "Forearm_Y",  "Forearm_Z",
               "S11_Real", "S11_Imag", "Z_R", "Z_X"]
 
 
 # =============================================================================
-# スレッド間共有: 最新の OptiTrack 座標
+# スレッド間共有: 3 点の最新 OptiTrack 座標
 # =============================================================================
 
 # Lock で保護される共有状態。NatNet コールバック(書き込み)と
 # NanoVNA ループ(読み出し)の双方からアクセスされる。
+# 各部位ごとに {x, y, z, valid} を保持する。
 _pos_lock = threading.Lock()
-_latest_position = {"x": None, "y": None, "z": None, "valid": False}
+_latest_positions = {
+    "UpperArm": {"x": None, "y": None, "z": None, "valid": False},
+    "Joint":    {"x": None, "y": None, "z": None, "valid": False},
+    "Forearm":  {"x": None, "y": None, "z": None, "valid": False},
+}
 
 # 全スレッド共通の停止フラグ
 _stop_event = threading.Event()
 
 
-def update_latest_position(x, y, z):
-    """NatNet コールバックから呼ばれ、最新座標をスレッド安全に更新する。"""
+def update_latest_position(name, x, y, z):
+    """NatNet コールバックから呼ばれ、指定部位の最新座標をスレッド安全に更新する。"""
     with _pos_lock:
-        _latest_position["x"] = x
-        _latest_position["y"] = y
-        _latest_position["z"] = z
-        _latest_position["valid"] = True
+        slot = _latest_positions[name]
+        slot["x"] = x
+        slot["y"] = y
+        slot["z"] = z
+        slot["valid"] = True
 
 
-def read_latest_position():
-    """NanoVNA ループから呼ばれ、最新座標のスナップショットを取得する。"""
+def read_latest_positions():
+    """
+    NanoVNA ループから呼ばれ、3 点すべての最新座標のスナップショットを
+    まとめて(同一ロック下で)取得する。
+    戻り値: {"UpperArm": (x,y,z,valid), "Joint": (...), "Forearm": (...)}
+    """
+    snapshot = {}
     with _pos_lock:
-        return (_latest_position["x"],
-                _latest_position["y"],
-                _latest_position["z"],
-                _latest_position["valid"])
+        for name, slot in _latest_positions.items():
+            snapshot[name] = (slot["x"], slot["y"], slot["z"], slot["valid"])
+    return snapshot
 
 
 # =============================================================================
@@ -239,12 +276,14 @@ def start_natnet():
     def rigid_body_listener(new_id, position, rotation):
         """
         Motive から各リジッドボディの姿勢が届くたびに呼ばれる。
-        position は (x, y, z)[m]。対象IDのみ最新座標を更新する。
+        position は (x, y, z)[m]。届いた ID が計測対象 3 点
+        (上腕/関節/前腕)のいずれかであれば、その部位の最新座標を更新する。
         """
-        if new_id != TARGET_RIGID_BODY_ID:
-            return
+        name = _ID_TO_NAME.get(new_id)
+        if name is None:
+            return  # 計測対象外の剛体は無視
         x, y, z = position[0], position[1], position[2]
-        update_latest_position(x, y, z)
+        update_latest_position(name, x, y, z)
 
     # SDK バージョンによりコールバック登録方法が異なる
     if hasattr(client, "rigid_body_listener"):
@@ -290,16 +329,22 @@ def main():
     if natnet_client is None:
         print("[WARN] OptiTrack なしで続行します(座標列は空欄になります)。")
 
-    # OptiTrack の初回データ到着を少し待つ
+    print("[INFO] 計測対象 ID -> UpperArm={}, Joint={}, Forearm={}".format(
+        UPPER_ARM_ID, JOINT_ID, FOREARM_ID))
+
+    # OptiTrack の初回データ到着を少し待つ(3 点すべての受信を確認)
     for _ in range(50):
-        _, _, _, valid = read_latest_position()
-        if valid:
-            print("[INFO] OptiTrack 初期データ受信 OK。")
+        snap = read_latest_positions()
+        if all(snap[n][3] for n in ("UpperArm", "Joint", "Forearm")):
+            print("[INFO] OptiTrack 初期データ受信 OK(3点すべて)。")
             break
         time.sleep(0.1)
     else:
         if natnet_client is not None:
-            print("[WARN] OptiTrack の初期データが届きません。リジッドボディ ID/トラッキング状態を確認してください。")
+            snap = read_latest_positions()
+            missing = [n for n in ("UpperArm", "Joint", "Forearm") if not snap[n][3]]
+            print("[WARN] OptiTrack の初期データが未受信の部位があります: {}".format(missing))
+            print("       リジッドボディ ID/トラッキング状態を確認してください。")
 
     # --- CSV 準備 & 計測ループ ---
     sample_count = 0
@@ -317,33 +362,47 @@ def main():
                     print("[WARN] S11 のパースに失敗。スキップします。")
                     continue
 
-                # 2) 取得が完了した「その瞬間」の最新 OptiTrack 座標を紐付け
-                x, y, z, valid = read_latest_position()
+                # 2) 取得が完了した「その瞬間」の 3 点(計9値)の最新座標を
+                #    まとめてスナップショット取得(同一ロック下で一括取得)
+                snap = read_latest_positions()
 
                 # 3) インピーダンス計算
                 z_r, z_x = s11_to_impedance(s11, Z0)
 
-                # 4) CSV へ1行書き込み
+                # 4) CSV へ1行書き込み(3点の座標 + S11 + Z をガッチャンコ)
                 ts = datetime.now().isoformat(timespec="milliseconds")
-                writer.writerow([
-                    ts,
-                    "" if not valid else "{:.6f}".format(x),
-                    "" if not valid else "{:.6f}".format(y),
-                    "" if not valid else "{:.6f}".format(z),
-                    "{:.6f}".format(s11.real),
-                    "{:.6f}".format(s11.imag),
-                    "{:.4f}".format(z_r),
-                    "{:.4f}".format(z_x),
-                ])
+
+                def fmt(name):
+                    """部位の (x,y,z) を CSV セル 3 個へ整形。未受信なら空欄。"""
+                    x, y, z, valid = snap[name]
+                    if not valid:
+                        return ["", "", ""]
+                    return ["{:.6f}".format(x), "{:.6f}".format(y), "{:.6f}".format(z)]
+
+                writer.writerow(
+                    [ts]
+                    + fmt("UpperArm")
+                    + fmt("Joint")
+                    + fmt("Forearm")
+                    + [
+                        "{:.6f}".format(s11.real),
+                        "{:.6f}".format(s11.imag),
+                        "{:.4f}".format(z_r),
+                        "{:.4f}".format(z_x),
+                    ]
+                )
                 f.flush()  # 計測中に随時保存(途中でクラッシュしてもデータを残す)
 
                 sample_count += 1
                 if sample_count % 10 == 0:
-                    print("[{:5d}] X={} Y={} Z={} | S11=({:.4f},{:.4f}) Z=({:.2f}{:+.2f}j)Ω".format(
+                    def short(name):
+                        x, y, z, valid = snap[name]
+                        if not valid:
+                            return "(----,----,----)"
+                        return "({:.2f},{:.2f},{:.2f})".format(x, y, z)
+                    print("[{:5d}] UA={} J={} FA={} | S11=({:.4f},{:.4f}) Z=({:.2f}{:+.2f}j)Ω".format(
                         sample_count,
-                        "----" if not valid else "{:.3f}".format(x),
-                        "----" if not valid else "{:.3f}".format(y),
-                        "----" if not valid else "{:.3f}".format(z),
+                        short("UpperArm"), short("Joint"), short("Forearm"),
                         s11.real, s11.imag, z_r, z_x))
 
     except KeyboardInterrupt:
