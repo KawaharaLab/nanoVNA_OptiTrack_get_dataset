@@ -7,13 +7,18 @@ OptiTrack (Motive / NatNet) + NanoVNA / JNCRadio VNA-3G 同期計測スクリプ
 USB シリアル接続された NanoVNA(JNCRadio VNA-3G)から特定単一周波数の S11 を
 連続取得し、両者を同期して CSV に保存する。
 
-計測対象は腕に配置した 3 つのリジッドボディ:
+計測対象は腕に直接貼り付けた 3 つの「単一マーカー」(Labeled Marker):
   1. 上腕   (Upper Arm)
   2. 関節   (Joint / 肘など)
   3. 前腕   (Forearm)
-それぞれの [X, Y, Z] 座標を同時に取得し、S11 と紐付けて 1 行に記録する。
+各マーカーの中心 [X, Y, Z] 座標を同時に取得し、S11 と紐付けて 1 行に記録する。
 
-- OptiTrack: 高速更新（〜100-360Hz）。コールバックで 3 点の「最新座標」を更新し続ける。
+※ リジッドボディではなく、Motive 側で個別にラベル付けした「Labeled Markers」
+  として配信される 3 マーカーを、マーカー ID で識別して取得する。
+  (Motive 3.1.0 Beta 2 以降のラベル付きマーカー配信を想定)
+
+- OptiTrack: 高速更新（〜100-360Hz）。フレームコールバックで 3 マーカーの
+            「最新座標」を更新し続ける。
 - NanoVNA : 低速取得（1点 数十〜数百ms）。1点取れるたびにその瞬間の 3 点(計9値)の
             最新座標をまとめて紐付け、CSV へ1行書き込む。
 - 速度差を吸収するためマルチスレッド + threading.Lock でスレッド安全に共有する。
@@ -50,19 +55,32 @@ Z0             = 50.0          # 特性インピーダンス [Ω]
 NATNET_SERVER_IP = "127.0.0.1"  # 同一PCなので localhost
 NATNET_LOCAL_IP  = "127.0.0.1"  # 同一PCなので localhost
 
-# 計測する 3 点のリジッドボディ Streaming ID(Motive 側の設定に合わせて変更)
-UPPER_ARM_ID = 1   # 上腕   (Upper Arm)
-JOINT_ID     = 2   # 関節   (Joint / 肘など)
-FOREARM_ID   = 3   # 前腕   (Forearm)
+# 計測する 3 つの単一マーカー(Labeled Marker)の ID
+# Motive 側で各マーカーに割り当てたラベル ID に合わせて変更する。
+UPPER_ARM_MARKER_ID = 1   # 上腕   (Upper Arm)
+JOINT_MARKER_ID     = 2   # 関節   (Joint / 肘など)
+FOREARM_MARKER_ID   = 3   # 前腕   (Forearm)
 
-# 内部処理で使う論理名 -> ID の対応表(ID からどの部位か逆引きする)
-BODY_IDS = {
-    "UpperArm": UPPER_ARM_ID,
-    "Joint":    JOINT_ID,
-    "Forearm":  FOREARM_ID,
+# 内部処理で使う論理名 -> マーカー ID の対応表
+MARKER_IDS = {
+    "UpperArm": UPPER_ARM_MARKER_ID,
+    "Joint":    JOINT_MARKER_ID,
+    "Forearm":  FOREARM_MARKER_ID,
 }
-# ID -> 論理名(コールバックでの逆引き用)
-_ID_TO_NAME = {bid: name for name, bid in BODY_IDS.items()}
+
+
+def match_marker_name(marker_id):
+    """
+    受信した Labeled Marker の ID を、計測対象 3 マーカーのどれかに突き合わせる。
+    NatNet の Labeled Marker ID は、アセットに属する場合 (model_id<<16 | member_id)
+    の合成値になることがあるため、生の ID と下位 16bit の両方で照合する。
+    一致しなければ None を返す。
+    """
+    low16 = marker_id & 0xFFFF
+    for name, target in MARKER_IDS.items():
+        if marker_id == target or low16 == target:
+            return name
+    return None
 
 # --- 出力 ---
 OUTPUT_CSV = "sync_dataset.csv"
@@ -246,11 +264,67 @@ class NanoVNA:
 # OptiTrack / NatNet スレッド
 # =============================================================================
 
+def _extract_marker_id_pos(marker):
+    """
+    1 個の Labeled Marker オブジェクト/タプルから (marker_id, x, y, z) を取り出す。
+    NatNet SDK のバージョン差(LabeledMarker クラス属性 / 生タプル)を吸収する。
+    取り出せない場合は None を返す。
+    """
+    # --- オブジェクト形式 (MoCapData.LabeledMarker など) ---
+    pos = getattr(marker, "pos", None)
+    mid = None
+    for attr in ("id_num", "marker_id", "id"):
+        if hasattr(marker, attr):
+            mid = getattr(marker, attr)
+            break
+    if pos is not None and mid is not None and len(pos) >= 3:
+        return int(mid), float(pos[0]), float(pos[1]), float(pos[2])
+
+    # --- タプル/リスト形式: (id, x, y, z, ...) を想定 ---
+    try:
+        if len(marker) >= 4:
+            return int(marker[0]), float(marker[1]), float(marker[2]), float(marker[3])
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def process_labeled_markers(markers):
+    """
+    Labeled Marker のリストを走査し、計測対象 3 マーカー(上腕/関節/前腕)の
+    最新座標をスレッド安全に更新する。
+    markers: LabeledMarker オブジェクト、または (id, x, y, z) タプルの反復可能
+    """
+    if not markers:
+        return
+    for m in markers:
+        parsed = _extract_marker_id_pos(m)
+        if parsed is None:
+            continue
+        marker_id, x, y, z = parsed
+        name = match_marker_name(marker_id)
+        if name is None:
+            continue  # 計測対象外のマーカーは無視
+        update_latest_position(name, x, y, z)
+
+
+def _markers_from_mocap(mocap_data):
+    """MoCapData オブジェクトから Labeled Marker のリストを取り出す(SDK差吸収)。"""
+    lm = getattr(mocap_data, "labeled_marker_data", None)
+    if lm is None:
+        return None
+    for attr in ("labeled_marker_list", "marker_list", "markers"):
+        lst = getattr(lm, attr, None)
+        if lst is not None:
+            return lst
+    return None
+
+
 def start_natnet():
     """
-    NatNetClient を起動し、リジッドボディ受信コールバックを登録する。
-    成功すると streaming_client を返す。NatNet SDK の Python サンプル
-    (NatNetClient.py) が import パス上にある必要がある。
+    NatNetClient を起動し、Labeled Marker(ラベル付きマーカー)受信コールバックを
+    登録する。成功すると streaming_client を返す。NatNet SDK の Python サンプル
+    (NatNetClient.py / MoCapData.py 等) が import パス上にある必要がある。
     """
     try:
         from NatNetClient import NatNetClient
@@ -272,26 +346,54 @@ def start_natnet():
         client.local_ip_address = NATNET_LOCAL_IP
         client.server_ip_address = NATNET_SERVER_IP
 
-    # --- リジッドボディ受信コールバック ---
-    def rigid_body_listener(new_id, position, rotation):
+    # --- フレーム受信コールバック(MoCapData 付き) ---
+    def on_frame_with_data(*args):
         """
-        Motive から各リジッドボディの姿勢が届くたびに呼ばれる。
-        position は (x, y, z)[m]。届いた ID が計測対象 3 点
-        (上腕/関節/前腕)のいずれかであれば、その部位の最新座標を更新する。
+        1 フレーム届くたびに呼ばれる。引数に含まれる MoCapData から
+        Labeled Marker のリストを取り出して処理する。
+        SDK により署名が (data_dict, mocap_data) などと異なるため、
+        引数群から MoCapData らしきものを探して使う。
         """
-        name = _ID_TO_NAME.get(new_id)
-        if name is None:
-            return  # 計測対象外の剛体は無視
-        x, y, z = position[0], position[1], position[2]
-        update_latest_position(name, x, y, z)
+        mocap = None
+        for a in args:
+            if hasattr(a, "labeled_marker_data"):
+                mocap = a
+                break
+        if mocap is None:
+            return
+        markers = _markers_from_mocap(mocap)
+        process_labeled_markers(markers)
 
-    # SDK バージョンによりコールバック登録方法が異なる
-    if hasattr(client, "rigid_body_listener"):
-        client.rigid_body_listener = rigid_body_listener
-    elif hasattr(client, "set_rigid_body_listener"):
-        client.set_rigid_body_listener(rigid_body_listener)
-    else:
-        print("[WARN] rigid_body_listener を登録できませんでした。SDK 版を確認してください。")
+    # 一部の SDK/フォークは Labeled Marker 専用 listener を持つ
+    def on_labeled_markers(markers, *_):
+        process_labeled_markers(markers)
+
+    # --- コールバック登録(SDK バージョン差を吸収) ---
+    registered = False
+    # 1) MoCapData を渡してくれる listener を最優先
+    for attr in ("new_frame_with_data_listener",
+                 "labeled_marker_listener",
+                 "marker_set_listener"):
+        if hasattr(client, attr):
+            if attr == "labeled_marker_listener":
+                setattr(client, attr, on_labeled_markers)
+            else:
+                setattr(client, attr, on_frame_with_data)
+            registered = True
+            print("[INFO] Labeled Marker コールバックを '{}' に登録しました。".format(attr))
+            break
+
+    if not registered:
+        # 2) フォールバック: 通常の new_frame_listener。
+        #    ※ 標準 SDK の new_frame_listener は集計値のみで座標を含まない場合があります。
+        #    その場合は NatNetClient 側の改造、または MoCapData を渡す listener が必要です。
+        if hasattr(client, "new_frame_listener"):
+            client.new_frame_listener = on_frame_with_data
+            print("[WARN] new_frame_with_data_listener が見つからないため new_frame_listener を使用します。")
+            print("       マーカー座標が取得できない場合は、お使いの NatNetClient が")
+            print("       MoCapData をコールバックに渡す実装か確認してください。")
+        else:
+            print("[WARN] Labeled Marker 用コールバックを登録できませんでした。SDK 版を確認してください。")
 
     # --- 受信開始 ---
     started = False
@@ -329,22 +431,22 @@ def main():
     if natnet_client is None:
         print("[WARN] OptiTrack なしで続行します(座標列は空欄になります)。")
 
-    print("[INFO] 計測対象 ID -> UpperArm={}, Joint={}, Forearm={}".format(
-        UPPER_ARM_ID, JOINT_ID, FOREARM_ID))
+    print("[INFO] 計測対象マーカー ID -> UpperArm={}, Joint={}, Forearm={}".format(
+        UPPER_ARM_MARKER_ID, JOINT_MARKER_ID, FOREARM_MARKER_ID))
 
-    # OptiTrack の初回データ到着を少し待つ(3 点すべての受信を確認)
+    # OptiTrack の初回データ到着を少し待つ(3 マーカーすべての受信を確認)
     for _ in range(50):
         snap = read_latest_positions()
         if all(snap[n][3] for n in ("UpperArm", "Joint", "Forearm")):
-            print("[INFO] OptiTrack 初期データ受信 OK(3点すべて)。")
+            print("[INFO] OptiTrack 初期データ受信 OK(3マーカーすべて)。")
             break
         time.sleep(0.1)
     else:
         if natnet_client is not None:
             snap = read_latest_positions()
             missing = [n for n in ("UpperArm", "Joint", "Forearm") if not snap[n][3]]
-            print("[WARN] OptiTrack の初期データが未受信の部位があります: {}".format(missing))
-            print("       リジッドボディ ID/トラッキング状態を確認してください。")
+            print("[WARN] OptiTrack の初期データが未受信のマーカーがあります: {}".format(missing))
+            print("       マーカー ID/ラベル付け/トラッキング状態を確認してください。")
 
     # --- CSV 準備 & 計測ループ ---
     sample_count = 0
