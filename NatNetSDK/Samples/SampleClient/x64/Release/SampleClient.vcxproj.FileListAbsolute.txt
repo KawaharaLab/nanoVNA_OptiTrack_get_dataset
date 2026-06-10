@@ -1,0 +1,1 @@
+M:\.jenkins\workspace\Npoint_Git\NatNetSDK\apps\NatNet\NatNetSDK\Samples\SampleClient\x64\Release\SampleClient.vcxproj.AssemblyReference.cache
