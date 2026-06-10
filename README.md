@@ -91,28 +91,38 @@ pip install pyserial pandas numpy
 
 ### 2.2 `NatNetClient.py` の配置（重要）
 
-OptiTrack との通信には、OptiTrack が公式に配布する **NatNet SDK 同梱の Python サンプル `NatNetClient.py`** を使用します。これは `pip` では入手できません。
+OptiTrack との通信には、OptiTrack が公式に配布する **NatNet SDK 同梱の Python サンプル `NatNetClient.py`** を使用します。これは `pip` では入手できません。本スクリプトは以下の **2 箇所のいずれか**に SDK ファイルがあれば自動で読み込みます（`sys.path` に自動追加）。
 
-1. OptiTrack 公式サイト（または Motive インストールフォルダ）から **NatNet SDK** をダウンロードします。
-2. SDK 内の `Samples/PythonClient/` フォルダに含まれる以下のファイル群を、**本リポジトリの計測スクリプト（`sync_optitrack_nanovna.py`）と同じフォルダ**にコピーします。
+- **(A) 同梱 SDK をそのまま使う場合:** リポジトリ内の `./NatNetSDK/Samples/PythonClient/` に `NatNetClient.py` 等が置かれていれば、追加作業は不要です。
+- **(B) 手動配置する場合:** OptiTrack 公式サイト（または Motive インストールフォルダ）から **NatNet SDK** を入手し、以下のファイルを **本体スクリプトと同じフォルダ**にコピーします。
+  - `NatNetClient.py`（必須）
+  - `MoCapData.py`（**必須**。Labeled Marker のデータ構造を解釈するために使用します）
+  - `DataDescriptions.py`（**必須**。`NatNetClient.py` が内部で import します）
 
-   - `NatNetClient.py`（必須）
-   - `MoCapData.py`（**必須**。Labeled Marker のデータ構造を解釈するために使用します）
-   - `DataDescriptions.py`（同梱されている場合は併せて配置）
-
-最終的なフォルダ構成は以下のようになります。
+想定するフォルダ構成は以下のいずれかです。
 
 ```
+# (A) 同梱 SDK 構成（このリポジトリの構成）
 nanoVNA_OptiTrack_get_dataset/
-├── sync_optitrack_nanovna.py     ← 本体スクリプト
-├── NatNetClient.py               ← OptiTrack SDK からコピー
-├── MoCapData.py                  ← OptiTrack SDK からコピー（Labeled Marker 解釈に必須）
-├── DataDescriptions.py           ← （同梱されていれば）
+├── sync_optitrack_nanovna.py
 ├── README.md
-└── sync_dataset.csv              ← 実行後に自動生成される出力
+└── NatNetSDK/
+    └── Samples/
+        └── PythonClient/
+            ├── NatNetClient.py
+            ├── MoCapData.py
+            └── DataDescriptions.py
+
+# (B) 手動配置構成
+nanoVNA_OptiTrack_get_dataset/
+├── sync_optitrack_nanovna.py
+├── NatNetClient.py
+├── MoCapData.py
+├── DataDescriptions.py
+└── README.md
 ```
 
-> **注意:** `NatNetClient.py` の API は SDK のバージョンによって細部が異なります。本スクリプトは複数のコールバック登録方法（`new_frame_with_data_listener` / `labeled_marker_listener` / `new_frame_listener`、`run("d")` / `run()` など）に自動対応していますが、**Labeled Marker の座標を取得するには、コールバックに `MoCapData` オブジェクトが渡される実装の NatNetClient が必要**です。標準サンプルの `new_frame_listener` が集計値のみで座標を含まない版の場合は、後述のトラブルシューティングを参照してください。
+> **対応バージョン:** 本スクリプトは **NatNet 4.x（Motive 3.1 系）** の `NatNetClient.py` に合わせて実装しています。具体的には `new_frame_with_data_listener`（`data_dict["mocap_data"]` に `MoCapData` を渡す）を使用してラベル付きマーカー座標を取得します。Assets/Labeled Marker は Motive 3.1 / NatNet 4.1 以降でサポートされます。
 
 ---
 
@@ -133,12 +143,14 @@ Motive を起動し、キャプチャ空間のキャリブレーションを済�
    - 例: `UpperArm`, `Joint`, `Forearm` のように、部位が分かる名前を付けます。
    - ラベル付けには、Motive のマーカーラベリング機能（手動ラベリング、または Active Marker のラベル付与など）を使用します。これにより各マーカーが安定した ID を持つ Labeled Marker として配信されます。
 3. 各マーカーの **識別子（マーカー ID）** を **3 個それぞれについて控えます**。
-   - この 3 つの ID を、後述のスクリプト定数 `UPPER_ARM_MARKER_ID` / `JOINT_MARKER_ID` / `FOREARM_MARKER_ID` に正しく反映させます。
+   - この 3 つの ID を、後述のスクリプト定数 `UPPER_ARM_ID` / `JOINT_ID` / `FOREARM_ID` に正しく反映させます。
    - **ID と部位の対応を取り違えると、座標が別の部位の列に記録されてしまう**ため、必ず一つずつ確認してください。
+
+> **ヒント（ID が分からないとき）:** スクリプト冒頭の定数 `DEBUG_PRINT_MARKER_IDS = True` に設定して実行すると、受信中の全ラベル付きマーカーの ID（`id_num` / `model` / `marker`）が 1 秒ごとにコンソールへ出力されます。1 個ずつマーカーを動かす・隠すなどして、どの ID がどの部位かを特定してから、`UPPER_ARM_ID` 等に反映させると確実です。
 
 > **ヒント:** マーカーに安定したラベル ID が付いていないと、毎フレーム ID が変わってしまい識別できません。ラベルが固定されること（フレーム間で同じマーカーに同じ ID が割り当てられること）を必ず確認してください。
 
-> **補足（ID の照合について）:** NatNet が配信する Labeled Marker の ID は、アセットに属する場合に `(モデルID << 16) | メンバーID` の合成値になることがあります。本スクリプトは生の ID と下位 16 bit の両方で照合するため、どちらの形式でも一致を検出できます。
+> **補足（ID の照合について）:** NatNet が配信する Labeled Marker の `id_num` は、アセットに属する場合 `(モデルID << 16) | マーカーID` の合成値になります。本スクリプトは生の `id_num` と下位 16 bit（= マーカーID）の両方で照合するため、どちらの形式でも一致を検出できます。`DEBUG_PRINT_MARKER_IDS` のログに表示される `marker=` の値を定数に設定すれば確実です。
 
 #### (b) Data Streaming の設定
 
@@ -197,11 +209,16 @@ Z0             = 50.0          # 特性インピーダンス [Ω]（通常は 50
 # --- OptiTrack (NatNet) ---
 NATNET_SERVER_IP = "127.0.0.1"  # 同一PCなので localhost（通常は変更不要）
 NATNET_LOCAL_IP  = "127.0.0.1"  # 同一PCなので localhost（通常は変更不要）
+NATNET_USE_MULTICAST = False    # 同一PCループバックは Unicast 推奨（通常は変更不要）
 
 # 計測する 3 個の単一マーカー（Labeled Marker）の ID（Motive の設定に合わせて変更）
-UPPER_ARM_MARKER_ID = 1   # ← 上腕   (Upper Arm) のマーカー ID
-JOINT_MARKER_ID     = 2   # ← 関節   (Joint)     のマーカー ID
-FOREARM_MARKER_ID   = 3   # ← 前腕   (Forearm)   のマーカー ID
+UPPER_ARM_ID = 1   # ← 上腕   (Upper Arm) のマーカー ID
+JOINT_ID     = 2   # ← 関節   (Joint)     のマーカー ID
+FOREARM_ID   = 3   # ← 前腕   (Forearm)   のマーカー ID
+
+# True にすると受信中の全マーカー ID を出力（ID 調査用）
+DEBUG_PRINT_MARKER_IDS = False
+SKIP_OCCLUDED = True            # 隠れ（オクルージョン）中のマーカーは更新をスキップ
 
 # --- 出力 ---
 OUTPUT_CSV = "sync_dataset.csv" # 出力 CSV ファイル名（任意で変更可）
@@ -213,11 +230,11 @@ OUTPUT_CSV = "sync_dataset.csv" # 出力 CSV ファイル名（任意で変更�
 |------|---------|
 | `NANOVNA_PORT` | デバイスマネージャーで確認した COM 番号（例: `"COM5"`） |
 | `TARGET_FREQ_HZ` | 測定対象の単一周波数（Hz 単位の整数。`13_560_000` = 13.56 MHz） |
-| `UPPER_ARM_MARKER_ID` | Motive で**上腕**マーカーに割り当てたラベル ID |
-| `JOINT_MARKER_ID` | Motive で**関節**マーカーに割り当てたラベル ID |
-| `FOREARM_MARKER_ID` | Motive で**前腕**マーカーに割り当てたラベル ID |
+| `UPPER_ARM_ID` | Motive で**上腕**マーカーに割り当てたラベル ID |
+| `JOINT_ID` | Motive で**関節**マーカーに割り当てたラベル ID |
+| `FOREARM_ID` | Motive で**前腕**マーカーに割り当てたラベル ID |
 
-> **注意:** 3 つのマーカー ID と部位の対応関係が Motive 側と一致していることを必ず確認してください。対応を誤ると、あるマーカーの座標が別の部位の列に記録されてしまいます。
+> **注意:** 3 つのマーカー ID と部位の対応関係が Motive 側と一致していることを必ず確認してください。対応を誤ると、あるマーカーの座標が別の部位の列に記録されてしまいます。ID が不明な場合は `DEBUG_PRINT_MARKER_IDS = True` で実行して確認してください。
 
 ### 4.2 実行
 
@@ -230,13 +247,12 @@ python sync_optitrack_nanovna.py
 正常に起動すると、コンソールに接続状況と計測ログが表示されます。
 
 ```
-[INFO] NanoVNA 接続 OK: COM3 @ 115200bps, 13.560 MHz
-[INFO] Labeled Marker コールバックを 'new_frame_with_data_listener' に登録しました。
-[INFO] NatNet クライアント開始。Motive からのデータ受信待ち...
+[INFO] VNA 接続 OK: COM3 @ 115200bps, 13.560 MHz
+[INFO] Motive へ接続しました (server app: Motive).
 [INFO] 計測対象マーカー ID -> UpperArm=1, Joint=2, Forearm=3
 [INFO] OptiTrack 初期データ受信 OK(3マーカーすべて)。
-[INFO] 計測開始。Ctrl+C で停止します。
-[   10] UA=(0.12,1.05,-0.32) J=(0.18,0.81,-0.30) FA=(0.25,0.55,-0.28) | S11=(0.2314,-0.1502) Z=(78.21-22.13j)Ω
+[INFO] 計測開始。Ctrl+C で安全に停止します。
+[   10] UA=(0.123,1.045,0.318) J=(0.181,0.812,0.301) FA=(0.254,0.553,0.288) | S11=(0.2314,-0.1502) Z=(78.21-22.13j)Ω
 ...
 ```
 
@@ -259,7 +275,9 @@ python sync_optitrack_nanovna.py
 
 ## 5. 出力データ構造（CSV ヘッダー解説）
 
-出力ファイル（既定: `sync_dataset.csv`）は、以下の 14 カラムを持つ CSV です。位置データは **上腕・関節・前腕の 3 個の単一マーカー × (X, Y, Z) = 9 値**が含まれます。各座標は、対応する **ラベル付きマーカーの中心座標**（Motive 座標系）です。
+出力ファイル（既定: `sync_dataset.csv`）は、以下の 14 カラムを持つ CSV です。位置データは **上腕・関節・前腕の 3 個の単一マーカー × (X, Y, Z) = 9 値**が含まれます。各座標は、対応する **ラベル付きマーカーの中心座標**（**Motive 3.x 標準の Z-Up 座標系**、単位はメートル）です。
+
+> **座標系について:** 本システムは Motive で設定された配信座標系の値をそのまま記録します。Motive 3.x 標準の **Z-Up** 設定では、おおむね Z 軸が鉛直上向き、X–Y が水平面となります。解析時は Motive 側の座標系設定に合わせて軸の向きを解釈してください。
 
 | カラム名 | 意味 | 単位 |
 |----------|------|------|
@@ -314,12 +332,13 @@ Z = Z0 × (1 + S11) / (1 − S11)
 - **Local Interface が `127.0.0.1`（localhost）になっているか。** 別の NIC（有線/無線 LAN の IP）が選択されていると、ループバックでは受信できません。
 - **Transmission Type が Unicast になっているか。** 本スクリプトは Unicast 前提です。Multicast にしている場合はスクリプト側の `set_use_multicast(True)` への変更が必要です。
 - **Labeled Markers のストリーミングが ON になっているか。** Data Streaming パネルで `Labeled Markers` が無効だと、マーカー座標は配信されません。
-- **`UPPER_ARM_MARKER_ID` / `JOINT_MARKER_ID` / `FOREARM_MARKER_ID` が正しいか。** 3 つのマーカー ID が Motive 上のラベル ID と一致していないと、データは届いていてもフィルタで除外されます。起動時のログ `[INFO] 計測対象マーカー ID -> ...` と Motive 側の設定を突き合わせてください。一部のマーカーだけ ID が間違っていると、その列だけが空欄になります。
+- **Labeled Markers のストリーミングが ON か。** Data Streaming パネルで `Labeled Markers` が無効だと座標が配信されません。
+- **`UPPER_ARM_ID` / `JOINT_ID` / `FOREARM_ID` が正しいか。** 3 つのマーカー ID が Motive 上のラベル ID と一致していないと、データは届いていてもフィルタで除外されます。起動時のログ `[INFO] 計測対象マーカー ID -> ...` と Motive 側の設定を突き合わせてください。一部のマーカーだけ ID が間違っていると、その列だけが空欄になります。**`DEBUG_PRINT_MARKER_IDS = True` で実行すると、受信中の全マーカー ID が出力されるので照合に便利です。**
 - **マーカーのラベルが固定されているか。** マーカーに安定したラベル ID が付いておらず、フレームごとに ID が変動すると識別できません。Motive 側で各マーカーにラベルが固定的に割り当てられていることを確認してください。
-- **3 個のマーカーがすべて実際にトラッキングされているか。** Motive のビューでいずれかのマーカーがロスト（オクルージョン等）していないか確認してください。起動時に `[WARN] OptiTrack の初期データが未受信のマーカーがあります: [...]` と表示された場合は、そのマーカーを重点的に確認します。
-- **NatNetClient がマーカー座標をコールバックに渡す実装か。** ログに `[WARN] new_frame_with_data_listener が見つからないため...` と表示され、かつ座標が空欄のままになる場合、お使いの `NatNetClient.py` の `new_frame_listener` が集計値のみで Labeled Marker の座標を渡さない版である可能性があります。`MoCapData` をコールバックに渡す版（`new_frame_with_data_listener` を備えた版）の NatNetClient を使用するか、`NatNetClient.py` 側で Labeled Marker のリストをコールバックに渡すよう改修してください。
+- **3 個のマーカーがすべて実際にトラッキングされているか。** Motive のビューでいずれかのマーカーがロスト（オクルージョン等）していないか確認してください。起動時に `[WARN] 初期データ未受信のマーカーがあります: [...]` と表示された場合は、そのマーカーを重点的に確認します。なお `SKIP_OCCLUDED = True`（既定）では、隠れている間は座標を更新せず直前の有効値を保持します。
+- **計測中に `[WARN] OptiTrack フレームが N.Ns 途絶しています` が出る場合。** Motive のストリーミングが一時停止・切断された可能性があります。Motive が前面に出ていて描画負荷が高い、PC リソース不足、または USB/ネットワークの瞬断が原因のことがあります（§6.3 参照）。
 - **Windows ファイアウォール。** ループバック通信は通常ブロックされませんが、セキュリティソフトが UDP 通信を遮断している場合は、Python（`python.exe`）の通信を許可してください。
-- **`NatNetClient.py` / `MoCapData.py` が同フォルダにあるか。** import に失敗すると OptiTrack なしで続行され、座標は空欄になります。
+- **`NatNetClient.py` / `MoCapData.py` / `DataDescriptions.py` が読み込めるか。** これらが見つからないと import に失敗し、OptiTrack なしで続行されて座標は空欄になります。同梱の `./NatNetSDK/Samples/PythonClient/` か、本体スクリプトと同じフォルダに配置してください。
 
 ### 6.2 COM ポートが開けない場合
 

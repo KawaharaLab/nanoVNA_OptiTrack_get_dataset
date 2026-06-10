@@ -1,27 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-OptiTrack (Motive / NatNet) + NanoVNA / JNCRadio VNA-3G 同期計測スクリプト
+OptiTrack (Motive 3.1 / NatNet) + JNCRadio VNA 3G 同期計測スクリプト
 ================================================================================
 
-同一PC上で動作する Motive から NatNet 経由でリジッドボディ座標を受信しつつ、
-USB シリアル接続された NanoVNA(JNCRadio VNA-3G)から特定単一周波数の S11 を
+同一 Windows PC 上で動作する Motive から NatNet 経由でラベル付きマーカーの座標を
+受信しつつ、USB シリアル接続された JNCRadio VNA 3G から特定単一周波数の S11 を
 連続取得し、両者を同期して CSV に保存する。
 
-計測対象は腕に直接貼り付けた 3 つの「単一マーカー」(Labeled Marker):
+計測対象は腕に直接貼り付けた 3 個の「単一マーカー」(Labeled Marker):
   1. 上腕   (Upper Arm)
   2. 関節   (Joint / 肘など)
   3. 前腕   (Forearm)
-各マーカーの中心 [X, Y, Z] 座標を同時に取得し、S11 と紐付けて 1 行に記録する。
+各マーカーの中心 [X, Y, Z] 座標(Motive 3.x の Z-Up 座標系)を同時に取得し、
+S11 / インピーダンスと紐付けて 1 行に記録する。
 
-※ リジッドボディではなく、Motive 側で個別にラベル付けした「Labeled Markers」
-  として配信される 3 マーカーを、マーカー ID で識別して取得する。
-  (Motive 3.1.0 Beta 2 以降のラベル付きマーカー配信を想定)
+動作確認環境:
+  - Windows 10/11, Python 3.8+
+  - Motive 3.1.0 Beta 2 / NatNet 4.x (127.0.0.1, Unicast)
+  - OptiTrack NatNet SDK 同梱の NatNetClient.py / MoCapData.py / DataDescriptions.py
 
-- OptiTrack: 高速更新（〜100-360Hz）。フレームコールバックで 3 マーカーの
-            「最新座標」を更新し続ける。
-- NanoVNA : 低速取得（1点 数十〜数百ms）。1点取れるたびにその瞬間の 3 点(計9値)の
-            最新座標をまとめて紐付け、CSV へ1行書き込む。
-- 速度差を吸収するためマルチスレッド + threading.Lock でスレッド安全に共有する。
+スレッド構成:
+  - OptiTrack: 高速更新。new_frame_with_data_listener が 3 マーカーの最新座標を更新。
+  - VNA      : 低速取得。1 点取れるたびに 3 マーカー(計9値)の最新座標を一括取得して書込み。
+  - 共有変数は threading.Lock() で保護してスレッド安全に読み書きする。
 
 CSV ヘッダー:
   [Timestamp,
@@ -31,6 +32,7 @@ CSV ヘッダー:
    S11_Real, S11_Imag, Z_R, Z_X]
 """
 
+import os
 import csv
 import sys
 import time
@@ -44,43 +46,36 @@ import serial  # pip install pyserial
 # 設定（ここを環境に合わせて変更してください）
 # =============================================================================
 
-# --- NanoVNA / JNCRadio VNA-3G (シリアル) ---
-NANOVNA_PORT   = "COM3"        # Windows の デバイスマネージャーで確認した COM 番号
-NANOVNA_BAUD   = 115200        # ボーレート(JNCRadio VNA-3G は 115200 を推奨)
+# --- JNCRadio VNA 3G (シリアル) ---
+NANOVNA_PORT   = "COM3"        # Windows のデバイスマネージャーで確認した COM 番号
+NANOVNA_BAUD   = 115200        # ボーレート(JNCRadio VNA 3G は 115200 を推奨)
 TARGET_FREQ_HZ = 13_560_000    # 取得したい単一周波数 [Hz] (例: 13.56 MHz)
 SCAN_POINTS    = 11            # 1回の scan の掃引点数(本機の最小は 11)。同一周波数で平均する
 Z0             = 50.0          # 特性インピーダンス [Ω]
 
 # --- OptiTrack (NatNet) ---
-NATNET_SERVER_IP = "127.0.0.1"  # 同一PCなので localhost
+NATNET_SERVER_IP = "127.0.0.1"  # 同一PCなので localhost (Motive と同じ PC)
 NATNET_LOCAL_IP  = "127.0.0.1"  # 同一PCなので localhost
+NATNET_USE_MULTICAST = False    # 同一PCループバックは Unicast 推奨
 
-# 計測する 3 つの単一マーカー(Labeled Marker)の ID
+# 計測する 3 個の単一マーカー(Labeled Marker)の ID
 # Motive 側で各マーカーに割り当てたラベル ID に合わせて変更する。
-UPPER_ARM_MARKER_ID = 1   # 上腕   (Upper Arm)
-JOINT_MARKER_ID     = 2   # 関節   (Joint / 肘など)
-FOREARM_MARKER_ID   = 3   # 前腕   (Forearm)
+# (NatNet の Labeled Marker ID は (model_id<<16 | marker_id) の合成値になる場合があり、
+#  本スクリプトは「生の ID」と「下位16bit(=marker_id)」の両方で照合する)
+UPPER_ARM_ID = 1   # 上腕   (Upper Arm)
+JOINT_ID     = 2   # 関節   (Joint / 肘など)
+FOREARM_ID   = 3   # 前腕   (Forearm)
 
-# 内部処理で使う論理名 -> マーカー ID の対応表
-MARKER_IDS = {
-    "UpperArm": UPPER_ARM_MARKER_ID,
-    "Joint":    JOINT_MARKER_ID,
-    "Forearm":  FOREARM_MARKER_ID,
-}
+# True にすると、受信した全ラベル付きマーカーの ID を定期的にコンソールへ出力する。
+# どのマーカーにどの ID が割り当たっているか分からないときの ID 調査に使う。
+DEBUG_PRINT_MARKER_IDS = False
 
+# オクルージョン(隠れ)状態のマーカーは座標が無効なため更新をスキップし、
+# 直前の有効値を保持する。
+SKIP_OCCLUDED = True
 
-def match_marker_name(marker_id):
-    """
-    受信した Labeled Marker の ID を、計測対象 3 マーカーのどれかに突き合わせる。
-    NatNet の Labeled Marker ID は、アセットに属する場合 (model_id<<16 | member_id)
-    の合成値になることがあるため、生の ID と下位 16bit の両方で照合する。
-    一致しなければ None を返す。
-    """
-    low16 = marker_id & 0xFFFF
-    for name, target in MARKER_IDS.items():
-        if marker_id == target or low16 == target:
-            return name
-    return None
+# ストリーミング途絶の警告しきい値 [秒](この時間フレームが来なければ警告)
+STREAM_STALE_SEC = 2.0
 
 # --- 出力 ---
 OUTPUT_CSV = "sync_dataset.csv"
@@ -91,19 +86,43 @@ CSV_HEADER = ["Timestamp",
               "S11_Real", "S11_Imag", "Z_R", "Z_X"]
 
 
+# 内部処理で使う論理名 -> マーカー ID の対応表
+MARKER_IDS = {
+    "UpperArm": UPPER_ARM_ID,
+    "Joint":    JOINT_ID,
+    "Forearm":  FOREARM_ID,
+}
+PART_NAMES = ("UpperArm", "Joint", "Forearm")
+
+
+def match_marker_name(marker_id):
+    """
+    受信した Labeled Marker の id_num を、計測対象 3 マーカーのどれかに突き合わせる。
+    NatNet の id_num は (model_id<<16 | marker_id) の合成値になり得るため、
+    生の id_num と下位 16bit(marker_id) の両方で照合する。一致しなければ None。
+    """
+    low16 = marker_id & 0x0000FFFF
+    for name, target in MARKER_IDS.items():
+        if marker_id == target or low16 == target:
+            return name
+    return None
+
+
 # =============================================================================
-# スレッド間共有: 3 点の最新 OptiTrack 座標
+# スレッド間共有: 3 マーカーの最新 OptiTrack 座標
 # =============================================================================
 
 # Lock で保護される共有状態。NatNet コールバック(書き込み)と
-# NanoVNA ループ(読み出し)の双方からアクセスされる。
-# 各部位ごとに {x, y, z, valid} を保持する。
+# VNA ループ(読み出し)の双方からアクセスされる。各部位ごとに {x,y,z,valid} を保持。
 _pos_lock = threading.Lock()
 _latest_positions = {
     "UpperArm": {"x": None, "y": None, "z": None, "valid": False},
     "Joint":    {"x": None, "y": None, "z": None, "valid": False},
     "Forearm":  {"x": None, "y": None, "z": None, "valid": False},
 }
+
+# 最後にフレームを受信した時刻(ストリーミング途絶検知用)。Lock 下で更新。
+_last_frame_time = [0.0]
 
 # 全スレッド共通の停止フラグ
 _stop_event = threading.Event()
@@ -119,10 +138,16 @@ def update_latest_position(name, x, y, z):
         slot["valid"] = True
 
 
+def mark_frame_received():
+    """フレーム受信時刻を更新(ストリーミング生存確認用)。"""
+    with _pos_lock:
+        _last_frame_time[0] = time.time()
+
+
 def read_latest_positions():
     """
-    NanoVNA ループから呼ばれ、3 点すべての最新座標のスナップショットを
-    まとめて(同一ロック下で)取得する。
+    VNA ループから呼ばれ、3 マーカーすべての最新座標のスナップショットを
+    同一ロック下で一括取得する。
     戻り値: {"UpperArm": (x,y,z,valid), "Joint": (...), "Forearm": (...)}
     """
     snapshot = {}
@@ -132,11 +157,19 @@ def read_latest_positions():
     return snapshot
 
 
+def seconds_since_last_frame():
+    with _pos_lock:
+        last = _last_frame_time[0]
+    if last == 0.0:
+        return None  # まだ一度も受信していない
+    return time.time() - last
+
+
 # =============================================================================
 # インピーダンス変換
 # =============================================================================
 
-def s11_to_impedance(s11: complex, z0: float = Z0):
+def s11_to_impedance(s11, z0=Z0):
     """
     反射係数 S11 (複素数) から負荷インピーダンス Z = R + jX を計算する。
         Z = Z0 * (1 + S11) / (1 - S11)
@@ -144,22 +177,21 @@ def s11_to_impedance(s11: complex, z0: float = Z0):
     """
     denom = (1.0 - s11)
     if denom == 0:
-        # 完全反射(開放相当)。発散を避けて inf を返す。
-        return float("inf"), float("inf")
+        return float("inf"), float("inf")  # 完全反射(開放相当)
     z = z0 * (1.0 + s11) / denom
     return z.real, z.imag
 
 
 # =============================================================================
-# NanoVNA / JNCRadio VNA-3G シリアル制御
+# JNCRadio VNA 3G シリアル制御
 # =============================================================================
 
 class NanoVNA:
     """
-    JNCRadio VNA-3G (NanoVNA 互換) のコンソールコマンドを扱う薄いラッパ。
+    JNCRadio VNA 3G (NanoVNA 互換) のコンソールコマンドを扱う薄いラッパ。
 
     本機のシリアルは「コマンド\\r を送ると、エコー → 結果行 → プロンプト 'ch> '」
-    の順で応答する。scan コマンドで毎回フレッシュな掃引を実行し S11 を取得する。
+    の順で応答する(マニュアル §7)。scan コマンドで毎回フレッシュな掃引を実行する。
 
         scan {start(Hz)} {stop(Hz)} [points] [outmask]
         outmask=2 -> 各掃引点の S11 データ(real imag)のみを出力
@@ -167,9 +199,8 @@ class NanoVNA:
 
     PROMPT = b"ch> "
 
-    def __init__(self, port: str, baud: int = 115200, timeout: float = 2.0):
+    def __init__(self, port, baud=115200, timeout=2.0):
         self.ser = serial.Serial(port, baud, timeout=timeout)
-        # 起動直後のゴミ/残プロンプトを読み捨てる
         time.sleep(0.2)
         self.ser.reset_input_buffer()
         self.ser.reset_output_buffer()
@@ -177,36 +208,32 @@ class NanoVNA:
         self._send_raw("pause")
         self._read_until_prompt()
 
-    def _send_raw(self, cmd: str):
+    def _send_raw(self, cmd):
         """コマンドを CR 終端で送信する(本機の終端は <CR>)。"""
         self.ser.write((cmd + "\r").encode("ascii"))
         self.ser.flush()
 
-    def _read_until_prompt(self, max_wait: float = 3.0) -> str:
-        """
-        プロンプト 'ch> ' が現れるまで読み、受信テキスト全体を返す。
-        タイムアウト時はそれまでに受信した分を返す。
-        """
+    def _read_until_prompt(self, max_wait=3.0):
+        """プロンプト 'ch> ' が現れるまで読み、受信テキスト全体を返す。"""
         buf = bytearray()
         deadline = time.time() + max_wait
         while time.time() < deadline:
             chunk = self.ser.read(self.ser.in_waiting or 1)
             if chunk:
                 buf += chunk
-                if buf.endswith(self.PROMPT) or self.PROMPT in buf:
+                if self.PROMPT in buf:
                     break
             else:
-                # データが来ない瞬間が続いてもプロンプトが既にあれば抜ける
                 if self.PROMPT in buf:
                     break
         return buf.decode("ascii", errors="ignore")
 
     @staticmethod
-    def _parse_s11_lines(text: str):
+    def _parse_s11_lines(text):
         """
         受信テキストから S11 の (real, imag) ペア群を抽出する。
-        outmask=2 の各データ行は "real imag" の2列。コマンドエコーや
-        プロンプト等、2 float に解釈できない行はスキップする。
+        outmask=2 の各データ行は "real imag" の2列。2 float に解釈できない行
+        (コマンドエコー・プロンプト等)はスキップする。
         """
         pairs = []
         for line in text.splitlines():
@@ -220,15 +247,14 @@ class NanoVNA:
                 real = float(tokens[0])
                 imag = float(tokens[1])
             except ValueError:
-                # コマンドエコー・プロンプト・その他テキスト行
                 continue
             pairs.append((real, imag))
         return pairs
 
     def measure_s11(self):
         """
-        単一周波数 TARGET_FREQ_HZ で 1 回 scan を実行し、S11 (複素数) を返す。
-        SCAN_POINTS 点すべて同一周波数(start==stop)なので平均してノイズを抑える。
+        単一周波数 TARGET_FREQ_HZ で 1 回 scan を実行し、S11(複素数)を返す。
+        SCAN_POINTS 点はすべて同一周波数(start==stop)なので平均してノイズを抑える。
         取得失敗時は None を返す。
         """
         cmd = "scan {start} {stop} {pts} 2".format(
@@ -236,14 +262,12 @@ class NanoVNA:
             stop=int(TARGET_FREQ_HZ),
             pts=int(SCAN_POINTS),
         )
-        # 送信前に入力バッファを空にして、直前応答の取りこぼし/混線を防ぐ
         self.ser.reset_input_buffer()
         self._send_raw(cmd)
         text = self._read_until_prompt()
         pairs = self._parse_s11_lines(text)
         if not pairs:
             return None
-        # 同一周波数の複数点を平均
         avg_real = sum(p[0] for p in pairs) / len(pairs)
         avg_imag = sum(p[1] for p in pairs) / len(pairs)
         return complex(avg_real, avg_imag)
@@ -261,231 +285,218 @@ class NanoVNA:
 
 
 # =============================================================================
-# OptiTrack / NatNet スレッド
+# OptiTrack / NatNet
 # =============================================================================
 
-def _extract_marker_id_pos(marker):
+def _ensure_natnet_on_path():
     """
-    1 個の Labeled Marker オブジェクト/タプルから (marker_id, x, y, z) を取り出す。
-    NatNet SDK のバージョン差(LabeledMarker クラス属性 / 生タプル)を吸収する。
-    取り出せない場合は None を返す。
+    NatNetClient.py を import できるよう、よくある配置場所を sys.path に追加する。
+      1) このスクリプトと同じフォルダ
+      2) 同梱 SDK: ./NatNetSDK/Samples/PythonClient
     """
-    # --- オブジェクト形式 (MoCapData.LabeledMarker など) ---
-    pos = getattr(marker, "pos", None)
-    mid = None
-    for attr in ("id_num", "marker_id", "id"):
-        if hasattr(marker, attr):
-            mid = getattr(marker, attr)
-            break
-    if pos is not None and mid is not None and len(pos) >= 3:
-        return int(mid), float(pos[0]), float(pos[1]), float(pos[2])
-
-    # --- タプル/リスト形式: (id, x, y, z, ...) を想定 ---
-    try:
-        if len(marker) >= 4:
-            return int(marker[0]), float(marker[1]), float(marker[2]), float(marker[3])
-    except (TypeError, ValueError):
-        pass
-    return None
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        here,
+        os.path.join(here, "NatNetSDK", "Samples", "PythonClient"),
+    ]
+    for d in candidates:
+        if os.path.isdir(d) and d not in sys.path:
+            sys.path.insert(0, d)
 
 
-def process_labeled_markers(markers):
+# DEBUG_PRINT_MARKER_IDS 用: 直近に出力した時刻
+_dbg_last_print = [0.0]
+
+
+def _on_frame_with_data(data_dict):
     """
-    Labeled Marker のリストを走査し、計測対象 3 マーカー(上腕/関節/前腕)の
-    最新座標をスレッド安全に更新する。
-    markers: LabeledMarker オブジェクト、または (id, x, y, z) タプルの反復可能
+    NatNetClient の new_frame_with_data_listener コールバック。
+    1 フレームごとに呼ばれ、data_dict["mocap_data"] に MoCapData が入る。
+    そこから Labeled Marker のリストを取り出し、対象 3 マーカーの座標を更新する。
     """
+    mark_frame_received()
+
+    mocap = data_dict.get("mocap_data")
+    if mocap is None:
+        return
+    lm_data = getattr(mocap, "labeled_marker_data", None)
+    if lm_data is None:
+        return
+    markers = getattr(lm_data, "labeled_marker_list", None)
     if not markers:
         return
+
+    if DEBUG_PRINT_MARKER_IDS:
+        now = time.time()
+        if now - _dbg_last_print[0] > 1.0:  # 1秒に1回だけ
+            _dbg_last_print[0] = now
+            ids = []
+            for m in markers:
+                model_id = m.id_num >> 16
+                marker_id = m.id_num & 0x0000FFFF
+                ids.append("id_num={} (model={}, marker={})".format(
+                    m.id_num, model_id, marker_id))
+            print("[DEBUG] Labeled Markers ({}): {}".format(len(markers), " | ".join(ids)))
+
     for m in markers:
-        parsed = _extract_marker_id_pos(m)
-        if parsed is None:
+        # オクルージョン判定(param bit0)
+        if SKIP_OCCLUDED and (getattr(m, "param", 0) & 0x01):
             continue
-        marker_id, x, y, z = parsed
-        name = match_marker_name(marker_id)
+        name = match_marker_name(m.id_num)
         if name is None:
-            continue  # 計測対象外のマーカーは無視
-        update_latest_position(name, x, y, z)
-
-
-def _markers_from_mocap(mocap_data):
-    """MoCapData オブジェクトから Labeled Marker のリストを取り出す(SDK差吸収)。"""
-    lm = getattr(mocap_data, "labeled_marker_data", None)
-    if lm is None:
-        return None
-    for attr in ("labeled_marker_list", "marker_list", "markers"):
-        lst = getattr(lm, attr, None)
-        if lst is not None:
-            return lst
-    return None
+            continue  # 計測対象外のマーカー
+        pos = m.pos
+        update_latest_position(name, float(pos[0]), float(pos[1]), float(pos[2]))
 
 
 def start_natnet():
     """
-    NatNetClient を起動し、Labeled Marker(ラベル付きマーカー)受信コールバックを
-    登録する。成功すると streaming_client を返す。NatNet SDK の Python サンプル
-    (NatNetClient.py / MoCapData.py 等) が import パス上にある必要がある。
+    NatNetClient を起動し、Labeled Marker 受信コールバックを登録する。
+    成功すると streaming_client を返す。失敗時は None。
     """
+    _ensure_natnet_on_path()
     try:
         from NatNetClient import NatNetClient
-    except ImportError:
-        print("[ERROR] NatNetClient が import できません。")
-        print("        OptiTrack NatNet SDK 同梱の Python サンプル(NatNetClient.py 等)を")
-        print("        このスクリプトと同じフォルダ、または PYTHONPATH に置いてください。")
+    except ImportError as e:
+        print("[ERROR] NatNetClient を import できません: {}".format(e))
+        print("        OptiTrack NatNet SDK 同梱の NatNetClient.py / MoCapData.py /")
+        print("        DataDescriptions.py を、このスクリプトと同じフォルダ、または")
+        print("        ./NatNetSDK/Samples/PythonClient/ に配置してください。")
         return None
 
     client = NatNetClient()
+    client.set_client_address(NATNET_LOCAL_IP)
+    client.set_server_address(NATNET_SERVER_IP)
+    client.set_use_multicast(NATNET_USE_MULTICAST)
 
-    # --- サーバ/クライアント IP の設定(SDK バージョン差を吸収) ---
+    # フレームごとに MoCapData を受け取るコールバックを登録
+    client.new_frame_with_data_listener = _on_frame_with_data
+
+    # 受信開始("d" = data + command スレッド)
     try:
-        client.set_client_address(NATNET_LOCAL_IP)
-        client.set_server_address(NATNET_SERVER_IP)
-        client.set_use_multicast(False)   # 同一PCループバックは Unicast 推奨
-    except AttributeError:
-        # 旧 API: 属性で直接指定
-        client.local_ip_address = NATNET_LOCAL_IP
-        client.server_ip_address = NATNET_SERVER_IP
-
-    # --- フレーム受信コールバック(MoCapData 付き) ---
-    def on_frame_with_data(*args):
-        """
-        1 フレーム届くたびに呼ばれる。引数に含まれる MoCapData から
-        Labeled Marker のリストを取り出して処理する。
-        SDK により署名が (data_dict, mocap_data) などと異なるため、
-        引数群から MoCapData らしきものを探して使う。
-        """
-        mocap = None
-        for a in args:
-            if hasattr(a, "labeled_marker_data"):
-                mocap = a
-                break
-        if mocap is None:
-            return
-        markers = _markers_from_mocap(mocap)
-        process_labeled_markers(markers)
-
-    # 一部の SDK/フォークは Labeled Marker 専用 listener を持つ
-    def on_labeled_markers(markers, *_):
-        process_labeled_markers(markers)
-
-    # --- コールバック登録(SDK バージョン差を吸収) ---
-    registered = False
-    # 1) MoCapData を渡してくれる listener を最優先
-    for attr in ("new_frame_with_data_listener",
-                 "labeled_marker_listener",
-                 "marker_set_listener"):
-        if hasattr(client, attr):
-            if attr == "labeled_marker_listener":
-                setattr(client, attr, on_labeled_markers)
-            else:
-                setattr(client, attr, on_frame_with_data)
-            registered = True
-            print("[INFO] Labeled Marker コールバックを '{}' に登録しました。".format(attr))
-            break
-
-    if not registered:
-        # 2) フォールバック: 通常の new_frame_listener。
-        #    ※ 標準 SDK の new_frame_listener は集計値のみで座標を含まない場合があります。
-        #    その場合は NatNetClient 側の改造、または MoCapData を渡す listener が必要です。
-        if hasattr(client, "new_frame_listener"):
-            client.new_frame_listener = on_frame_with_data
-            print("[WARN] new_frame_with_data_listener が見つからないため new_frame_listener を使用します。")
-            print("       マーカー座標が取得できない場合は、お使いの NatNetClient が")
-            print("       MoCapData をコールバックに渡す実装か確認してください。")
-        else:
-            print("[WARN] Labeled Marker 用コールバックを登録できませんでした。SDK 版を確認してください。")
-
-    # --- 受信開始 ---
-    started = False
-    try:
-        # 新しめの API は run() に通信モードを渡す
-        started = client.run("d")  # "d" = data + command threads
-    except TypeError:
-        started = client.run()
-
-    if started is False:
-        print("[ERROR] NatNetClient の起動に失敗しました。Motive のストリーミング設定を確認してください。")
+        is_running = client.run("d")
+    except Exception as e:
+        print("[ERROR] NatNetClient.run() で例外: {}".format(e))
         return None
 
-    print("[INFO] NatNet クライアント開始。Motive からのデータ受信待ち...")
+    if not is_running:
+        print("[ERROR] NatNetClient の起動に失敗しました。")
+        print("        Motive の Data Streaming(127.0.0.1 / Unicast / Labeled Markers)を確認してください。")
+        try:
+            client.shutdown()
+        except Exception:
+            pass
+        return None
+
+    # サーバ接続確認(数秒待ってバージョン応答が来るか)
+    time.sleep(1.0)
+    app_name = getattr(client, "get_application_name", lambda: "")() or ""
+    if app_name and app_name != "Not Set":
+        print("[INFO] Motive へ接続しました (server app: {}).".format(app_name))
+    else:
+        print("[INFO] NatNet 起動。Motive からのフレーム受信待ち...")
+        print("       (まだサーバ応答なし。Motive の Data Streaming 設定を確認してください)")
     return client
 
 
 # =============================================================================
-# メイン: NanoVNA サンプリングループ + CSV 書き込み
+# メイン: VNA サンプリングループ + CSV 書き込み
 # =============================================================================
+
+def _fmt_xyz(snap, name):
+    """部位の (x,y,z) を CSV セル 3 個へ整形。未受信なら空欄。"""
+    x, y, z, valid = snap[name]
+    if not valid:
+        return ["", "", ""]
+    return ["{:.6f}".format(x), "{:.6f}".format(y), "{:.6f}".format(z)]
+
+
+def _short_xyz(snap, name):
+    x, y, z, valid = snap[name]
+    if not valid:
+        return "(----,----,----)"
+    return "({:.3f},{:.3f},{:.3f})".format(x, y, z)
+
 
 def main():
     # --- NanoVNA 接続 ---
     try:
         vna = NanoVNA(NANOVNA_PORT, NANOVNA_BAUD)
     except serial.SerialException as e:
-        print("[ERROR] NanoVNA シリアル接続に失敗: {}".format(e))
-        print("        NANOVNA_PORT('{}') が正しいか確認してください。".format(NANOVNA_PORT))
+        print("[ERROR] VNA シリアル接続に失敗: {}".format(e))
+        print("        NANOVNA_PORT('{}') が正しいか、他ソフトが占有していないか確認してください。".format(NANOVNA_PORT))
         sys.exit(1)
-    print("[INFO] NanoVNA 接続 OK: {} @ {}bps, {:.3f} MHz".format(
+    except Exception as e:
+        print("[ERROR] VNA 初期化中に予期せぬ例外: {}".format(e))
+        sys.exit(1)
+    print("[INFO] VNA 接続 OK: {} @ {}bps, {:.3f} MHz".format(
         NANOVNA_PORT, NANOVNA_BAUD, TARGET_FREQ_HZ / 1e6))
 
     # --- NatNet 開始 ---
     natnet_client = start_natnet()
     if natnet_client is None:
         print("[WARN] OptiTrack なしで続行します(座標列は空欄になります)。")
-
-    print("[INFO] 計測対象マーカー ID -> UpperArm={}, Joint={}, Forearm={}".format(
-        UPPER_ARM_MARKER_ID, JOINT_MARKER_ID, FOREARM_MARKER_ID))
-
-    # OptiTrack の初回データ到着を少し待つ(3 マーカーすべての受信を確認)
-    for _ in range(50):
-        snap = read_latest_positions()
-        if all(snap[n][3] for n in ("UpperArm", "Joint", "Forearm")):
-            print("[INFO] OptiTrack 初期データ受信 OK(3マーカーすべて)。")
-            break
-        time.sleep(0.1)
     else:
-        if natnet_client is not None:
+        print("[INFO] 計測対象マーカー ID -> UpperArm={}, Joint={}, Forearm={}".format(
+            UPPER_ARM_ID, JOINT_ID, FOREARM_ID))
+
+    # OptiTrack の初回データ到着を待つ(3 マーカーすべて)
+    if natnet_client is not None:
+        for _ in range(50):
             snap = read_latest_positions()
-            missing = [n for n in ("UpperArm", "Joint", "Forearm") if not snap[n][3]]
-            print("[WARN] OptiTrack の初期データが未受信のマーカーがあります: {}".format(missing))
-            print("       マーカー ID/ラベル付け/トラッキング状態を確認してください。")
+            if all(snap[n][3] for n in PART_NAMES):
+                print("[INFO] OptiTrack 初期データ受信 OK(3マーカーすべて)。")
+                break
+            time.sleep(0.1)
+        else:
+            snap = read_latest_positions()
+            missing = [n for n in PART_NAMES if not snap[n][3]]
+            print("[WARN] 初期データ未受信のマーカーがあります: {}".format(missing))
+            print("       マーカー ID/ラベル付け/トラッキング状態/Labeled Markers 配信設定を確認してください。")
+            print("       (DEBUG_PRINT_MARKER_IDS=True にすると受信中の ID 一覧を確認できます)")
 
     # --- CSV 準備 & 計測ループ ---
     sample_count = 0
+    last_stale_warn = 0.0
     try:
         with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(CSV_HEADER)
             f.flush()
 
-            print("[INFO] 計測開始。Ctrl+C で停止します。")
+            print("[INFO] 計測開始。Ctrl+C で安全に停止します。")
             while not _stop_event.is_set():
-                # 1) NanoVNA から S11 を1点取得(ここがレート律速)
-                s11 = vna.measure_s11()
+                # 1) VNA から S11 を1点取得(ここがレート律速)
+                try:
+                    s11 = vna.measure_s11()
+                except serial.SerialException as e:
+                    print("[ERROR] VNA シリアル通信が切断されました: {}".format(e))
+                    break
                 if s11 is None:
                     print("[WARN] S11 のパースに失敗。スキップします。")
                     continue
 
-                # 2) 取得が完了した「その瞬間」の 3 点(計9値)の最新座標を
-                #    まとめてスナップショット取得(同一ロック下で一括取得)
+                # 2) ストリーミング途絶チェック(警告のみ。計測は継続)
+                if natnet_client is not None:
+                    elapsed = seconds_since_last_frame()
+                    now = time.time()
+                    if elapsed is not None and elapsed > STREAM_STALE_SEC and (now - last_stale_warn) > STREAM_STALE_SEC:
+                        last_stale_warn = now
+                        print("[WARN] OptiTrack フレームが {:.1f}s 途絶しています(座標が古い可能性)。".format(elapsed))
+
+                # 3) その瞬間の 3 マーカー(計9値)の最新座標を一括スナップショット
                 snap = read_latest_positions()
 
-                # 3) インピーダンス計算
+                # 4) インピーダンス計算
                 z_r, z_x = s11_to_impedance(s11, Z0)
 
-                # 4) CSV へ1行書き込み(3点の座標 + S11 + Z をガッチャンコ)
+                # 5) CSV へ1行書き込み(3マーカー座標 + S11 + Z)
                 ts = datetime.now().isoformat(timespec="milliseconds")
-
-                def fmt(name):
-                    """部位の (x,y,z) を CSV セル 3 個へ整形。未受信なら空欄。"""
-                    x, y, z, valid = snap[name]
-                    if not valid:
-                        return ["", "", ""]
-                    return ["{:.6f}".format(x), "{:.6f}".format(y), "{:.6f}".format(z)]
-
                 writer.writerow(
                     [ts]
-                    + fmt("UpperArm")
-                    + fmt("Joint")
-                    + fmt("Forearm")
+                    + _fmt_xyz(snap, "UpperArm")
+                    + _fmt_xyz(snap, "Joint")
+                    + _fmt_xyz(snap, "Forearm")
                     + [
                         "{:.6f}".format(s11.real),
                         "{:.6f}".format(s11.imag),
@@ -493,25 +504,27 @@ def main():
                         "{:.4f}".format(z_x),
                     ]
                 )
-                f.flush()  # 計測中に随時保存(途中でクラッシュしてもデータを残す)
+                f.flush()  # 途中でクラッシュしてもデータを残す
 
                 sample_count += 1
                 if sample_count % 10 == 0:
-                    def short(name):
-                        x, y, z, valid = snap[name]
-                        if not valid:
-                            return "(----,----,----)"
-                        return "({:.2f},{:.2f},{:.2f})".format(x, y, z)
                     print("[{:5d}] UA={} J={} FA={} | S11=({:.4f},{:.4f}) Z=({:.2f}{:+.2f}j)Ω".format(
                         sample_count,
-                        short("UpperArm"), short("Joint"), short("Forearm"),
+                        _short_xyz(snap, "UpperArm"),
+                        _short_xyz(snap, "Joint"),
+                        _short_xyz(snap, "Forearm"),
                         s11.real, s11.imag, z_r, z_x))
 
     except KeyboardInterrupt:
         print("\n[INFO] Ctrl+C を検出。停止処理中...")
+    except Exception as e:
+        print("\n[ERROR] 計測ループで予期せぬ例外: {}".format(e))
     finally:
         _stop_event.set()
-        vna.close()
+        try:
+            vna.close()
+        except Exception:
+            pass
         if natnet_client is not None:
             try:
                 natnet_client.shutdown()
