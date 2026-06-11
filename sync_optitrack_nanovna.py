@@ -41,6 +41,12 @@ GUI / スレッド構成:
   2. [計測開始] で計測スタート(最初の有効フレームで自動判別が走る)。
   3. [計測終了] で計測停止 → 保存ダイアログでファイル名指定 → CSV 保存 → 終了。
 
+VNA 接続(COM ポート):
+  計測する S パラメータは S11 固定。VNA を接続する COM ポートは GUI のドロップダウンで
+  選択する。「ポート再検索」ボタンで一覧を更新でき、後から VNA を挿しても再起動不要。
+  選択ポートが開けない(存在しない/他ソフトが占有)場合は、クラッシュさせず
+  messagebox.showerror で警告を表示する。
+
 CSV ヘッダー:
   [Timestamp,
    UpperArm_X, UpperArm_Y, UpperArm_Z,
@@ -58,6 +64,7 @@ import threading
 from datetime import datetime
 
 import serial  # pip install pyserial
+from serial.tools import list_ports  # 利用可能な COM ポートの列挙に使用
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -73,6 +80,16 @@ NANOVNA_BAUD   = 115200        # ボーレート(JNCRadio VNA 3G は 115200 を�
 TARGET_FREQ_HZ = 13_560_000    # 取得したい単一周波数 [Hz] (例: 13.56 MHz)
 SCAN_POINTS    = 11            # 1回の scan の掃引点数(本機の最小は 11)。同一周波数で平均する
 Z0             = 50.0          # 特性インピーダンス [Ω]
+
+# --- 計測する S パラメータ(S11 固定) ---
+# 本機(NanoVNA 系)のコンソール `scan {start} {stop} {pts} {outmask}` は outmask の
+# ビットで出力内容を選ぶ。S11(ポート1の反射)は bit1(=2)。
+# 本システムは S11 固定で計測する。
+VNA_SPARAM  = "S11"
+VNA_OUTMASK = 2
+
+# 使用する COM ポートは GUI のドロップダウンで選択する(下記は初期選択の候補)。
+# 起動時にこの値が一覧に存在すれば初期選択される。無ければ一覧の先頭を選ぶ。
 
 # --- OptiTrack (NatNet) ---
 NATNET_SERVER_IP = "127.0.0.1"  # 同一PCなので localhost (Motive と同じ PC)
@@ -314,6 +331,22 @@ def s11_to_impedance(s11, z0=Z0):
 # JNCRadio VNA 3G シリアル制御
 # =============================================================================
 
+def list_serial_ports():
+    """
+    PC が認識しているシリアル(COM)ポートを列挙して返す。
+    戻り値: [(device, description), ...] を device 名でソートしたもの。
+            例: [("COM3", "USB Serial Device (COM3)"), ...]
+    取得に失敗した場合は空リストを返す(GUI 側で「ポートなし」を表示)。
+    """
+    try:
+        ports = list(list_ports.comports())
+    except Exception:
+        return []
+    out = [(p.device, (p.description or "")) for p in ports]
+    out.sort(key=lambda t: t[0])
+    return out
+
+
 class NanoVNA:
     """
     JNCRadio VNA 3G (NanoVNA 互換) のコンソールコマンドを扱う薄いラッパ。
@@ -328,6 +361,9 @@ class NanoVNA:
     PROMPT = b"ch> "
 
     def __init__(self, port, baud=115200, timeout=2.0):
+        # 計測は S11 固定(scan の outmask=2)。
+        self.outmask = VNA_OUTMASK
+        self.sparam = VNA_SPARAM
         self.ser = serial.Serial(port, baud, timeout=timeout)
         time.sleep(0.2)
         self.ser.reset_input_buffer()
@@ -357,10 +393,10 @@ class NanoVNA:
         return buf.decode("ascii", errors="ignore")
 
     @staticmethod
-    def _parse_s11_lines(text):
+    def _parse_sparam_lines(text):
         """
-        受信テキストから S11 の (real, imag) ペア群を抽出する。
-        outmask=2 の各データ行は "real imag" の2列。2 float に解釈できない行
+        受信テキストから S パラメータの (real, imag) ペア群を抽出する。
+        単一ビット outmask の各データ行は "real imag" の2列。2 float に解釈できない行
         (コマンドエコー・プロンプト等)はスキップする。
         """
         pairs = []
@@ -379,21 +415,26 @@ class NanoVNA:
             pairs.append((real, imag))
         return pairs
 
-    def measure_s11(self):
+    def measure_sparam(self):
         """
-        単一周波数 TARGET_FREQ_HZ で 1 回 scan を実行し、S11(複素数)を返す。
+        単一周波数 TARGET_FREQ_HZ で 1 回 scan を実行し、選択中の S パラメータ
+        (self.sparam / self.outmask)を複素数で返す。
         SCAN_POINTS 点はすべて同一周波数(start==stop)なので平均してノイズを抑える。
         取得失敗時は None を返す。
+
+        outmask は単一ビットのみを指定するため、各データ行の先頭 2 列が
+        選択 S パラメータの (real, imag) になる(列構成は S パラメータに依らない)。
         """
-        cmd = "scan {start} {stop} {pts} 2".format(
+        cmd = "scan {start} {stop} {pts} {mask}".format(
             start=int(TARGET_FREQ_HZ),
             stop=int(TARGET_FREQ_HZ),
             pts=int(SCAN_POINTS),
+            mask=int(self.outmask),
         )
         self.ser.reset_input_buffer()
         self._send_raw(cmd)
         text = self._read_until_prompt()
-        pairs = self._parse_s11_lines(text)
+        pairs = self._parse_sparam_lines(text)
         if not pairs:
             return None
         avg_real = sum(p[0] for p in pairs) / len(pairs)
@@ -584,6 +625,8 @@ class MeasurementController:
         self.sample_count = 0
         self._cleaned = False
         self._cleanup_lock = threading.Lock()
+        # [計測開始]時に GUI から渡される接続先 COM ポート
+        self.com_port = NANOVNA_PORT
 
     # ---- GUI へ通知 ----
     def _post(self, kind, value=None):
@@ -593,8 +636,13 @@ class MeasurementController:
             pass
 
     # ---- 開始 ----
-    def start(self):
-        """共有状態を初期化し、計測ワーカースレッドを起動する。"""
+    def start(self, com_port):
+        """
+        共有状態を初期化し、計測ワーカースレッドを起動する。
+        com_port は GUI で選択された接続先 COM ポート(例 "COM3")。
+        """
+        self.com_port = com_port
+
         reset_runtime_state()
         with self.rows_lock:
             self.rows = []
@@ -606,21 +654,24 @@ class MeasurementController:
 
     # ---- ワーカースレッド本体 ----
     def _worker_loop(self):
-        # 1) VNA 接続
+        # 1) VNA 接続(S11 固定)。COM ポートが開けない場合は friendly なエラーを通知。
+        #    SerialException / FileNotFoundError はいずれも OSError のサブクラス。
         try:
-            self.vna = NanoVNA(NANOVNA_PORT, NANOVNA_BAUD)
-        except serial.SerialException as e:
+            self.vna = NanoVNA(self.com_port, NANOVNA_BAUD)
+        except OSError as e:
             self._post("error",
-                       "VNA シリアル接続に失敗: {}\nCOM 番号や他ソフトの占有を確認してください。"
-                       .format(e))
+                       "VNAの接続に失敗しました。\n"
+                       "COM番号({})が正しいか、他のソフトが占有していないか確認してください。\n"
+                       "（VNA を後から挿した場合は「ポート再検索」で一覧を更新できます）\n"
+                       "\n詳細: {}".format(self.com_port, e))
             self._post("finished")
             return
         except Exception as e:
             self._post("error", "VNA 初期化中に予期せぬ例外: {}".format(e))
             self._post("finished")
             return
-        self._post("status", "VNA 接続 OK: {} @ {}bps, {:.3f} MHz".format(
-            NANOVNA_PORT, NANOVNA_BAUD, TARGET_FREQ_HZ / 1e6))
+        self._post("status", "VNA 接続 OK: {} @ {}bps, {:.3f} MHz ({} 計測)".format(
+            self.com_port, NANOVNA_BAUD, TARGET_FREQ_HZ / 1e6, VNA_SPARAM))
 
         # 2) NatNet 開始(ブロックしない)
         self.client = start_natnet()
@@ -649,7 +700,7 @@ class MeasurementController:
         last_stale_warn = 0.0
         while not _stop_event.is_set():
             try:
-                s11 = self.vna.measure_s11()
+                s11 = self.vna.measure_sparam()
             except serial.SerialException as e:
                 self._post("error", "VNA シリアル通信が切断されました: {}".format(e))
                 break
@@ -759,6 +810,10 @@ class App(tk.Tk):
 
         self._build_widgets()
 
+        # 全ウィジェット(self.log を含む)の構築後に COM ポートを取得する。
+        # (構築前に呼ぶと self._log() が self.log を参照できず AttributeError になる)
+        self._scan_ports()
+
         # ウィンドウの × でも必ずクリーンアップして終了する
         self.protocol("WM_DELETE_WINDOW", self.on_window_close)
         # GUI メッセージのポーリング開始
@@ -770,12 +825,30 @@ class App(tk.Tk):
 
         info = ttk.Label(
             self,
-            text=("VNA: {}  /  周波数: {:.3f} MHz  /  高さ軸: {}\n"
-                  "[計測開始]を押すと最初の有効フレームで自動判別します。").format(
-                NANOVNA_PORT, TARGET_FREQ_HZ / 1e6,
+            text=("周波数: {:.3f} MHz  /  計測: {}（固定）  /  高さ軸: {}\n"
+                  "VNA の COM ポートを選んで[計測開始]。最初の有効フレームで自動判別します。"
+                  ).format(
+                TARGET_FREQ_HZ / 1e6, VNA_SPARAM,
                 {0: "X", 1: "Y", 2: "Z"}.get(HEIGHT_AXIS_INDEX, "?")),
             justify="left")
         info.pack(anchor="w", **pad)
+
+        # --- VNA 接続先 COM ポート選択 + 再検索 ---
+        port_frame = ttk.Frame(self)
+        port_frame.pack(fill="x", **pad)
+        ttk.Label(port_frame, text="COM Port:").pack(side="left")
+        self.port_var = tk.StringVar(value="")
+        self.port_combo = ttk.Combobox(
+            port_frame, textvariable=self.port_var,
+            values=[], state="readonly", width=34)
+        self.port_combo.pack(side="left", padx=6)
+        self.rescan_btn = ttk.Button(
+            port_frame, text="ポート再検索", command=self.on_rescan_ports)
+        self.rescan_btn.pack(side="left", padx=4)
+
+        # 表示名 -> デバイス名("COM3") の対応表。実際の接続にはデバイス名を使う。
+        # 実際のスキャンは __init__ で全ウィジェット(self.log を含む)構築後に行う。
+        self._port_display_to_device = {}
 
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill="x", **pad)
@@ -805,6 +878,57 @@ class App(tk.Tk):
         self.log.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
 
+    # ---- COM ポート一覧のスキャン/再検索 ----
+    def _scan_ports(self):
+        """
+        利用可能な COM ポートを取得して Combobox に反映する。
+        既存の選択を可能な限り維持し、無ければ設定値 NANOVNA_PORT、
+        それも無ければ先頭を選ぶ。
+        """
+        ports = list_serial_ports()  # [(device, description), ...]
+        self._port_display_to_device = {}
+        displays = []
+        for dev, desc in ports:
+            disp = "{} - {}".format(dev, desc) if desc else dev
+            displays.append(disp)
+            self._port_display_to_device[disp] = dev
+
+        # 現在の選択(デバイス名)を覚えておく
+        prev_dev = self.get_selected_port()
+
+        self.port_combo.configure(values=displays)
+
+        if not displays:
+            self.port_var.set("")
+            self._log("利用可能な COM ポートが見つかりませんでした。"
+                      "VNA を接続して[ポート再検索]を押してください。")
+            return
+
+        # 選択の復元優先順位: 直前の選択 -> 設定の NANOVNA_PORT -> 先頭
+        def disp_for_device(dev):
+            for disp, d in self._port_display_to_device.items():
+                if d == dev:
+                    return disp
+            return None
+
+        target = (disp_for_device(prev_dev)
+                  or disp_for_device(NANOVNA_PORT)
+                  or displays[0])
+        self.port_var.set(target)
+
+    def get_selected_port(self):
+        """Combobox の選択表示名から、実際のデバイス名("COM3")を返す。"""
+        disp = self.port_var.get()
+        return self._port_display_to_device.get(disp, disp)
+
+    def on_rescan_ports(self):
+        """[ポート再検索] ボタン: COM ポート一覧を更新する。"""
+        if self.measuring:
+            return  # 計測中は変更しない
+        self._scan_ports()
+        n = len(self.port_combo.cget("values"))
+        self._log("COM ポートを再検索しました（{} 件）。".format(n))
+
     # ---- ログ出力 ----
     def _log(self, text):
         self.log.configure(state="normal")
@@ -816,14 +940,26 @@ class App(tk.Tk):
     def on_start(self):
         if self.measuring:
             return
+        # 開始時点で選択されている COM ポートを読み込む
+        com_port = self.get_selected_port()
+        if not com_port:
+            messagebox.showerror(
+                "COM ポート未選択",
+                "VNA の COM ポートが選択されていません。\n"
+                "VNA を接続し、[ポート再検索] で一覧を更新してから選択してください。")
+            return
+
         self.measuring = True
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
+        self.port_combo.configure(state="disabled")   # 計測中はポート変更不可
+        self.rescan_btn.configure(state="disabled")
         self.status_var.set("接続中...")
         self.count_var.set("サンプル数: 0")
-        self._log("計測を開始します。")
+        self._log("計測を開始します。COM Port = {}（{} を計測）".format(
+            com_port, VNA_SPARAM))
         self.controller = MeasurementController(self.msg_queue)
-        self.controller.start()
+        self.controller.start(com_port)
 
     # ---- 計測終了 -> 保存 -> 終了 ----
     def on_stop(self):
@@ -944,6 +1080,8 @@ class App(tk.Tk):
         self.measuring = False
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        self.port_combo.configure(state="readonly")  # ポート再選択を許可
+        self.rescan_btn.configure(state="normal")
         self.status_var.set("エラーで停止。再開できます")
 
 
