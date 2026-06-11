@@ -58,17 +58,25 @@ NATNET_SERVER_IP = "127.0.0.1"  # 同一PCなので localhost (Motive と同じ 
 NATNET_LOCAL_IP  = "127.0.0.1"  # 同一PCなので localhost
 NATNET_USE_MULTICAST = False    # 同一PCループバックは Unicast 推奨
 
-# 計測する 3 個の単一マーカー(Labeled Marker)の ID
-# Motive 側で各マーカーに割り当てたラベル ID に合わせて変更する。
-# (NatNet の Labeled Marker ID は (model_id<<16 | marker_id) の合成値になる場合があり、
-#  本スクリプトは「生の ID」と「下位16bit(=marker_id)」の両方で照合する)
-UPPER_ARM_ID = 1   # 上腕   (Upper Arm)
-JOINT_ID     = 2   # 関節   (Joint / 肘など)
-FOREARM_ID   = 3   # 前腕   (Forearm)
+# 計測する 3 個の対象を「Motive 側で付けた名前」で指定する。
+# ★ID はハードコードしない★。実行ごとに変わる ID ではなく、この名前をキーに
+#   起動時の Data Descriptions(NAT_MODELDEF)から現在の ID/インデックスを自動解決する。
+#
+# 左 = スクリプト内部の論理名(CSV 列名に対応), 右 = Motive 上の名前(大文字小文字は無視)。
+# Motive 上で Rigid Body として作っていても、Marker Set 内の単一マーカーとして
+# 名前を付けていても、どちらでも同じ名前で解決できる(自動判別)。
+TARGET_NAMES = {
+    "UpperArm": "upperarm",   # 上腕   (Upper Arm)
+    "Joint":    "joint",      # 関節   (Joint / 肘など)
+    "Forearm":  "forearm",    # 前腕   (Forearm)
+}
 
-# True にすると、受信した全ラベル付きマーカーの ID を定期的にコンソールへ出力する。
-# どのマーカーにどの ID が割り当たっているか分からないときの ID 調査に使う。
-DEBUG_PRINT_MARKER_IDS = False
+# True にすると、受信した Data Descriptions に含まれる Rigid Body 名 / Marker Set 名と
+# マーカー名の一覧をコンソールへ出力する。Motive 側の正確な名前が分からないときの調査に使う。
+DEBUG_PRINT_DESCRIPTIONS = True
+
+# 名前解決(Data Descriptions 受信)を待つ最大秒数。
+DESC_RESOLVE_TIMEOUT_SEC = 5.0
 
 # オクルージョン(隠れ)状態のマーカーは座標が無効なため更新をスキップし、
 # 直前の有効値を保持する。
@@ -86,26 +94,95 @@ CSV_HEADER = ["Timestamp",
               "S11_Real", "S11_Imag", "Z_R", "Z_X"]
 
 
-# 内部処理で使う論理名 -> マーカー ID の対応表
-MARKER_IDS = {
-    "UpperArm": UPPER_ARM_ID,
-    "Joint":    JOINT_ID,
-    "Forearm":  FOREARM_ID,
-}
 PART_NAMES = ("UpperArm", "Joint", "Forearm")
 
 
-def match_marker_name(marker_id):
+# =============================================================================
+# 動的マッピング: Motive 上の名前 -> 現在の ID / インデックス
+# =============================================================================
+#
+# Data Descriptions を解決した結果をここに保持する。各論理名 (UpperArm 等) に対し、
+# 「フレームデータのどこから座標を取り出すか」を表す解決済みエントリを格納する。
+#   - Rigid Body の場合 : {"kind": "rigid_body", "id": <現在の RigidBody ID>}
+#   - Marker Set の場合 : {"kind": "marker_set", "set": <セット名>, "index": <マーカー番号>}
+#
+# _resolve_lock 下で書き込み、フレームコールバック側は基本的に起動直後に1回だけ
+# 確定したこの辞書を読む(以後不変)。
+_resolve_lock = threading.Lock()
+_resolved_targets = {}          # name -> エントリ(上記)
+_descriptions_ready = threading.Event()  # Data Descriptions を1回でも解析できたら set
+
+
+def _norm(s):
+    """名前比較用に正規化(前後空白除去 + 小文字化)。bytes も str も受ける。"""
+    if isinstance(s, bytes):
+        s = s.decode("utf-8", errors="ignore")
+    return s.strip().lower()
+
+
+def resolve_targets_from_descriptions(data_descs):
     """
-    受信した Labeled Marker の id_num を、計測対象 3 マーカーのどれかに突き合わせる。
-    NatNet の id_num は (model_id<<16 | marker_id) の合成値になり得るため、
-    生の id_num と下位 16bit(marker_id) の両方で照合する。一致しなければ None。
+    受信した DataDescriptions から、TARGET_NAMES の各名前に対応する
+    現在の ID / インデックスを解決して _resolved_targets を更新する。
+
+    Rigid Body 名で一致すれば rigid_body エントリ、見つからなければ
+    Marker Set 内のマーカー名で一致を探して marker_set エントリにする。
     """
-    low16 = marker_id & 0x0000FFFF
-    for name, target in MARKER_IDS.items():
-        if marker_id == target or low16 == target:
-            return name
-    return None
+    # 解決しやすいように、説明側を正規化名で索引化する。
+    rb_by_name = {}                 # 正規化RB名 -> RigidBodyDescription
+    for rb in getattr(data_descs, "rigid_body_list", []) or []:
+        rb_by_name[_norm(getattr(rb, "sz_name", ""))] = rb
+
+    # Marker Set 内のマーカー名 -> (セット名, そのセット内インデックス)
+    marker_by_name = {}
+    for ms in getattr(data_descs, "marker_set_list", []) or []:
+        set_name = getattr(ms, "marker_set_name", "")
+        for idx, mname in enumerate(getattr(ms, "marker_names_list", []) or []):
+            marker_by_name[_norm(mname)] = (set_name, idx)
+
+    if DEBUG_PRINT_DESCRIPTIONS:
+        print("[DESC] Rigid Bodies: {}".format(
+            ", ".join("{}(id={})".format(_norm(rb.sz_name), rb.id_num)
+                      for rb in rb_by_name.values()) or "(なし)"))
+        print("[DESC] Marker Set マーカー名: {}".format(
+            ", ".join("{}[{}#{}]".format(n, _norm(s), i)
+                      for n, (s, i) in marker_by_name.items()) or "(なし)"))
+
+    resolved = {}
+    for logical, motive_name in TARGET_NAMES.items():
+        key = _norm(motive_name)
+        if key in rb_by_name:
+            rb = rb_by_name[key]
+            resolved[logical] = {"kind": "rigid_body", "id": rb.id_num}
+        elif key in marker_by_name:
+            set_name, idx = marker_by_name[key]
+            resolved[logical] = {
+                "kind": "marker_set", "set": set_name, "index": idx}
+        # 見つからなければ resolved に入れない(未解決として後で警告)
+
+    with _resolve_lock:
+        _resolved_targets.clear()
+        _resolved_targets.update(resolved)
+    _descriptions_ready.set()
+
+    # 解決結果のログ
+    for logical in PART_NAMES:
+        ent = resolved.get(logical)
+        if ent is None:
+            print("[WARN] '{}'(Motive名='{}') を Data Descriptions 内に発見できませんでした。"
+                  .format(logical, TARGET_NAMES[logical]))
+        elif ent["kind"] == "rigid_body":
+            print("[INFO] {} -> Rigid Body (現在ID={})".format(logical, ent["id"]))
+        else:
+            print("[INFO] {} -> Marker Set '{}' の {} 番目のマーカー".format(
+                logical, _norm(ent["set"]), ent["index"]))
+    return resolved
+
+
+def get_resolved_targets():
+    """フレームコールバックから呼ぶ: 解決済みマッピングのスナップショット。"""
+    with _resolve_lock:
+        return dict(_resolved_targets)
 
 
 # =============================================================================
@@ -304,55 +381,117 @@ def _ensure_natnet_on_path():
             sys.path.insert(0, d)
 
 
-# DEBUG_PRINT_MARKER_IDS 用: 直近に出力した時刻
-_dbg_last_print = [0.0]
+def _extract_rigid_body_positions(mocap, resolved):
+    """解決済みの rigid_body エントリについて、現在フレームから id 一致の座標を取り出す。"""
+    rb_data = getattr(mocap, "rigid_body_data", None)
+    if rb_data is None:
+        return
+    rb_list = getattr(rb_data, "rigid_body_list", None) or []
+    # id -> 論理名 の逆引き(rigid_body のものだけ)
+    id_to_name = {ent["id"]: name
+                  for name, ent in resolved.items() if ent["kind"] == "rigid_body"}
+    if not id_to_name:
+        return
+    for rb in rb_list:
+        name = id_to_name.get(getattr(rb, "id_num", None))
+        if name is None:
+            continue
+        # トラッキング有効フラグ(tracking_valid)が False の間は更新しない
+        if SKIP_OCCLUDED and not getattr(rb, "tracking_valid", True):
+            continue
+        pos = rb.pos
+        update_latest_position(name, float(pos[0]), float(pos[1]), float(pos[2]))
+
+
+def _extract_marker_set_positions(mocap, resolved):
+    """解決済みの marker_set エントリについて、セット名+インデックスで座標を取り出す。"""
+    ms_data = getattr(mocap, "marker_set_data", None)
+    if ms_data is None:
+        return
+    ms_list = getattr(ms_data, "marker_data_list", None) or []
+    # (正規化セット名, index) -> 論理名 の逆引き
+    want = {(_norm(ent["set"]), ent["index"]): name
+            for name, ent in resolved.items() if ent["kind"] == "marker_set"}
+    if not want:
+        return
+    for md in ms_list:
+        set_key = _norm(getattr(md, "model_name", ""))
+        pos_list = getattr(md, "marker_pos_list", None) or []
+        for idx, pos in enumerate(pos_list):
+            name = want.get((set_key, idx))
+            if name is None:
+                continue
+            update_latest_position(name, float(pos[0]), float(pos[1]), float(pos[2]))
 
 
 def _on_frame_with_data(data_dict):
     """
     NatNetClient の new_frame_with_data_listener コールバック。
     1 フレームごとに呼ばれ、data_dict["mocap_data"] に MoCapData が入る。
-    そこから Labeled Marker のリストを取り出し、対象 3 マーカーの座標を更新する。
+    起動時に解決した name->(ID/インデックス) マッピングを使って、対象 3 点の座標を更新する。
     """
     mark_frame_received()
 
     mocap = data_dict.get("mocap_data")
     if mocap is None:
         return
-    lm_data = getattr(mocap, "labeled_marker_data", None)
-    if lm_data is None:
-        return
-    markers = getattr(lm_data, "labeled_marker_list", None)
-    if not markers:
+
+    resolved = get_resolved_targets()
+    if not resolved:
+        return  # まだ名前解決が済んでいない
+
+    # Rigid Body 由来と Marker Set 由来の両方を取り出す(混在していてもよい)。
+    _extract_rigid_body_positions(mocap, resolved)
+    _extract_marker_set_positions(mocap, resolved)
+
+
+def _install_description_capture(client):
+    """
+    この同梱 NatNet SDK は Data Descriptions を内部で print するだけで、
+    コールバックも保持用属性も提供しない。そこで SDK ファイルには手を入れず、
+    Data Descriptions を解析する private メソッドをインスタンス単位でラップし、
+    解析結果を横取りして resolve_targets_from_descriptions() に渡す。
+
+    NatNet の private メソッド名はクラス名でマングリングされるため、
+    実体は '_NatNetClient__unpack_data_descriptions' でアクセスする。
+    インスタンス属性に関数を差し込むと、SDK 内部の self.__unpack_data_descriptions(...)
+    呼び出しはこのラッパへ解決される(インスタンス辞書がクラス属性より優先されるため)。
+    """
+    mangled = "_NatNetClient__unpack_data_descriptions"
+    original = getattr(client, mangled, None)
+    if original is None:
+        print("[WARN] SDK の data descriptions 解析メソッドが見つかりません。"
+              "名前の自動解決ができない可能性があります。")
         return
 
-    if DEBUG_PRINT_MARKER_IDS:
-        now = time.time()
-        if now - _dbg_last_print[0] > 1.0:  # 1秒に1回だけ
-            _dbg_last_print[0] = now
-            ids = []
-            for m in markers:
-                model_id = m.id_num >> 16
-                marker_id = m.id_num & 0x0000FFFF
-                ids.append("id_num={} (model={}, marker={})".format(
-                    m.id_num, model_id, marker_id))
-            print("[DEBUG] Labeled Markers ({}): {}".format(len(markers), " | ".join(ids)))
+    def wrapper(data, packet_size, major, minor):
+        offset, data_descs = original(data, packet_size, major, minor)
+        try:
+            resolve_targets_from_descriptions(data_descs)
+        except Exception as e:  # 解決失敗でも受信自体は壊さない
+            print("[WARN] Data Descriptions の名前解決に失敗: {}".format(e))
+        return offset, data_descs
 
-    for m in markers:
-        # オクルージョン判定(param bit0)
-        if SKIP_OCCLUDED and (getattr(m, "param", 0) & 0x01):
-            continue
-        name = match_marker_name(m.id_num)
-        if name is None:
-            continue  # 計測対象外のマーカー
-        pos = m.pos
-        update_latest_position(name, float(pos[0]), float(pos[1]), float(pos[2]))
+    setattr(client, mangled, wrapper)
+
+
+def _request_model_definitions(client):
+    """サーバ(Motive)へ Data Descriptions(NAT_MODELDEF)を明示的に要求する。"""
+    try:
+        client.send_request(
+            client.command_socket,
+            client.NAT_REQUEST_MODELDEF,
+            "",
+            (client.server_ip_address, client.command_port),
+        )
+    except Exception as e:
+        print("[WARN] NAT_REQUEST_MODELDEF の送信に失敗: {}".format(e))
 
 
 def start_natnet():
     """
-    NatNetClient を起動し、Labeled Marker 受信コールバックを登録する。
-    成功すると streaming_client を返す。失敗時は None。
+    NatNetClient を起動し、Data Descriptions による名前解決とフレーム受信コールバックを
+    セットアップする。成功すると streaming_client を返す。失敗時は None。
     """
     _ensure_natnet_on_path()
     try:
@@ -368,6 +507,9 @@ def start_natnet():
     client.set_client_address(NATNET_LOCAL_IP)
     client.set_server_address(NATNET_SERVER_IP)
     client.set_use_multicast(NATNET_USE_MULTICAST)
+
+    # Data Descriptions(名前→ID)を横取りするためのフックを先に仕掛ける
+    _install_description_capture(client)
 
     # フレームごとに MoCapData を受け取るコールバックを登録
     client.new_frame_with_data_listener = _on_frame_with_data
@@ -396,6 +538,16 @@ def start_natnet():
     else:
         print("[INFO] NatNet 起動。Motive からのフレーム受信待ち...")
         print("       (まだサーバ応答なし。Motive の Data Streaming 設定を確認してください)")
+
+    # --- Data Descriptions を要求し、名前→ID の解決完了を待つ ---
+    print("[INFO] Data Descriptions を要求して名前を解決します...")
+    _request_model_definitions(client)
+    if not _descriptions_ready.wait(timeout=DESC_RESOLVE_TIMEOUT_SEC):
+        # 自動要求に応答が来なくても、Motive が定期配信していれば後から解決されることがある。
+        print("[WARN] {:.0f}s 以内に Data Descriptions を取得できませんでした。"
+              .format(DESC_RESOLVE_TIMEOUT_SEC))
+        print("       Motive の Data Streaming で対象を配信しているか、名前("
+              + " / ".join(TARGET_NAMES.values()) + ")が正しいか確認してください。")
     return client
 
 
@@ -437,8 +589,18 @@ def main():
     if natnet_client is None:
         print("[WARN] OptiTrack なしで続行します(座標列は空欄になります)。")
     else:
-        print("[INFO] 計測対象マーカー ID -> UpperArm={}, Joint={}, Forearm={}".format(
-            UPPER_ARM_ID, JOINT_ID, FOREARM_ID))
+        resolved = get_resolved_targets()
+        print("[INFO] 計測対象(Motive名 -> 解決結果):")
+        for logical in PART_NAMES:
+            ent = resolved.get(logical)
+            if ent is None:
+                desc = "未解決"
+            elif ent["kind"] == "rigid_body":
+                desc = "RigidBody id={}".format(ent["id"])
+            else:
+                desc = "MarkerSet '{}' #{}".format(_norm(ent["set"]), ent["index"])
+            print("       {:8s} ('{}') -> {}".format(
+                logical, TARGET_NAMES[logical], desc))
 
     # OptiTrack の初回データ到着を待つ(3 マーカーすべて)
     if natnet_client is not None:
@@ -451,9 +613,10 @@ def main():
         else:
             snap = read_latest_positions()
             missing = [n for n in PART_NAMES if not snap[n][3]]
-            print("[WARN] 初期データ未受信のマーカーがあります: {}".format(missing))
-            print("       マーカー ID/ラベル付け/トラッキング状態/Labeled Markers 配信設定を確認してください。")
-            print("       (DEBUG_PRINT_MARKER_IDS=True にすると受信中の ID 一覧を確認できます)")
+            print("[WARN] 初期データ未受信の対象があります: {}".format(missing))
+            print("       Motive 側の名前/トラッキング状態/Data Streaming(Rigid Bodies または")
+            print("       Markers)の配信設定を確認してください。")
+            print("       (DEBUG_PRINT_DESCRIPTIONS=True にすると受信した名前一覧を確認できます)")
 
     # --- CSV 準備 & 計測ループ ---
     sample_count = 0
