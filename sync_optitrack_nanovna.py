@@ -79,6 +79,21 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 
 # =============================================================================
+# コンソール出力ポリシー
+# =============================================================================
+# 計測中の細かいログはコンソールに出さず GUI ログに集約する。
+# CONSOLE_VERBOSE=True にすると、補助的な [INFO]/自動判別結果などもコンソールに出す。
+# (重要イベント[計測開始/保存完了/エラー]とエラー詳細は常にコンソールへ出力する)
+CONSOLE_VERBOSE = False
+
+
+def _dbg(*args):
+    """補助ログ。CONSOLE_VERBOSE のときのみコンソール出力する。"""
+    if CONSOLE_VERBOSE:
+        print(*args)
+
+
+# =============================================================================
 # 設定（ここを環境に合わせて変更してください）
 # =============================================================================
 
@@ -248,9 +263,9 @@ def try_calibrate(objects):
         now = time.time()
         if now - _calib_warn_time[0] > 2.0:
             _calib_warn_time[0] = now
-            print("[WARN] 有効な対象が {} 個あります(期待値 {})。"
-                  "余分な対象を Motive 側で外すか OBJECT_SOURCE を見直してください。"
-                  .format(len(objects), EXPECTED_OBJECT_COUNT))
+            _dbg("[WARN] 有効な対象が {} 個あります(期待値 {})。"
+                 "余分な対象を Motive 側で外すか OBJECT_SOURCE を見直してください。"
+                 .format(len(objects), EXPECTED_OBJECT_COUNT))
         return False
 
     # 高さ(指定軸の座標)で降順ソート: [0]=最も高い, [-1]=最も低い
@@ -268,9 +283,9 @@ def try_calibrate(objects):
     _calibrated.set()
 
     axis_name = {0: "X", 1: "Y", 2: "Z"}.get(HEIGHT_AXIS_INDEX, "?")
-    print("[INFO] 自動判別 完了(開始時の高さ {} 軸で降順):".format(axis_name))
+    _dbg("[INFO] 自動判別 完了(開始時の高さ {} 軸で降順):".format(axis_name))
     for part, (oid, pos) in zip(("UpperArm", "Joint", "Forearm"), ordered):
-        print("       {:8s} <- id={}  (高さ {}={:.3f})".format(
+        _dbg("       {:8s} <- id={}  (高さ {}={:.3f})".format(
             part, oid, axis_name, pos[HEIGHT_AXIS_INDEX]))
     return True
 
@@ -594,6 +609,11 @@ def start_natnet():
     client.set_client_address(NATNET_LOCAL_IP)
     client.set_server_address(NATNET_SERVER_IP)
     client.set_use_multicast(NATNET_USE_MULTICAST)
+    # 毎フレームのコンソール出力(MoCap Frame ダンプ等)を抑制する
+    try:
+        client.set_print_level(0)
+    except Exception:
+        pass
 
     # フレームごとに MoCapData を受け取るコールバックを登録
     client.new_frame_with_data_listener = _on_frame_with_data
@@ -618,10 +638,10 @@ def start_natnet():
     time.sleep(1.0)
     app_name = getattr(client, "get_application_name", lambda: "")() or ""
     if app_name and app_name != "Not Set":
-        print("[INFO] Motive へ接続しました (server app: {}).".format(app_name))
+        _dbg("[INFO] Motive へ接続しました (server app: {}).".format(app_name))
     else:
-        print("[INFO] NatNet 起動。Motive からのフレーム受信待ち...")
-        print("       (まだサーバ応答なし。Motive の Data Streaming 設定を確認してください)")
+        _dbg("[INFO] NatNet 起動。Motive からのフレーム受信待ち...")
+        _dbg("       (まだサーバ応答なし。Motive の Data Streaming 設定を確認してください)")
 
     # 自動判別(キャリブレーション)の完了待ちは呼び出し側(ワーカー)が
     # 停止フラグを見ながら中断可能な形で行う。ここではブロックしない。
@@ -639,7 +659,7 @@ def shutdown_natnet(client):
     try:
         client.shutdown()
     except Exception as e:
-        print("[WARN] NatNet shutdown 中に例外(無視): {}".format(e))
+        _dbg("[WARN] NatNet shutdown 中に例外(無視): {}".format(e))
     # SDK のスレッドが残っていれば join を試みる(取りこぼし防止)。
     for attr in ("data_thread", "command_thread"):
         th = getattr(client, attr, None)
@@ -877,7 +897,7 @@ class MeasurementController:
                 try:
                     self.vna.close()
                 except Exception as e:
-                    print("[WARN] VNA close 中に例外(無視): {}".format(e))
+                    _dbg("[WARN] VNA close 中に例外(無視): {}".format(e))
                 self.vna = None
 
             # 3) NatNet を停止 -> UDP ソケット/受信スレッド解放
@@ -921,6 +941,7 @@ class App(tk.Tk):
         self.measuring = False
         self._finalizing = False  # 停止→保存→終了の処理中フラグ
         self._latest_plot = None  # 直近の (z_r, z_x)。poll ごとに1回だけ描画する
+        self._counter_active = False  # コンソールの \r カウンタ行が出ているか
 
         # グラフ横軸(周波数 MHz)は固定
         self._freq_mhz = FREQ_GRID_HZ / 1e6
@@ -1107,6 +1128,23 @@ class App(tk.Tk):
         self.log.see("end")
         self.log.configure(state="disabled")
 
+    # ---- コンソール出力(重要イベントのみ。毎フレームは出さない) ----
+    def _console_event(self, text):
+        """重要イベントを通常の1行でコンソールに残す。"""
+        self._finalize_counter_line()
+        print(text, flush=True)
+
+    def _console_counter(self, count):
+        """計測中の取得数を「同じ1行」で上書き更新する(\\r)。"""
+        print("\r[計測中] データ取得数: {} 件...".format(count), end="", flush=True)
+        self._counter_active = True
+
+    def _finalize_counter_line(self):
+        """\\r で更新中のカウンタ行があれば、改行して確定させる。"""
+        if self._counter_active:
+            print("", flush=True)
+            self._counter_active = False
+
     # ---- 計測開始 ----
     def on_start(self):
         if self.measuring:
@@ -1128,11 +1166,12 @@ class App(tk.Tk):
         self.status_var.set("接続中...")
         self.count_var.set("サンプル数: 0")
         if com_port == TEST_MODE:
-            self._log("計測を開始します。【VNAなしテストモード】"
-                      "VNA をスキップし OptiTrack のみ取得します（VNA 列は 0）。")
+            msg = "計測を開始しました。【VNAなしテストモード】OptiTrack のみ取得（VNA 列は 0）。"
         else:
-            self._log("計測を開始します。COM Port = {}（{} を計測）".format(
-                com_port, VNA_SPARAM))
+            msg = "計測を開始しました。COM Port = {}（{} を計測）".format(
+                com_port, VNA_SPARAM)
+        self._log(msg)
+        self._console_event("[計測開始] " + msg)  # 重要イベントはコンソールにも残す
         self.controller = MeasurementController(self.msg_queue)
         self.controller.start(com_port)
 
@@ -1172,10 +1211,13 @@ class App(tk.Tk):
             try:
                 written = self.controller.save_csv(path)
                 self._log("保存しました: {} ({} サンプル)".format(path, written))
+                self._console_event(
+                    "[保存完了] {} 件を保存しました: {}".format(written, path))
                 messagebox.showinfo(
                     "保存完了", "{} サンプルを保存しました。\n{}".format(written, path))
             except Exception as e:
                 self._log("保存に失敗: {}".format(e))
+                self._console_event("[保存エラー] {}".format(e))
                 messagebox.showerror("保存エラー", "保存に失敗しました:\n{}".format(e))
         else:
             # キャンセル時: データ破棄の確認
@@ -1213,26 +1255,33 @@ class App(tk.Tk):
 
     # ---- GUI メッセージのポーリング ----
     def _poll_messages(self):
-        self._latest_plot = None  # この poll サイクルで届いた最新の Z スイープ
+        self._latest_plot = None   # この poll サイクルで届いた最新の Z スイープ
+        latest_count = None        # この poll サイクルで届いた最新のサンプル数
         try:
             while True:
                 kind, value = self.msg_queue.get_nowait()
                 if kind == "status":
+                    # ステータスは GUI ログのみに出す(コンソールは汚さない)
                     self.status_var.set(value)
                     self._log(value)
                 elif kind == "sample":
                     self.count_var.set("サンプル数: {}".format(value))
+                    latest_count = value
                 elif kind == "plot":
                     # 最新値だけ保持し、描画はループ後に1回だけ行う(間引き)
                     self._latest_plot = value
                 elif kind == "error":
+                    self._finalize_counter_line()
                     self._log("[エラー] " + str(value))
+                    self._console_event("[エラー] " + str(value))
                     messagebox.showerror("エラー", str(value))
                     # 致命的エラー: 計測を畳んでボタンを戻す
                     self._recover_after_error()
                 elif kind == "finished":
+                    self._finalize_counter_line()
                     self._log("計測ループ終了。")
                 elif kind == "ready_to_save":
+                    self._finalize_counter_line()
                     self.status_var.set("停止しました")
                     self.count_var.set("サンプル数: {}".format(
                         self.controller.get_sample_count() if self.controller else 0))
@@ -1240,6 +1289,9 @@ class App(tk.Tk):
                     return  # ウィンドウ破棄後に after を再登録しない
         except queue.Empty:
             pass
+        # 今サイクルに届いた最新サンプル数を「同じ1行」で上書き表示(コンソール)
+        if latest_count is not None:
+            self._console_counter(latest_count)
         # 今サイクルに届いた最新スイープでグラフを 1 回だけ更新(描画負荷を抑制)
         if self._latest_plot is not None:
             z_r, z_x = self._latest_plot

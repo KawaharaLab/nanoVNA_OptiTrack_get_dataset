@@ -2079,9 +2079,10 @@ class NatNetClient:
 
             offset_tmp, mocap_data = self.__unpack_mocap_data(data[offset:], packet_size, major, minor) #type: ignore  # noqa E501
             offset += offset_tmp
-            print("MoCap Frame: %d\n" % (mocap_data.prefix_data.frame_number))
-            # get a string version of the data for output
+            # print_level=0(set_print_level(0))のとき毎フレームのコンソール出力を抑制する
             if print_level >= 1:
+                print("MoCap Frame: %d\n" % (mocap_data.prefix_data.frame_number))
+                # get a string version of the data for output
                 mocap_data_str = mocap_data.get_as_string()
                 print(" %s\n" % mocap_data_str)
 
@@ -2090,10 +2091,10 @@ class NatNetClient:
             trace("Packet Size: %d" % packet_size)
             offset_tmp, data_descs = self.__unpack_data_descriptions(data[offset:], packet_size, major, minor) #type: ignore  # noqa E501
             offset += offset_tmp
-            print("Data Descriptions:\n")
             # get a string version of the data for output
-            data_descs_str = data_descs.get_as_string()
             if print_level > 0:
+                print("Data Descriptions:\n")
+                data_descs_str = data_descs.get_as_string()
                 print(" %s\n" % (data_descs_str))
 
         elif message_id == self.NAT_SERVERINFO:
