@@ -77,9 +77,17 @@ from tkinter import ttk, filedialog, messagebox
 # --- JNCRadio VNA 3G (シリアル) ---
 NANOVNA_PORT   = "COM3"        # Windows のデバイスマネージャーで確認した COM 番号
 NANOVNA_BAUD   = 115200        # ボーレート(JNCRadio VNA 3G は 115200 を推奨)
-TARGET_FREQ_HZ = 13_560_000    # 取得したい単一周波数 [Hz] (例: 13.56 MHz)
-SCAN_POINTS    = 11            # 1回の scan の掃引点数(本機の最小は 11)。同一周波数で平均する
+TARGET_FREQ_HZ = 13_560_000    # 採用したい中心周波数 [Hz] (13.56 MHz)
 Z0             = 50.0          # 特性インピーダンス [Ω]
+
+# --- 掃引(スイープ)範囲の固定 ---
+# start==stop の縮退掃引はファームによって不安定(全反射のような値)になりやすいため、
+# 13.56MHz を含む「ごく狭い範囲」を掃引し、その中から TARGET_FREQ_HZ に最も近い点を
+# 採用する。下記既定(13.0-14.0MHz / 101点)では 13.56MHz が掃引点にちょうど一致する。
+# ピンポイント掃引にしたい場合は SWEEP_START_HZ == SWEEP_STOP_HZ に設定する。
+SWEEP_START_HZ = 13_000_000    # 掃引開始 [Hz] (13.00 MHz)
+SWEEP_STOP_HZ  = 14_000_000    # 掃引終了 [Hz] (14.00 MHz)
+SCAN_POINTS    = 101           # 掃引点数(範囲/分解能に応じて。多いほど精度↑だが1掃引が遅くなる)
 
 # --- 計測する S パラメータ(S11 固定) ---
 # 本機(NanoVNA 系)のコンソール `scan {start} {stop} {pts} {outmask}` は outmask の
@@ -87,6 +95,14 @@ Z0             = 50.0          # 特性インピーダンス [Ω]
 # 本システムは S11 固定で計測する。
 VNA_SPARAM  = "S11"
 VNA_OUTMASK = 2
+
+# --- VNA 未接続テストモード(OptiTrack 単体テスト用) ---
+# COM ポート一覧に「None(VNAなしテストモード)」を追加する。これを選んで計測開始すると、
+# VNA の接続・初期化を一切スキップし、OptiTrack の座標だけを取得する。
+# VNA 由来のカラム(S11_Real, S11_Imag, Z_R, Z_X)にはダミー値 0 を入れて同期させる。
+NO_VNA_DISPLAY = "None（VNAなしテストモード）"  # ドロップダウンの表示名
+TEST_MODE = "__TEST_NO_VNA__"                  # get_selected_port が返す内部センチネル
+TEST_MODE_INTERVAL_SEC = 0.1                    # テストモードの1サンプル間隔[秒](律速が無いため)
 
 # 使用する COM ポートは GUI のドロップダウンで選択する(下記は初期選択の候補)。
 # 起動時にこの値が一覧に存在すれば初期選択される。無ければ一覧の先頭を選ぶ。
@@ -355,21 +371,44 @@ class NanoVNA:
     の順で応答する(マニュアル §7)。scan コマンドで毎回フレッシュな掃引を実行する。
 
         scan {start(Hz)} {stop(Hz)} [points] [outmask]
-        outmask=2 -> 各掃引点の S11 データ(real imag)のみを出力
+        outmask は出力内容のビット指定: bit0(=1) 周波数, bit1(=2) S11, bit2(=4) S21
+        本クラスは「周波数 + S11」を出力(outmask=3)し、各点の周波数を見て
+        TARGET_FREQ_HZ に最も近い点の S11 を採用する。
+
+    初期化時に sweep コマンドでデバイスの掃引範囲を 13.56MHz 付近に固定する。
     """
 
     PROMPT = b"ch> "
 
     def __init__(self, port, baud=115200, timeout=2.0):
-        # 計測は S11 固定(scan の outmask=2)。
-        self.outmask = VNA_OUTMASK
+        # 計測は S11 固定。scan には周波数ビット(1)を足して "周波数+S11"(=3)を出力させる。
         self.sparam = VNA_SPARAM
+        self.scan_outmask = (1 | VNA_OUTMASK)  # 1(周波数) | 2(S11) = 3
         self.ser = serial.Serial(port, baud, timeout=timeout)
         time.sleep(0.2)
         self.ser.reset_input_buffer()
         self.ser.reset_output_buffer()
         # 連続出力を止めてプロンプト状態を確定させる
         self._send_raw("pause")
+        self._read_until_prompt()
+        # 掃引範囲を 13.56MHz 付近に固定(初期化コマンド)
+        self.setup_sweep()
+
+    def setup_sweep(self):
+        """
+        デバイスの掃引範囲を SWEEP_START_HZ 〜 SWEEP_STOP_HZ / SCAN_POINTS に固定する。
+        NanoVNA 系コンソールの `sweep {start} {stop} {points}` を発行する。
+        (この設定はキャリブレーションの補間や表示の基準にもなる)
+        ファームが当該書式に対応していなくても、毎回の scan が範囲を指定するため
+        計測自体は継続できる。
+        """
+        cmd = "sweep {start} {stop} {points}".format(
+            start=int(SWEEP_START_HZ),
+            stop=int(SWEEP_STOP_HZ),
+            points=int(SCAN_POINTS),
+        )
+        self.ser.reset_input_buffer()
+        self._send_raw(cmd)
         self._read_until_prompt()
 
     def _send_raw(self, cmd):
@@ -393,52 +432,55 @@ class NanoVNA:
         return buf.decode("ascii", errors="ignore")
 
     @staticmethod
-    def _parse_sparam_lines(text):
+    def _parse_scan_lines(text):
         """
-        受信テキストから S パラメータの (real, imag) ペア群を抽出する。
-        単一ビット outmask の各データ行は "real imag" の2列。2 float に解釈できない行
+        outmask=3("周波数 S11_real S11_imag")の scan 出力をパースする。
+        各データ行は "freq real imag" の 3 列。3 float に解釈できない行
         (コマンドエコー・プロンプト等)はスキップする。
+        戻り値: [(freq_hz, real, imag), ...]
         """
-        pairs = []
+        triples = []
         for line in text.splitlines():
             line = line.strip()
             if not line:
                 continue
             tokens = line.split()
-            if len(tokens) < 2:
+            if len(tokens) < 3:
                 continue
             try:
-                real = float(tokens[0])
-                imag = float(tokens[1])
+                freq = float(tokens[0])
+                real = float(tokens[1])
+                imag = float(tokens[2])
             except ValueError:
                 continue
-            pairs.append((real, imag))
-        return pairs
+            triples.append((freq, real, imag))
+        return triples
 
     def measure_sparam(self):
         """
-        単一周波数 TARGET_FREQ_HZ で 1 回 scan を実行し、選択中の S パラメータ
-        (self.sparam / self.outmask)を複素数で返す。
-        SCAN_POINTS 点はすべて同一周波数(start==stop)なので平均してノイズを抑える。
+        SWEEP_START_HZ 〜 SWEEP_STOP_HZ を SCAN_POINTS 点で 1 回 scan し、
+        各点の周波数を見て TARGET_FREQ_HZ に最も近い点の S11 を複素数で返す。
+        最近傍周波数が複数点ある場合(ピンポイント掃引等)は平均してノイズを抑える。
         取得失敗時は None を返す。
-
-        outmask は単一ビットのみを指定するため、各データ行の先頭 2 列が
-        選択 S パラメータの (real, imag) になる(列構成は S パラメータに依らない)。
         """
         cmd = "scan {start} {stop} {pts} {mask}".format(
-            start=int(TARGET_FREQ_HZ),
-            stop=int(TARGET_FREQ_HZ),
+            start=int(SWEEP_START_HZ),
+            stop=int(SWEEP_STOP_HZ),
             pts=int(SCAN_POINTS),
-            mask=int(self.outmask),
+            mask=int(self.scan_outmask),
         )
         self.ser.reset_input_buffer()
         self._send_raw(cmd)
         text = self._read_until_prompt()
-        pairs = self._parse_sparam_lines(text)
-        if not pairs:
+        triples = self._parse_scan_lines(text)
+        if not triples:
             return None
-        avg_real = sum(p[0] for p in pairs) / len(pairs)
-        avg_imag = sum(p[1] for p in pairs) / len(pairs)
+
+        # TARGET_FREQ_HZ に最も近い周波数を求め、その周波数の点(複数あれば平均)を採用
+        nearest_freq = min(triples, key=lambda t: abs(t[0] - TARGET_FREQ_HZ))[0]
+        sel = [t for t in triples if t[0] == nearest_freq]
+        avg_real = sum(t[1] for t in sel) / len(sel)
+        avg_imag = sum(t[2] for t in sel) / len(sel)
         return complex(avg_real, avg_imag)
 
     def close(self):
@@ -654,24 +696,35 @@ class MeasurementController:
 
     # ---- ワーカースレッド本体 ----
     def _worker_loop(self):
-        # 1) VNA 接続(S11 固定)。COM ポートが開けない場合は friendly なエラーを通知。
-        #    SerialException / FileNotFoundError はいずれも OSError のサブクラス。
-        try:
-            self.vna = NanoVNA(self.com_port, NANOVNA_BAUD)
-        except OSError as e:
-            self._post("error",
-                       "VNAの接続に失敗しました。\n"
-                       "COM番号({})が正しいか、他のソフトが占有していないか確認してください。\n"
-                       "（VNA を後から挿した場合は「ポート再検索」で一覧を更新できます）\n"
-                       "\n詳細: {}".format(self.com_port, e))
-            self._post("finished")
-            return
-        except Exception as e:
-            self._post("error", "VNA 初期化中に予期せぬ例外: {}".format(e))
-            self._post("finished")
-            return
-        self._post("status", "VNA 接続 OK: {} @ {}bps, {:.3f} MHz ({} 計測)".format(
-            self.com_port, NANOVNA_BAUD, TARGET_FREQ_HZ / 1e6, VNA_SPARAM))
+        test_mode = (self.com_port == TEST_MODE)
+
+        # 1) VNA 接続(S11 固定)。テストモードなら接続・初期化を完全にスキップする。
+        if test_mode:
+            self.vna = None
+            self._post("status",
+                       "【VNAなしテストモード】VNA 接続をスキップしました（VNA 列は 0）。")
+        else:
+            # COM ポートが開けない場合は friendly なエラーを通知。
+            # SerialException / FileNotFoundError はいずれも OSError のサブクラス。
+            try:
+                self.vna = NanoVNA(self.com_port, NANOVNA_BAUD)
+            except OSError as e:
+                self._post("error",
+                           "VNAの接続に失敗しました。\n"
+                           "COM番号({})が正しいか、他のソフトが占有していないか確認してください。\n"
+                           "（VNA を後から挿した場合は「ポート再検索」で一覧を更新できます）\n"
+                           "\n詳細: {}".format(self.com_port, e))
+                self._post("finished")
+                return
+            except Exception as e:
+                self._post("error", "VNA 初期化中に予期せぬ例外: {}".format(e))
+                self._post("finished")
+                return
+            self._post("status",
+                       "VNA 接続 OK: {} @ {}bps / 掃引 {:.3f}-{:.3f} MHz {}点 → {:.3f} MHz の {} を採用".format(
+                           self.com_port, NANOVNA_BAUD,
+                           SWEEP_START_HZ / 1e6, SWEEP_STOP_HZ / 1e6, SCAN_POINTS,
+                           TARGET_FREQ_HZ / 1e6, VNA_SPARAM))
 
         # 2) NatNet 開始(ブロックしない)
         self.client = start_natnet()
@@ -699,16 +752,23 @@ class MeasurementController:
         self._post("status", "計測中...")
         last_stale_warn = 0.0
         while not _stop_event.is_set():
-            try:
-                s11 = self.vna.measure_sparam()
-            except serial.SerialException as e:
-                self._post("error", "VNA シリアル通信が切断されました: {}".format(e))
-                break
-            except Exception as e:
-                self._post("error", "VNA 取得中に例外: {}".format(e))
-                break
-            if s11 is None:
-                continue  # パース失敗はスキップ
+            if test_mode:
+                # VNA は使わない。ダミーの S 値を入れ、適度な間隔でサンプリングする。
+                s11 = None  # 下のダミーカラム生成で使う(値は使わない)
+                # _stop_event.wait() は停止時に即座に抜けられる中断可能な待機。
+                if _stop_event.wait(TEST_MODE_INTERVAL_SEC):
+                    break
+            else:
+                try:
+                    s11 = self.vna.measure_sparam()
+                except serial.SerialException as e:
+                    self._post("error", "VNA シリアル通信が切断されました: {}".format(e))
+                    break
+                except Exception as e:
+                    self._post("error", "VNA 取得中に例外: {}".format(e))
+                    break
+                if s11 is None:
+                    continue  # パース失敗はスキップ
 
             if self.client is not None:
                 elapsed = seconds_since_last_frame()
@@ -720,15 +780,20 @@ class MeasurementController:
                                "[警告] OptiTrack フレームが {:.1f}s 途絶(座標が古い可能性)".format(elapsed))
 
             snap = read_latest_positions()
-            z_r, z_x = s11_to_impedance(s11, Z0)
             ts = datetime.now().isoformat(timespec="milliseconds")
+            if test_mode:
+                # VNA 由来のカラムはダミー値 0(S11_Real, S11_Imag, Z_R, Z_X)
+                vna_cols = ["0", "0", "0", "0"]
+            else:
+                z_r, z_x = s11_to_impedance(s11, Z0)
+                vna_cols = ["{:.6f}".format(s11.real), "{:.6f}".format(s11.imag),
+                            "{:.4f}".format(z_r), "{:.4f}".format(z_x)]
             row = (
                 [ts]
                 + _fmt_xyz(snap, "UpperArm")
                 + _fmt_xyz(snap, "Joint")
                 + _fmt_xyz(snap, "Forearm")
-                + ["{:.6f}".format(s11.real), "{:.6f}".format(s11.imag),
-                   "{:.4f}".format(z_r), "{:.4f}".format(z_x)]
+                + vna_cols
             )
             with self.rows_lock:
                 self.rows.append(row)
@@ -812,7 +877,14 @@ class App(tk.Tk):
 
         # 全ウィジェット(self.log を含む)の構築後に COM ポートを取得する。
         # (構築前に呼ぶと self._log() が self.log を参照できず AttributeError になる)
-        self._scan_ports()
+        count = self._scan_ports()
+        if count > 0:
+            self._log("COM ポートを検出しました（{} 件）。先頭のポートを選択しました。"
+                      .format(count))
+        else:
+            self._log("利用可能な COM ポートが見つかりませんでした。"
+                      "VNA を接続して[ポート再検索]を押すか、"
+                      "「{}」で OptiTrack 単体テストができます。".format(NO_VNA_DISPLAY))
 
         # ウィンドウの × でも必ずクリーンアップして終了する
         self.protocol("WM_DELETE_WINDOW", self.on_window_close)
@@ -882,8 +954,11 @@ class App(tk.Tk):
     def _scan_ports(self):
         """
         利用可能な COM ポートを取得して Combobox に反映する。
-        既存の選択を可能な限り維持し、無ければ設定値 NANOVNA_PORT、
-        それも無ければ先頭を選ぶ。
+        末尾には常に「VNAなしテストモード」を追加する。
+        選択は次のとおり:
+          - 実ポートが 1 件以上 -> 先頭の実ポート(current(0))を選択
+          - 実ポートが 0 件     -> 「VNAなしテストモード」を選択
+        ログは出さず、見つかった実ポート数を返す(出力は呼び出し側が行う)。
         """
         ports = list_serial_ports()  # [(device, description), ...]
         self._port_display_to_device = {}
@@ -893,28 +968,20 @@ class App(tk.Tk):
             displays.append(disp)
             self._port_display_to_device[disp] = dev
 
-        # 現在の選択(デバイス名)を覚えておく
-        prev_dev = self.get_selected_port()
+        # 末尾に「VNAなしテストモード」を必ず追加(実機が無くてもテスト可能にする)
+        displays.append(NO_VNA_DISPLAY)
+        self._port_display_to_device[NO_VNA_DISPLAY] = TEST_MODE
 
         self.port_combo.configure(values=displays)
 
-        if not displays:
-            self.port_var.set("")
-            self._log("利用可能な COM ポートが見つかりませんでした。"
-                      "VNA を接続して[ポート再検索]を押してください。")
-            return
+        if ports:
+            # 実ポートあり: 先頭の実ポートを選択(displays[0] は最初の実ポート)
+            self.port_combo.current(0)
+        else:
+            # 実ポートなし: テストモードをデフォルト選択
+            self.port_combo.current(displays.index(NO_VNA_DISPLAY))
 
-        # 選択の復元優先順位: 直前の選択 -> 設定の NANOVNA_PORT -> 先頭
-        def disp_for_device(dev):
-            for disp, d in self._port_display_to_device.items():
-                if d == dev:
-                    return disp
-            return None
-
-        target = (disp_for_device(prev_dev)
-                  or disp_for_device(NANOVNA_PORT)
-                  or displays[0])
-        self.port_var.set(target)
+        return len(ports)
 
     def get_selected_port(self):
         """Combobox の選択表示名から、実際のデバイス名("COM3")を返す。"""
@@ -925,9 +992,12 @@ class App(tk.Tk):
         """[ポート再検索] ボタン: COM ポート一覧を更新する。"""
         if self.measuring:
             return  # 計測中は変更しない
-        self._scan_ports()
-        n = len(self.port_combo.cget("values"))
-        self._log("COM ポートを再検索しました（{} 件）。".format(n))
+        count = self._scan_ports()
+        if count > 0:
+            self._log("COM ポートを再検索しました（{} 件）。".format(count))
+        else:
+            self._log("COM ポートを再検索しましたが、利用可能なポートはありません。"
+                      "「{}」で OptiTrack 単体テストができます。".format(NO_VNA_DISPLAY))
 
     # ---- ログ出力 ----
     def _log(self, text):
@@ -956,8 +1026,12 @@ class App(tk.Tk):
         self.rescan_btn.configure(state="disabled")
         self.status_var.set("接続中...")
         self.count_var.set("サンプル数: 0")
-        self._log("計測を開始します。COM Port = {}（{} を計測）".format(
-            com_port, VNA_SPARAM))
+        if com_port == TEST_MODE:
+            self._log("計測を開始します。【VNAなしテストモード】"
+                      "VNA をスキップし OptiTrack のみ取得します（VNA 列は 0）。")
+        else:
+            self._log("計測を開始します。COM Port = {}（{} を計測）".format(
+                com_port, VNA_SPARAM))
         self.controller = MeasurementController(self.msg_queue)
         self.controller.start(com_port)
 
