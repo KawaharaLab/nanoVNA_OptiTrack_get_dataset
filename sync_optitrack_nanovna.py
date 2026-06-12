@@ -66,8 +66,16 @@ from datetime import datetime
 import serial  # pip install pyserial
 from serial.tools import list_ports  # 利用可能な COM ポートの列挙に使用
 
+import numpy as np          # pip install numpy
+import skrf as rf           # pip install scikit-rf (S パラメータ -> インピーダンス変換)
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+
+import matplotlib            # pip install matplotlib
+matplotlib.use("TkAgg")      # tkinter への埋め込みバックエンド
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 
 # =============================================================================
@@ -77,17 +85,21 @@ from tkinter import ttk, filedialog, messagebox
 # --- JNCRadio VNA 3G (シリアル) ---
 NANOVNA_PORT   = "COM3"        # Windows のデバイスマネージャーで確認した COM 番号
 NANOVNA_BAUD   = 115200        # ボーレート(JNCRadio VNA 3G は 115200 を推奨)
-TARGET_FREQ_HZ = 13_560_000    # 採用したい中心周波数 [Hz] (13.56 MHz)
 Z0             = 50.0          # 特性インピーダンス [Ω]
 
-# --- 掃引(スイープ)範囲の固定 ---
-# start==stop の縮退掃引はファームによって不安定(全反射のような値)になりやすいため、
-# 13.56MHz を含む「ごく狭い範囲」を掃引し、その中から TARGET_FREQ_HZ に最も近い点を
-# 採用する。下記既定(13.0-14.0MHz / 101点)では 13.56MHz が掃引点にちょうど一致する。
-# ピンポイント掃引にしたい場合は SWEEP_START_HZ == SWEEP_STOP_HZ に設定する。
-SWEEP_START_HZ = 13_000_000    # 掃引開始 [Hz] (13.00 MHz)
-SWEEP_STOP_HZ  = 14_000_000    # 掃引終了 [Hz] (14.00 MHz)
-SCAN_POINTS    = 101           # 掃引点数(範囲/分解能に応じて。多いほど精度↑だが1掃引が遅くなる)
+# --- 掃引(スイープ)範囲 ---
+# 12.5MHz 〜 14.5MHz を 101 点で掃引し、毎フレーム 101 点分の複素 S11 を一括取得する。
+# これにより、服(メアンダコイル)を動かしたときに「どの帯域で整合がずれるか」を
+# Z11 のスイープとして記録・可視化できる。
+SWEEP_START_HZ = 12_500_000    # 掃引開始 [Hz] (12.5 MHz)
+SWEEP_STOP_HZ  = 14_500_000    # 掃引終了 [Hz] (14.5 MHz)
+SCAN_POINTS    = 101           # 掃引点数
+
+# 掃引周波数グリッド[Hz]。CSV ヘッダー・skrf 変換・グラフ横軸の共通基準。
+FREQ_GRID_HZ = np.linspace(SWEEP_START_HZ, SWEEP_STOP_HZ, SCAN_POINTS)
+
+# 参考用の中心周波数(グラフの縦線マーカーに使用)。
+TARGET_FREQ_HZ = 13_560_000    # 13.56 MHz
 
 # --- 計測する S パラメータ(S11 固定) ---
 # 本機(NanoVNA 系)のコンソール `scan {start} {stop} {pts} {outmask}` は outmask の
@@ -147,11 +159,31 @@ STREAM_STALE_SEC = 2.0
 
 # --- 出力 ---
 OUTPUT_CSV = "sync_dataset.csv"
-CSV_HEADER = ["Timestamp",
-              "UpperArm_X", "UpperArm_Y", "UpperArm_Z",
-              "Joint_X",    "Joint_Y",    "Joint_Z",
-              "Forearm_X",  "Forearm_Y",  "Forearm_Z",
-              "S11_Real", "S11_Imag", "Z_R", "Z_X"]
+
+# 位置情報の先頭 10 列(タイムスタンプ + 3 部位 × XYZ)
+_POSITION_HEADER = ["Timestamp",
+                    "UpperArm_X", "UpperArm_Y", "UpperArm_Z",
+                    "Joint_X",    "Joint_Y",    "Joint_Z",
+                    "Forearm_X",  "Forearm_Y",  "Forearm_Z"]
+
+
+def _fmt_mhz(hz):
+    """周波数[Hz]を CSV 列名用の MHz 表記(末尾ゼロを省いた短い形)にする。例: 12.5, 12.52"""
+    s = "{:.2f}".format(hz / 1e6)
+    return s.rstrip("0").rstrip(".")
+
+
+def build_csv_header():
+    """位置情報 + 各掃引周波数の (S11_Real, S11_Imag, Z_R, Z_X) を並べたヘッダーを作る。"""
+    cols = list(_POSITION_HEADER)
+    for hz in FREQ_GRID_HZ:
+        lbl = _fmt_mhz(hz)
+        cols += ["S11_Real_{}".format(lbl), "S11_Imag_{}".format(lbl),
+                 "Z_R_{}".format(lbl), "Z_X_{}".format(lbl)]
+    return cols
+
+
+CSV_HEADER = build_csv_header()
 
 
 PART_NAMES = ("UpperArm", "Joint", "Forearm")
@@ -327,20 +359,22 @@ def reset_runtime_state():
 
 
 # =============================================================================
-# インピーダンス変換
+# インピーダンス変換 (scikit-rf)
 # =============================================================================
 
-def s11_to_impedance(s11, z0=Z0):
+def s11_sweep_to_z(s11_array, freqs_hz=FREQ_GRID_HZ, z0=Z0):
     """
-    反射係数 S11 (複素数) から負荷インピーダンス Z = R + jX を計算する。
-        Z = Z0 * (1 + S11) / (1 - S11)
-    戻り値: (R, X)  実部・虚部 [Ω]
+    掃引した複素 S11 配列(101点)を scikit-rf の Network に変換し、
+    50Ω 基準のインピーダンス Z11 を求めて (Z_R配列, Z_X配列) を返す。
+
+    skrf の Network は s を (周波数点数, ポート数, ポート数) で持つため、
+    1 ポート(S11 のみ)では (N, 1, 1) に整形する。ntwk.z[:, 0, 0] が Z11。
     """
-    denom = (1.0 - s11)
-    if denom == 0:
-        return float("inf"), float("inf")  # 完全反射(開放相当)
-    z = z0 * (1.0 + s11) / denom
-    return z.real, z.imag
+    s = np.asarray(s11_array, dtype=complex).reshape(-1, 1, 1)
+    freq = rf.Frequency.from_f(np.asarray(freqs_hz, dtype=float), unit="Hz")
+    ntwk = rf.Network(frequency=freq, s=s, z0=z0)
+    z11 = ntwk.z[:, 0, 0]
+    return z11.real, z11.imag
 
 
 # =============================================================================
@@ -456,12 +490,11 @@ class NanoVNA:
             triples.append((freq, real, imag))
         return triples
 
-    def measure_sparam(self):
+    def measure_sweep(self):
         """
         SWEEP_START_HZ 〜 SWEEP_STOP_HZ を SCAN_POINTS 点で 1 回 scan し、
-        各点の周波数を見て TARGET_FREQ_HZ に最も近い点の S11 を複素数で返す。
-        最近傍周波数が複数点ある場合(ピンポイント掃引等)は平均してノイズを抑える。
-        取得失敗時は None を返す。
+        掃引全点の複素 S11 を一括取得する。
+        戻り値: (freqs_hz[np.ndarray], s11[np.ndarray(complex)]) / 失敗時 None
         """
         cmd = "scan {start} {stop} {pts} {mask}".format(
             start=int(SWEEP_START_HZ),
@@ -471,17 +504,14 @@ class NanoVNA:
         )
         self.ser.reset_input_buffer()
         self._send_raw(cmd)
-        text = self._read_until_prompt()
+        # 101 点の出力はやや長いので読み取り待ちを長めにする
+        text = self._read_until_prompt(max_wait=6.0)
         triples = self._parse_scan_lines(text)
         if not triples:
             return None
-
-        # TARGET_FREQ_HZ に最も近い周波数を求め、その周波数の点(複数あれば平均)を採用
-        nearest_freq = min(triples, key=lambda t: abs(t[0] - TARGET_FREQ_HZ))[0]
-        sel = [t for t in triples if t[0] == nearest_freq]
-        avg_real = sum(t[1] for t in sel) / len(sel)
-        avg_imag = sum(t[2] for t in sel) / len(sel)
-        return complex(avg_real, avg_imag)
+        freqs = np.array([t[0] for t in triples], dtype=float)
+        s11 = np.array([complex(t[1], t[2]) for t in triples], dtype=complex)
+        return freqs, s11
 
     def close(self):
         try:
@@ -721,10 +751,10 @@ class MeasurementController:
                 self._post("finished")
                 return
             self._post("status",
-                       "VNA 接続 OK: {} @ {}bps / 掃引 {:.3f}-{:.3f} MHz {}点 → {:.3f} MHz の {} を採用".format(
+                       "VNA 接続 OK: {} @ {}bps / 掃引 {:.2f}-{:.2f} MHz {}点を記録 ({})".format(
                            self.com_port, NANOVNA_BAUD,
                            SWEEP_START_HZ / 1e6, SWEEP_STOP_HZ / 1e6, SCAN_POINTS,
-                           TARGET_FREQ_HZ / 1e6, VNA_SPARAM))
+                           VNA_SPARAM))
 
         # 2) NatNet 開始(ブロックしない)
         self.client = start_natnet()
@@ -748,27 +778,42 @@ class MeasurementController:
                 self._post("status", "自動判別 完了: " + " / ".join(
                     "{}=id{}".format(p, part_to_id.get(p, "?")) for p in PART_NAMES))
 
-        # 4) 計測ループ(メモリへ蓄積)
+        # 4) 計測ループ(メモリへ蓄積 + グラフ更新)
         self._post("status", "計測中...")
         last_stale_warn = 0.0
+        npts = SCAN_POINTS
         while not _stop_event.is_set():
             if test_mode:
-                # VNA は使わない。ダミーの S 値を入れ、適度な間隔でサンプリングする。
-                s11 = None  # 下のダミーカラム生成で使う(値は使わない)
+                # VNA は使わない。101 点すべてダミー 0。間隔をあけてサンプリング。
+                s11_arr = np.zeros(npts, dtype=complex)
+                z_r = np.zeros(npts)
+                z_x = np.zeros(npts)
                 # _stop_event.wait() は停止時に即座に抜けられる中断可能な待機。
                 if _stop_event.wait(TEST_MODE_INTERVAL_SEC):
                     break
             else:
                 try:
-                    s11 = self.vna.measure_sparam()
+                    result = self.vna.measure_sweep()
                 except serial.SerialException as e:
                     self._post("error", "VNA シリアル通信が切断されました: {}".format(e))
                     break
                 except Exception as e:
                     self._post("error", "VNA 取得中に例外: {}".format(e))
                     break
-                if s11 is None:
+                if result is None:
                     continue  # パース失敗はスキップ
+                freqs, s11_arr = result
+                if len(s11_arr) != npts:
+                    # 期待点数と異なる掃引はヘッダーと整合しないのでスキップ(警告は間引く)
+                    now = time.time()
+                    if now - last_stale_warn > 2.0:
+                        last_stale_warn = now
+                        self._post("status",
+                                   "[警告] 掃引点数が {} 点でした(期待 {} 点)。スキップします。".format(
+                                       len(s11_arr), npts))
+                    continue
+                # scikit-rf で 101 点をまとめて Z11 に変換
+                z_r, z_x = s11_sweep_to_z(s11_arr, FREQ_GRID_HZ, Z0)
 
             if self.client is not None:
                 elapsed = seconds_since_last_frame()
@@ -781,13 +826,14 @@ class MeasurementController:
 
             snap = read_latest_positions()
             ts = datetime.now().isoformat(timespec="milliseconds")
-            if test_mode:
-                # VNA 由来のカラムはダミー値 0(S11_Real, S11_Imag, Z_R, Z_X)
-                vna_cols = ["0", "0", "0", "0"]
-            else:
-                z_r, z_x = s11_to_impedance(s11, Z0)
-                vna_cols = ["{:.6f}".format(s11.real), "{:.6f}".format(s11.imag),
-                            "{:.4f}".format(z_r), "{:.4f}".format(z_x)]
+
+            # 各掃引点の (S11_Real, S11_Imag, Z_R, Z_X) を 1 行に展開
+            vna_cols = []
+            for i in range(npts):
+                vna_cols += ["{:.6f}".format(s11_arr[i].real),
+                             "{:.6f}".format(s11_arr[i].imag),
+                             "{:.4f}".format(z_r[i]),
+                             "{:.4f}".format(z_x[i])]
             row = (
                 [ts]
                 + _fmt_xyz(snap, "UpperArm")
@@ -800,6 +846,8 @@ class MeasurementController:
                 self.sample_count += 1
                 count = self.sample_count
             self._post("sample", count)
+            # リアルタイムグラフ用に最新の Z スイープを送る(GUI 側で間引いて描画)
+            self._post("plot", (np.asarray(z_r), np.asarray(z_x)))
 
         self._post("finished")
 
@@ -865,13 +913,17 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("OptiTrack × VNA 同期計測")
-        self.geometry("560x420")
-        self.minsize(480, 360)
+        self.geometry("820x720")
+        self.minsize(640, 560)
 
         self.msg_queue = queue.Queue()
         self.controller = None
         self.measuring = False
         self._finalizing = False  # 停止→保存→終了の処理中フラグ
+        self._latest_plot = None  # 直近の (z_r, z_x)。poll ごとに1回だけ描画する
+
+        # グラフ横軸(周波数 MHz)は固定
+        self._freq_mhz = FREQ_GRID_HZ / 1e6
 
         self._build_widgets()
 
@@ -897,10 +949,10 @@ class App(tk.Tk):
 
         info = ttk.Label(
             self,
-            text=("周波数: {:.3f} MHz  /  計測: {}（固定）  /  高さ軸: {}\n"
+            text=("掃引: {:.2f}–{:.2f} MHz {}点  /  計測: {}（固定）  /  高さ軸: {}\n"
                   "VNA の COM ポートを選んで[計測開始]。最初の有効フレームで自動判別します。"
                   ).format(
-                TARGET_FREQ_HZ / 1e6, VNA_SPARAM,
+                SWEEP_START_HZ / 1e6, SWEEP_STOP_HZ / 1e6, SCAN_POINTS, VNA_SPARAM,
                 {0: "X", 1: "Y", 2: "Z"}.get(HEIGHT_AXIS_INDEX, "?")),
             justify="left")
         info.pack(anchor="w", **pad)
@@ -941,14 +993,63 @@ class App(tk.Tk):
         self.count_var = tk.StringVar(value="サンプル数: 0")
         ttk.Label(status_frame, textvariable=self.count_var).pack(side="right")
 
-        # ログ表示
+        # --- リアルタイムグラフ(周波数 vs インピーダンス) ---
+        self._build_plot(pad)
+
+        # ログ表示(グラフを広く取るため小さめ)
         log_frame = ttk.Frame(self)
-        log_frame.pack(fill="both", expand=True, **pad)
-        self.log = tk.Text(log_frame, height=12, state="disabled", wrap="word")
+        log_frame.pack(fill="x", **pad)
+        self.log = tk.Text(log_frame, height=6, state="disabled", wrap="word")
         scroll = ttk.Scrollbar(log_frame, command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
         self.log.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
+
+    # ---- リアルタイムグラフの構築 ----
+    def _build_plot(self, pad):
+        plot_frame = ttk.LabelFrame(self, text="周波数 vs インピーダンス (Z11)")
+        plot_frame.pack(fill="both", expand=True, **pad)
+
+        self.fig = Figure(figsize=(6.4, 3.4), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+
+        # matplotlib の既定フォントは日本語グリフを持たないため、グラフ内は ASCII で表記する
+        zeros = np.zeros_like(self._freq_mhz)
+        (self.line_zr,) = self.ax.plot(
+            self._freq_mhz, zeros, color="#d62728", label="Z_R (Resistance)")
+        (self.line_zx,) = self.ax.plot(
+            self._freq_mhz, zeros, color="#1f77b4", label="Z_X (Reactance)")
+
+        # 参考: 中心周波数(13.56MHz)の縦線
+        self.ax.axvline(TARGET_FREQ_HZ / 1e6, color="#888888",
+                        linestyle="--", linewidth=0.8)
+
+        self.ax.set_xlabel("Frequency [MHz]")
+        self.ax.set_ylabel("Impedance [Ω]")
+        self.ax.set_xlim(SWEEP_START_HZ / 1e6, SWEEP_STOP_HZ / 1e6)
+        self.ax.set_ylim(-100, 100)
+        self.ax.grid(True, alpha=0.3)
+        self.ax.legend(loc="upper right", fontsize=9)
+        self.fig.tight_layout()
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.canvas.draw()
+
+    def _redraw_plot(self, z_r, z_x):
+        """最新の Z スイープでグラフを更新する(メインスレッドから呼ぶこと)。"""
+        self.line_zr.set_ydata(z_r)
+        self.line_zx.set_ydata(z_x)
+        # 有限値のみで y 範囲を自動調整(全反射で inf になっても破綻しないように)
+        allv = np.concatenate([np.asarray(z_r, float), np.asarray(z_x, float)])
+        finite = allv[np.isfinite(allv)]
+        if finite.size:
+            lo, hi = float(finite.min()), float(finite.max())
+            if lo == hi:
+                lo, hi = lo - 1.0, hi + 1.0
+            margin = (hi - lo) * 0.1
+            self.ax.set_ylim(lo - margin, hi + margin)
+        self.canvas.draw_idle()
 
     # ---- COM ポート一覧のスキャン/再検索 ----
     def _scan_ports(self):
@@ -1112,6 +1213,7 @@ class App(tk.Tk):
 
     # ---- GUI メッセージのポーリング ----
     def _poll_messages(self):
+        self._latest_plot = None  # この poll サイクルで届いた最新の Z スイープ
         try:
             while True:
                 kind, value = self.msg_queue.get_nowait()
@@ -1120,6 +1222,9 @@ class App(tk.Tk):
                     self._log(value)
                 elif kind == "sample":
                     self.count_var.set("サンプル数: {}".format(value))
+                elif kind == "plot":
+                    # 最新値だけ保持し、描画はループ後に1回だけ行う(間引き)
+                    self._latest_plot = value
                 elif kind == "error":
                     self._log("[エラー] " + str(value))
                     messagebox.showerror("エラー", str(value))
@@ -1135,6 +1240,10 @@ class App(tk.Tk):
                     return  # ウィンドウ破棄後に after を再登録しない
         except queue.Empty:
             pass
+        # 今サイクルに届いた最新スイープでグラフを 1 回だけ更新(描画負荷を抑制)
+        if self._latest_plot is not None:
+            z_r, z_x = self._latest_plot
+            self._redraw_plot(z_r, z_x)
         # ウィンドウが破棄されていれば再ポーリングしない
         try:
             if self.winfo_exists():
