@@ -315,6 +315,30 @@ _last_frame_time = [0.0]
 # 全スレッド共通の停止フラグ
 _stop_event = threading.Event()
 
+# --- FPS 計測用の累計カウンタ ---
+# OptiTrack: NatNet コールバック(受信スレッド)で 1 フレームごとに +1
+# NanoVNA  : 計測ワーカーで 1 サンプル(1 掃引)ごとに +1
+# どちらも reset_runtime_state() で 0 にリセットする。
+_fps_lock = threading.Lock()
+_opti_frame_count = [0]   # OptiTrack 受信フレーム累計
+_vna_sample_count = [0]   # NanoVNA 取得サンプル累計
+
+
+def incr_opti_frame():
+    with _fps_lock:
+        _opti_frame_count[0] += 1
+
+
+def incr_vna_sample():
+    with _fps_lock:
+        _vna_sample_count[0] += 1
+
+
+def read_fps_counters():
+    """(OptiTrack 累計, NanoVNA 累計) を返す。"""
+    with _fps_lock:
+        return _opti_frame_count[0], _vna_sample_count[0]
+
 
 def update_latest_position(name, x, y, z):
     """NatNet コールバックから呼ばれ、指定部位の最新座標をスレッド安全に更新する。"""
@@ -371,6 +395,9 @@ def reset_runtime_state():
             slot["valid"] = False
         _last_frame_time[0] = 0.0
     _calib_warn_time[0] = 0.0
+    with _fps_lock:
+        _opti_frame_count[0] = 0
+        _vna_sample_count[0] = 0
 
 
 # =============================================================================
@@ -569,6 +596,7 @@ def _on_frame_with_data(data_dict):
     確定後は固定した ID->部位 マップで各対象の座標を更新する。
     """
     mark_frame_received()
+    incr_opti_frame()  # OptiTrack FPS 計測: 受信フレームをカウント
 
     mocap = data_dict.get("mocap_data")
     if mocap is None:
@@ -865,6 +893,7 @@ class MeasurementController:
                 self.rows.append(row)
                 self.sample_count += 1
                 count = self.sample_count
+            incr_vna_sample()  # NanoVNA FPS 計測: 取得サンプルをカウント
             self._post("sample", count)
             # リアルタイムグラフ用に最新の Z スイープを送る(GUI 側で間引いて描画)
             self._post("plot", (np.asarray(z_r), np.asarray(z_x)))
@@ -943,6 +972,16 @@ class App(tk.Tk):
         self._latest_plot = None  # 直近の (z_r, z_x)。poll ごとに1回だけ描画する
         self._counter_active = False  # コンソールの \r カウンタ行が出ているか
 
+        # --- FPS 計測の状態(GUI=メインスレッドで 1 秒ごとに算出) ---
+        self._latest_count = 0          # 直近のサンプル数
+        self._opti_fps = 0.0            # 直近 1 秒の OptiTrack FPS
+        self._vna_fps = 0.0             # 直近 1 秒の NanoVNA FPS
+        self._fps_win_start = None      # FPS 計算ウィンドウの起点時刻
+        self._fps_win_opti = 0          # ウィンドウ起点での OptiTrack 累計
+        self._fps_win_vna = 0           # ウィンドウ起点での NanoVNA 累計
+        self._meas_start_time = None    # 計測全体の開始時刻(平均 FPS 用)
+        self._meas_stop_time = None     # 計測全体の停止時刻(平均 FPS 用)
+
         # グラフ横軸(周波数 MHz)は固定
         self._freq_mhz = FREQ_GRID_HZ / 1e6
 
@@ -1013,6 +1052,14 @@ class App(tk.Tk):
                   foreground="#0a6").pack(side="left", padx=6)
         self.count_var = tk.StringVar(value="サンプル数: 0")
         ttk.Label(status_frame, textvariable=self.count_var).pack(side="right")
+
+        # --- サンプリングレート(FPS)表示 ---
+        fps_frame = ttk.Frame(self)
+        fps_frame.pack(fill="x", **pad)
+        self.fps_var = tk.StringVar(value="OptiTrack: -- FPS / NanoVNA: -- FPS")
+        ttk.Label(fps_frame, text="取得レート:").pack(side="left")
+        ttk.Label(fps_frame, textvariable=self.fps_var,
+                  foreground="#06c").pack(side="left", padx=6)
 
         # --- リアルタイムグラフ(周波数 vs インピーダンス) ---
         self._build_plot(pad)
@@ -1134,9 +1181,11 @@ class App(tk.Tk):
         self._finalize_counter_line()
         print(text, flush=True)
 
-    def _console_counter(self, count):
-        """計測中の取得数を「同じ1行」で上書き更新する(\\r)。"""
-        print("\r[計測中] データ取得数: {} 件...".format(count), end="", flush=True)
+    def _console_counter(self):
+        """計測中の取得数と FPS を「同じ1行」で上書き更新する(\\r)。"""
+        print("\r[計測中] 取得数: {} 件 (OptiTrack: {:.1f} Hz, NanoVNA: {:.1f} Hz)   ".format(
+            self._latest_count, self._opti_fps, self._vna_fps),
+            end="", flush=True)
         self._counter_active = True
 
     def _finalize_counter_line(self):
@@ -1165,6 +1214,17 @@ class App(tk.Tk):
         self.rescan_btn.configure(state="disabled")
         self.status_var.set("接続中...")
         self.count_var.set("サンプル数: 0")
+        # FPS 計測の初期化
+        self._latest_count = 0
+        self._opti_fps = 0.0
+        self._vna_fps = 0.0
+        now = time.time()
+        self._meas_start_time = now
+        self._meas_stop_time = None
+        self._fps_win_start = now
+        self._fps_win_opti = 0
+        self._fps_win_vna = 0
+        self.fps_var.set("OptiTrack: -- FPS / NanoVNA: -- FPS")
         if com_port == TEST_MODE:
             msg = "計測を開始しました。【VNAなしテストモード】OptiTrack のみ取得（VNA 列は 0）。"
         else:
@@ -1180,6 +1240,7 @@ class App(tk.Tk):
         if not self.measuring or self._finalizing:
             return
         self._finalizing = True
+        self._meas_stop_time = time.time()  # 平均 FPS 算出用に停止時刻を記録
         self.stop_btn.configure(state="disabled")
         self.status_var.set("停止処理中...")
         self._log("計測を停止しています...")
@@ -1213,6 +1274,7 @@ class App(tk.Tk):
                 self._log("保存しました: {} ({} サンプル)".format(path, written))
                 self._console_event(
                     "[保存完了] {} 件を保存しました: {}".format(written, path))
+                self._log_fps_summary()  # 平均 FPS サマリーを GUI/コンソールへ
                 messagebox.showinfo(
                     "保存完了", "{} サンプルを保存しました。\n{}".format(written, path))
             except Exception as e:
@@ -1238,6 +1300,7 @@ class App(tk.Tk):
                     "終了確認", "計測中です。停止して終了しますか?"):
                 return
             self._finalizing = True
+            self._meas_stop_time = time.time()  # 平均 FPS 算出用に停止時刻を記録
             self.status_var.set("停止処理中...")
             self._log("ウィンドウを閉じています。クリーンアップ中...")
 
@@ -1256,7 +1319,7 @@ class App(tk.Tk):
     # ---- GUI メッセージのポーリング ----
     def _poll_messages(self):
         self._latest_plot = None   # この poll サイクルで届いた最新の Z スイープ
-        latest_count = None        # この poll サイクルで届いた最新のサンプル数
+        got_sample = False         # この poll サイクルで新しいサンプルが届いたか
         try:
             while True:
                 kind, value = self.msg_queue.get_nowait()
@@ -1266,7 +1329,8 @@ class App(tk.Tk):
                     self._log(value)
                 elif kind == "sample":
                     self.count_var.set("サンプル数: {}".format(value))
-                    latest_count = value
+                    self._latest_count = value
+                    got_sample = True
                 elif kind == "plot":
                     # 最新値だけ保持し、描画はループ後に1回だけ行う(間引き)
                     self._latest_plot = value
@@ -1289,9 +1353,14 @@ class App(tk.Tk):
                     return  # ウィンドウ破棄後に after を再登録しない
         except queue.Empty:
             pass
-        # 今サイクルに届いた最新サンプル数を「同じ1行」で上書き表示(コンソール)
-        if latest_count is not None:
-            self._console_counter(latest_count)
+
+        # --- FPS を約 1 秒ごとに算出して表示(GUI ラベル + コンソール) ---
+        fps_updated = self._update_fps_if_due()
+
+        # コンソールの \r 行は、FPS 更新時 か 新サンプル到着時に上書き更新する
+        if self.measuring and (fps_updated or got_sample):
+            self._console_counter()
+
         # 今サイクルに届いた最新スイープでグラフを 1 回だけ更新(描画負荷を抑制)
         if self._latest_plot is not None:
             z_r, z_x = self._latest_plot
@@ -1302,6 +1371,46 @@ class App(tk.Tk):
                 self.after(100, self._poll_messages)
         except tk.TclError:
             pass
+
+    def _update_fps_if_due(self):
+        """
+        FPS 計算ウィンドウ(約1秒)が経過していれば、OptiTrack/NanoVNA の FPS を
+        算出して GUI ラベルを更新する。更新したら True を返す。
+        """
+        if not self.measuring or self._fps_win_start is None:
+            return False
+        now = time.time()
+        dt = now - self._fps_win_start
+        if dt < 1.0:
+            return False
+        opti_total, vna_total = read_fps_counters()
+        self._opti_fps = (opti_total - self._fps_win_opti) / dt
+        self._vna_fps = (vna_total - self._fps_win_vna) / dt
+        # 次ウィンドウへ
+        self._fps_win_start = now
+        self._fps_win_opti = opti_total
+        self._fps_win_vna = vna_total
+        self.fps_var.set("OptiTrack: {:.1f} FPS / NanoVNA: {:.1f} FPS".format(
+            self._opti_fps, self._vna_fps))
+        return True
+
+    def _log_fps_summary(self):
+        """計測全体の平均 FPS を GUI ログとコンソールへ出力する。"""
+        opti_total, vna_total = read_fps_counters()
+        start = self._meas_start_time
+        stop = self._meas_stop_time or time.time()
+        dur = (stop - start) if start else 0.0
+        if dur > 0:
+            avg_opti = opti_total / dur
+            avg_vna = vna_total / dur
+        else:
+            avg_opti = avg_vna = 0.0
+        summary = ("計測サマリー: 計測時間 {:.1f} 秒 / "
+                   "OptiTrack 平均 {:.1f} FPS ({} フレーム) / "
+                   "NanoVNA 平均 {:.1f} FPS ({} サンプル)").format(
+            dur, avg_opti, opti_total, avg_vna, vna_total)
+        self._log(summary)
+        self._console_event("[サマリー] " + summary)
 
     def _recover_after_error(self):
         """致命的エラー後、計測状態を解除して再度開始できるようにする。"""
