@@ -61,6 +61,7 @@ import sys
 import time
 import queue
 import threading
+import collections
 from datetime import datetime
 
 import serial  # pip install pyserial
@@ -102,16 +103,33 @@ NANOVNA_PORT   = "COM3"        # Windows のデバイスマネージャーで確
 NANOVNA_BAUD   = 115200        # ボーレート(JNCRadio VNA 3G は 115200 を推奨)
 Z0             = 50.0          # 特性インピーダンス [Ω]
 
-# --- 掃引(スイープ)範囲 ---
-# 12.5MHz 〜 14.5MHz を 101 点で掃引し、毎フレーム 101 点分の複素 S11 を一括取得する。
-# これにより、服(メアンダコイル)を動かしたときに「どの帯域で整合がずれるか」を
-# Z11 のスイープとして記録・可視化できる。
+# --- 掃引(スイープ)範囲の既定値 ---
+# 実際の掃引条件は GUI の入力欄(開始/終了周波数・点数)で変更でき、[計測開始]時に
+# その値が VNA に設定される。下記はその「GUI 初期値 兼 既定値」。
+# 一定範囲を掃引して 101 点分の複素 S11 を一括取得し、服(メアンダコイル)を動かした
+# ときに「どの帯域で整合がずれるか」を Z11 のスイープとして記録・可視化する。
 SWEEP_START_HZ = 12_500_000    # 掃引開始 [Hz] (12.5 MHz)
 SWEEP_STOP_HZ  = 14_500_000    # 掃引終了 [Hz] (14.5 MHz)
-SCAN_POINTS    = 101           # 掃引点数
+SCAN_POINTS    = 101           # 掃引点数(GUI 初期値)
+# GUI の点数スピンボックスの範囲(1 刻みで任意指定可能)
+POINTS_MIN = 1                 # 最小点数(1 = 単一周波数ピンポイント測定)
+POINTS_MAX = 100_000           # 上限(実用上の安全上限。実機の制約に応じて調整)
 
-# 掃引周波数グリッド[Hz]。CSV ヘッダー・skrf 変換・グラフ横軸の共通基準。
-FREQ_GRID_HZ = np.linspace(SWEEP_START_HZ, SWEEP_STOP_HZ, SCAN_POINTS)
+# 単一周波数(1点)モードでデバイスへ実際に投げる scan の点数。
+# 点数 1 の縮退 scan はファームによっては不安定なため、同一周波数を数点掃引して
+# 平均し、論理的には 1 点として扱う(start==stop の極小掃引)。
+SINGLE_DEVICE_POINTS = 2
+
+# 単一周波数モードのリアルタイムグラフ(時系列)で保持する直近サンプル数。
+TIME_PLOT_WINDOW = 300
+
+# 掃引周波数グリッド[Hz]を作るヘルパ。CSV ヘッダー・skrf 変換・グラフ横軸の共通基準。
+def make_freq_grid(start_hz, stop_hz, points):
+    return np.linspace(float(start_hz), float(stop_hz), int(points))
+
+
+# 既定グリッド(初期グラフ描画などに使用)
+FREQ_GRID_HZ = make_freq_grid(SWEEP_START_HZ, SWEEP_STOP_HZ, SCAN_POINTS)
 
 # 参考用の中心周波数(グラフの縦線マーカーに使用)。
 TARGET_FREQ_HZ = 13_560_000    # 13.56 MHz
@@ -183,22 +201,32 @@ _POSITION_HEADER = ["Timestamp",
 
 
 def _fmt_mhz(hz):
-    """周波数[Hz]を CSV 列名用の MHz 表記(末尾ゼロを省いた短い形)にする。例: 12.5, 12.52"""
-    s = "{:.2f}".format(hz / 1e6)
+    """周波数[Hz]を CSV 列名用の MHz 表記(末尾ゼロを省いた短い形)にする。例: 12.5, 12.51, 12.505"""
+    # 点数が多い(刻みが細かい)グリッドでも列名が重複しないよう 4 桁(=100Hz)精度で表記
+    s = "{:.4f}".format(hz / 1e6)
     return s.rstrip("0").rstrip(".")
 
 
-def build_csv_header():
-    """位置情報 + 各掃引周波数の (S11_Real, S11_Imag, Z_R, Z_X) を並べたヘッダーを作る。"""
+def build_csv_header(freq_grid_hz):
+    """
+    位置情報 + S パラメータ/インピーダンス列を並べた CSV ヘッダーを作る。
+    - 単一周波数(1 点)のとき: 周波数サフィックスを付けないシンプルな
+      [..., S11_Real, S11_Imag, Z_R, Z_X] にフォールバックする(test2.csv 互換)。
+    - 2 点以上のとき: 各掃引周波数ごとに 4 列(S11_Real_<MHz> ...)を動的生成する。
+    """
     cols = list(_POSITION_HEADER)
-    for hz in FREQ_GRID_HZ:
-        lbl = _fmt_mhz(hz)
-        cols += ["S11_Real_{}".format(lbl), "S11_Imag_{}".format(lbl),
-                 "Z_R_{}".format(lbl), "Z_X_{}".format(lbl)]
+    if len(freq_grid_hz) <= 1:
+        cols += ["S11_Real", "S11_Imag", "Z_R", "Z_X"]
+    else:
+        for hz in freq_grid_hz:
+            lbl = _fmt_mhz(hz)
+            cols += ["S11_Real_{}".format(lbl), "S11_Imag_{}".format(lbl),
+                     "Z_R_{}".format(lbl), "Z_X_{}".format(lbl)]
     return cols
 
 
-CSV_HEADER = build_csv_header()
+# 既定ヘッダー(参考。実際は計測条件に応じてコントローラが動的生成する)
+CSV_HEADER = build_csv_header(FREQ_GRID_HZ)
 
 
 PART_NAMES = ("UpperArm", "Joint", "Forearm")
@@ -448,18 +476,30 @@ class NanoVNA:
 
         scan {start(Hz)} {stop(Hz)} [points] [outmask]
         outmask は出力内容のビット指定: bit0(=1) 周波数, bit1(=2) S11, bit2(=4) S21
-        本クラスは「周波数 + S11」を出力(outmask=3)し、各点の周波数を見て
-        TARGET_FREQ_HZ に最も近い点の S11 を採用する。
+        本クラスは「周波数 + S11」を出力(outmask=3)する。
 
-    初期化時に sweep コマンドでデバイスの掃引範囲を 13.56MHz 付近に固定する。
+    掃引条件(開始/終了周波数・点数)は GUI から渡され、初期化時に sweep コマンドで
+    デバイスへ設定する。
     """
 
     PROMPT = b"ch> "
 
-    def __init__(self, port, baud=115200, timeout=2.0):
+    def __init__(self, port, baud=115200, timeout=2.0,
+                 start_hz=SWEEP_START_HZ, stop_hz=SWEEP_STOP_HZ,
+                 points=SCAN_POINTS):
         # 計測は S11 固定。scan には周波数ビット(1)を足して "周波数+S11"(=3)を出力させる。
         self.sparam = VNA_SPARAM
         self.scan_outmask = (1 | VNA_OUTMASK)  # 1(周波数) | 2(S11) = 3
+        # 掃引条件(GUI で指定された値)
+        self.start_hz = int(start_hz)
+        self.stop_hz = int(stop_hz)
+        self.points = int(points)
+        # 単一周波数(ピンポイント)モード判定: 点数 1 または 開始==終了
+        self.single = (self.points <= 1) or (self.start_hz == self.stop_hz)
+        if self.single:
+            # 論理点数は 1、周波数は開始値に揃える
+            self.points = 1
+            self.stop_hz = self.start_hz
         self.ser = serial.Serial(port, baud, timeout=timeout)
         time.sleep(0.2)
         self.ser.reset_input_buffer()
@@ -467,22 +507,23 @@ class NanoVNA:
         # 連続出力を止めてプロンプト状態を確定させる
         self._send_raw("pause")
         self._read_until_prompt()
-        # 掃引範囲を 13.56MHz 付近に固定(初期化コマンド)
+        # 掃引範囲・点数をデバイスへ設定(初期化コマンド)
         self.setup_sweep()
 
     def setup_sweep(self):
         """
-        デバイスの掃引範囲を SWEEP_START_HZ 〜 SWEEP_STOP_HZ / SCAN_POINTS に固定する。
+        デバイスの掃引条件(開始/終了周波数・点数)を設定する。
         NanoVNA 系コンソールの `sweep {start} {stop} {points}` を発行する。
-        (この設定はキャリブレーションの補間や表示の基準にもなる)
+        単一周波数モードでは縮退(1点)を避け、開始==終了で SINGLE_DEVICE_POINTS 点に設定する。
         ファームが当該書式に対応していなくても、毎回の scan が範囲を指定するため
         計測自体は継続できる。
         """
+        if self.single:
+            dev_stop, dev_points = self.start_hz, SINGLE_DEVICE_POINTS
+        else:
+            dev_stop, dev_points = self.stop_hz, self.points
         cmd = "sweep {start} {stop} {points}".format(
-            start=int(SWEEP_START_HZ),
-            stop=int(SWEEP_STOP_HZ),
-            points=int(SCAN_POINTS),
-        )
+            start=self.start_hz, stop=dev_stop, points=dev_points)
         self.ser.reset_input_buffer()
         self._send_raw(cmd)
         self._read_until_prompt()
@@ -534,23 +575,38 @@ class NanoVNA:
 
     def measure_sweep(self):
         """
-        SWEEP_START_HZ 〜 SWEEP_STOP_HZ を SCAN_POINTS 点で 1 回 scan し、
+        設定された開始〜終了周波数を points 点で 1 回 scan し、
         掃引全点の複素 S11 を一括取得する。
         戻り値: (freqs_hz[np.ndarray], s11[np.ndarray(complex)]) / 失敗時 None
+
+        単一周波数モードでは start==stop の極小掃引(SINGLE_DEVICE_POINTS 点)を行い、
+        同一周波数の点を平均して論理的に 1 点へ集約する(npts=1 を保証)。
         """
+        if self.single:
+            dev_stop, dev_points = self.start_hz, SINGLE_DEVICE_POINTS
+        else:
+            dev_stop, dev_points = self.stop_hz, self.points
         cmd = "scan {start} {stop} {pts} {mask}".format(
-            start=int(SWEEP_START_HZ),
-            stop=int(SWEEP_STOP_HZ),
-            pts=int(SCAN_POINTS),
+            start=self.start_hz,
+            stop=dev_stop,
+            pts=dev_points,
             mask=int(self.scan_outmask),
         )
         self.ser.reset_input_buffer()
         self._send_raw(cmd)
-        # 101 点の出力はやや長いので読み取り待ちを長めにする
-        text = self._read_until_prompt(max_wait=6.0)
+        # 点数が多いと出力が長いので読み取り待ちを長めにする
+        text = self._read_until_prompt(max_wait=8.0)
         triples = self._parse_scan_lines(text)
         if not triples:
             return None
+
+        if self.single:
+            # 同一周波数の全点を平均し、論理的に 1 点として返す
+            re = float(np.mean([t[1] for t in triples]))
+            im = float(np.mean([t[2] for t in triples]))
+            return (np.array([float(self.start_hz)], dtype=float),
+                    np.array([complex(re, im)], dtype=complex))
+
         freqs = np.array([t[0] for t in triples], dtype=float)
         s11 = np.array([complex(t[1], t[2]) for t in triples], dtype=complex)
         return freqs, s11
@@ -745,8 +801,14 @@ class MeasurementController:
         self.sample_count = 0
         self._cleaned = False
         self._cleanup_lock = threading.Lock()
-        # [計測開始]時に GUI から渡される接続先 COM ポート
+        # [計測開始]時に GUI から渡される計測条件(既定値で初期化)
         self.com_port = NANOVNA_PORT
+        self.start_hz = SWEEP_START_HZ
+        self.stop_hz = SWEEP_STOP_HZ
+        self.points = SCAN_POINTS
+        self.freq_grid_hz = FREQ_GRID_HZ
+        self.csv_header = CSV_HEADER
+        self.use_optitrack = True   # False で OptiTrack を使わない(VNA のみ計測)
 
     # ---- GUI へ通知 ----
     def _post(self, kind, value=None):
@@ -756,12 +818,25 @@ class MeasurementController:
             pass
 
     # ---- 開始 ----
-    def start(self, com_port):
+    def start(self, com_port, start_hz, stop_hz, points, use_optitrack=True):
         """
         共有状態を初期化し、計測ワーカースレッドを起動する。
         com_port は GUI で選択された接続先 COM ポート(例 "COM3")。
+        start_hz/stop_hz/points は GUI で指定された掃引条件。
+        use_optitrack=False のときは OptiTrack(NatNet)を使わず VNA のみ計測する。
+        この条件から周波数グリッドと CSV ヘッダーを動的に生成する。
         """
         self.com_port = com_port
+        self.use_optitrack = bool(use_optitrack)
+        self.start_hz = int(start_hz)
+        self.stop_hz = int(stop_hz)
+        self.points = int(points)
+        # 単一周波数(ピンポイント)モードの正規化: 点数 1 または 開始==終了 -> 1 点に揃える
+        if self.points <= 1 or self.start_hz == self.stop_hz:
+            self.points = 1
+            self.stop_hz = self.start_hz
+        self.freq_grid_hz = make_freq_grid(self.start_hz, self.stop_hz, self.points)
+        self.csv_header = build_csv_header(self.freq_grid_hz)
 
         reset_runtime_state()
         with self.rows_lock:
@@ -785,7 +860,10 @@ class MeasurementController:
             # COM ポートが開けない場合は friendly なエラーを通知。
             # SerialException / FileNotFoundError はいずれも OSError のサブクラス。
             try:
-                self.vna = NanoVNA(self.com_port, NANOVNA_BAUD)
+                # GUI で指定された掃引条件を反映して接続・初期化
+                self.vna = NanoVNA(self.com_port, NANOVNA_BAUD,
+                                   start_hz=self.start_hz, stop_hz=self.stop_hz,
+                                   points=self.points)
             except OSError as e:
                 self._post("error",
                            "VNAの接続に失敗しました。\n"
@@ -799,17 +877,22 @@ class MeasurementController:
                 self._post("finished")
                 return
             self._post("status",
-                       "VNA 接続 OK: {} @ {}bps / 掃引 {:.2f}-{:.2f} MHz {}点を記録 ({})".format(
+                       "VNA 接続 OK: {} @ {}bps / 掃引 {:.3f}-{:.3f} MHz {}点を記録 ({})".format(
                            self.com_port, NANOVNA_BAUD,
-                           SWEEP_START_HZ / 1e6, SWEEP_STOP_HZ / 1e6, SCAN_POINTS,
+                           self.start_hz / 1e6, self.stop_hz / 1e6, self.points,
                            VNA_SPARAM))
 
-        # 2) NatNet 開始(ブロックしない)
-        self.client = start_natnet()
-        if self.client is None:
-            self._post("status", "OptiTrack なしで継続(座標列は空欄になります)。")
+        # 2) NatNet 開始(ブロックしない)。OptiTrack を使わないモードでは丸ごとスキップ。
+        if not self.use_optitrack:
+            self.client = None
+            self._post("status",
+                       "【OptiTrack なしモード】NatNet を使用しません(VNA のみ計測)。座標列は空欄になります。")
         else:
-            self._post("status", "OptiTrack 受信開始。最初の有効フレームで自動判別します...")
+            self.client = start_natnet()
+            if self.client is None:
+                self._post("status", "OptiTrack なしで継続(座標列は空欄になります)。")
+            else:
+                self._post("status", "OptiTrack 受信開始。最初の有効フレームで自動判別します...")
 
         # 3) 自動判別の完了を「停止フラグを見ながら」中断可能に待つ
         if self.client is not None:
@@ -829,10 +912,10 @@ class MeasurementController:
         # 4) 計測ループ(メモリへ蓄積 + グラフ更新)
         self._post("status", "計測中...")
         last_stale_warn = 0.0
-        npts = SCAN_POINTS
+        npts = self.points
         while not _stop_event.is_set():
             if test_mode:
-                # VNA は使わない。101 点すべてダミー 0。間隔をあけてサンプリング。
+                # VNA は使わない。全点ダミー 0。間隔をあけてサンプリング。
                 s11_arr = np.zeros(npts, dtype=complex)
                 z_r = np.zeros(npts)
                 z_x = np.zeros(npts)
@@ -860,8 +943,8 @@ class MeasurementController:
                                    "[警告] 掃引点数が {} 点でした(期待 {} 点)。スキップします。".format(
                                        len(s11_arr), npts))
                     continue
-                # scikit-rf で 101 点をまとめて Z11 に変換
-                z_r, z_x = s11_sweep_to_z(s11_arr, FREQ_GRID_HZ, Z0)
+                # scikit-rf で全点をまとめて Z11 に変換(この計測の周波数グリッドで)
+                z_r, z_x = s11_sweep_to_z(s11_arr, self.freq_grid_hz, Z0)
 
             if self.client is not None:
                 elapsed = seconds_since_last_frame()
@@ -943,7 +1026,7 @@ class MeasurementController:
             rows = list(self.rows)
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(CSV_HEADER)
+            writer.writerow(self.csv_header)  # 計測条件に応じて動的生成したヘッダー
             writer.writerows(rows)
         return len(rows)
 
@@ -982,8 +1065,13 @@ class App(tk.Tk):
         self._meas_start_time = None    # 計測全体の開始時刻(平均 FPS 用)
         self._meas_stop_time = None     # 計測全体の停止時刻(平均 FPS 用)
 
-        # グラフ横軸(周波数 MHz)は固定
+        # グラフ横軸(周波数 MHz)。掃引モードでは周波数グリッド、単一周波数モードでは
+        # 時系列(直近サンプル)に切り替える。
         self._freq_mhz = FREQ_GRID_HZ / 1e6
+        self._plot_mode = "sweep"   # "sweep"(周波数軸) または "time"(時系列)
+        # 単一周波数モードの時系列バッファ(直近 TIME_PLOT_WINDOW サンプル)
+        self._tr_zr = collections.deque(maxlen=TIME_PLOT_WINDOW)
+        self._tr_zx = collections.deque(maxlen=TIME_PLOT_WINDOW)
 
         self._build_widgets()
 
@@ -1009,10 +1097,10 @@ class App(tk.Tk):
 
         info = ttk.Label(
             self,
-            text=("掃引: {:.2f}–{:.2f} MHz {}点  /  計測: {}（固定）  /  高さ軸: {}\n"
-                  "VNA の COM ポートを選んで[計測開始]。最初の有効フレームで自動判別します。"
+            text=("計測: {}（固定）  /  高さ軸: {}\n"
+                  "COM ポートと掃引条件を設定して[計測開始]。最初の有効フレームで自動判別します。"
                   ).format(
-                SWEEP_START_HZ / 1e6, SWEEP_STOP_HZ / 1e6, SCAN_POINTS, VNA_SPARAM,
+                VNA_SPARAM,
                 {0: "X", 1: "Y", 2: "Z"}.get(HEIGHT_AXIS_INDEX, "?")),
             justify="left")
         info.pack(anchor="w", **pad)
@@ -1033,6 +1121,36 @@ class App(tk.Tk):
         # 表示名 -> デバイス名("COM3") の対応表。実際の接続にはデバイス名を使う。
         # 実際のスキャンは __init__ で全ウィジェット(self.log を含む)構築後に行う。
         self._port_display_to_device = {}
+
+        # --- VNA 掃引条件(開始/終了周波数・点数)の設定 ---
+        sweep_frame = ttk.Frame(self)
+        sweep_frame.pack(fill="x", **pad)
+        ttk.Label(sweep_frame, text="開始[MHz]:").pack(side="left")
+        self.start_var = tk.StringVar(value="{:g}".format(SWEEP_START_HZ / 1e6))
+        self.start_entry = ttk.Entry(sweep_frame, textvariable=self.start_var, width=8)
+        self.start_entry.pack(side="left", padx=(2, 8))
+        ttk.Label(sweep_frame, text="終了[MHz]:").pack(side="left")
+        self.stop_var = tk.StringVar(value="{:g}".format(SWEEP_STOP_HZ / 1e6))
+        self.stop_entry = ttk.Entry(sweep_frame, textvariable=self.stop_var, width=8)
+        self.stop_entry.pack(side="left", padx=(2, 8))
+        ttk.Label(sweep_frame, text="点数:").pack(side="left")
+        self.points_var = tk.StringVar(value=str(SCAN_POINTS))
+        # 1 刻みで増減できるスピンボックス(直接入力も可)
+        self.points_spin = ttk.Spinbox(
+            sweep_frame, textvariable=self.points_var,
+            from_=POINTS_MIN, to=POINTS_MAX, increment=1, width=8)
+        self.points_spin.pack(side="left", padx=2)
+        ttk.Label(sweep_frame, text="(1刻みで指定可)").pack(side="left", padx=2)
+
+        # --- 計測モード(OptiTrack を使うか) ---
+        opt_frame = ttk.Frame(self)
+        opt_frame.pack(fill="x", **pad)
+        self.optitrack_var = tk.BooleanVar(value=True)
+        self.optitrack_chk = ttk.Checkbutton(
+            opt_frame,
+            text="OptiTrack を使う（OFF にすると VNA のみ計測：Motive 未接続でも可）",
+            variable=self.optitrack_var)
+        self.optitrack_chk.pack(side="left")
 
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill="x", **pad)
@@ -1088,9 +1206,9 @@ class App(tk.Tk):
         (self.line_zx,) = self.ax.plot(
             self._freq_mhz, zeros, color="#1f77b4", label="Z_X (Reactance)")
 
-        # 参考: 中心周波数(13.56MHz)の縦線
-        self.ax.axvline(TARGET_FREQ_HZ / 1e6, color="#888888",
-                        linestyle="--", linewidth=0.8)
+        # 参考: 中心周波数(13.56MHz)の縦線(単一周波数=時系列モードでは隠す)
+        self._target_vline = self.ax.axvline(
+            TARGET_FREQ_HZ / 1e6, color="#888888", linestyle="--", linewidth=0.8)
 
         self.ax.set_xlabel("Frequency [MHz]")
         self.ax.set_ylabel("Impedance [Ω]")
@@ -1104,12 +1222,62 @@ class App(tk.Tk):
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
         self.canvas.draw()
 
+    def _reconfigure_plot(self, start_hz, stop_hz, points):
+        """
+        掃引条件の変更にあわせてグラフを作り直す。
+        - 2 点以上: 横軸=周波数[MHz] のスイープ波形
+        - 1 点(単一周波数): 横軸=直近サンプル の時系列スクロールチャート
+        """
+        if points <= 1:
+            # 単一周波数 -> 時系列モード
+            self._plot_mode = "time"
+            self._tr_zr.clear()
+            self._tr_zx.clear()
+            self.line_zr.set_data([], [])
+            self.line_zx.set_data([], [])
+            self._target_vline.set_visible(False)
+            self.ax.set_xlabel("Recent samples")
+            self.ax.set_title("Single freq {:.4f} MHz (time series)".format(
+                start_hz / 1e6), fontsize=9)
+            self.ax.set_xlim(0, TIME_PLOT_WINDOW)
+            self.ax.set_ylim(-100, 100)
+        else:
+            # スイープモード -> 横軸=周波数
+            self._plot_mode = "sweep"
+            self._freq_mhz = make_freq_grid(start_hz, stop_hz, points) / 1e6
+            zeros = np.zeros_like(self._freq_mhz)
+            self.line_zr.set_data(self._freq_mhz, zeros)
+            self.line_zx.set_data(self._freq_mhz, zeros)
+            self._target_vline.set_visible(True)
+            self.ax.set_xlabel("Frequency [MHz]")
+            self.ax.set_title("")
+            self.ax.set_xlim(start_hz / 1e6, stop_hz / 1e6)
+            self.ax.set_ylim(-100, 100)
+        self.canvas.draw_idle()
+
     def _redraw_plot(self, z_r, z_x):
-        """最新の Z スイープでグラフを更新する(メインスレッドから呼ぶこと)。"""
-        self.line_zr.set_ydata(z_r)
-        self.line_zx.set_ydata(z_x)
+        """最新の Z データでグラフを更新する(メインスレッドから呼ぶこと)。"""
+        if self._plot_mode == "time":
+            # 単一周波数: 先頭(唯一)の値を時系列バッファへ追加してスクロール表示
+            if len(z_r) == 0:
+                return
+            self._tr_zr.append(float(z_r[0]))
+            self._tr_zx.append(float(z_x[0]))
+            n = len(self._tr_zr)
+            xs = range(n)
+            self.line_zr.set_data(xs, list(self._tr_zr))
+            self.line_zx.set_data(xs, list(self._tr_zx))
+            self.ax.set_xlim(max(0, n - TIME_PLOT_WINDOW), max(TIME_PLOT_WINDOW, n))
+            allv = np.array(list(self._tr_zr) + list(self._tr_zx), dtype=float)
+        else:
+            # スイープ: 点数が一致しない場合はスキップ(再構成直後など)
+            if len(z_r) != len(self._freq_mhz):
+                return
+            self.line_zr.set_ydata(z_r)
+            self.line_zx.set_ydata(z_x)
+            allv = np.concatenate([np.asarray(z_r, float), np.asarray(z_x, float)])
+
         # 有限値のみで y 範囲を自動調整(全反射で inf になっても破綻しないように)
-        allv = np.concatenate([np.asarray(z_r, float), np.asarray(z_x, float)])
         finite = allv[np.isfinite(allv)]
         if finite.size:
             lo, hi = float(finite.min()), float(finite.max())
@@ -1194,6 +1362,50 @@ class App(tk.Tk):
             print("", flush=True)
             self._counter_active = False
 
+    # ---- 掃引条件の読み取り・検証 ----
+    def _read_sweep_config(self):
+        """
+        GUI の開始/終了周波数(MHz)と点数を読み取り検証する。
+        正常なら (start_hz, stop_hz, points) を返し、不正なら警告して None を返す。
+        単一周波数(開始==終了、または点数 1)は許可し、(points=1, stop=start) に正規化する。
+        """
+        try:
+            start_mhz = float(self.start_var.get())
+            stop_mhz = float(self.stop_var.get())
+        except ValueError:
+            messagebox.showerror("入力エラー",
+                                 "開始/終了周波数は数値(MHz)で入力してください。")
+            return None
+        # 点数は 1 刻みの任意整数。小数を入れられても四捨五入で整数化する。
+        try:
+            points = int(round(float(self.points_var.get())))
+        except ValueError:
+            messagebox.showerror("入力エラー", "点数は整数で入力してください。")
+            return None
+
+        if start_mhz <= 0 or stop_mhz <= 0:
+            messagebox.showerror("入力エラー", "周波数は正の値にしてください。")
+            return None
+        if start_mhz > stop_mhz:
+            messagebox.showerror(
+                "入力エラー", "開始周波数は終了周波数以下にしてください。\n"
+                "(開始==終了 にすると単一周波数測定になります)")
+            return None
+        if points < POINTS_MIN or points > POINTS_MAX:
+            messagebox.showerror(
+                "入力エラー",
+                "点数は {} 〜 {} の範囲で指定してください。".format(
+                    POINTS_MIN, POINTS_MAX))
+            return None
+
+        start_hz = int(round(start_mhz * 1e6))
+        stop_hz = int(round(stop_mhz * 1e6))
+        # 単一周波数モードの正規化: 点数 1 または 開始==終了 -> (points=1, stop=start)
+        if points <= 1 or start_hz == stop_hz:
+            points = 1
+            stop_hz = start_hz
+        return start_hz, stop_hz, points
+
     # ---- 計測開始 ----
     def on_start(self):
         if self.measuring:
@@ -1207,11 +1419,25 @@ class App(tk.Tk):
                 "VNA を接続し、[ポート再検索] で一覧を更新してから選択してください。")
             return
 
+        # 掃引条件(開始/終了周波数・点数)を読み取り検証
+        cfg = self._read_sweep_config()
+        if cfg is None:
+            return
+        start_hz, stop_hz, points = cfg
+        use_optitrack = bool(self.optitrack_var.get())
+
+        # 新しい掃引条件にあわせてグラフ横軸を作り直す
+        self._reconfigure_plot(start_hz, stop_hz, points)
+
         self.measuring = True
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self.port_combo.configure(state="disabled")   # 計測中はポート変更不可
+        self.port_combo.configure(state="disabled")   # 計測中は変更不可
         self.rescan_btn.configure(state="disabled")
+        self.start_entry.configure(state="disabled")
+        self.stop_entry.configure(state="disabled")
+        self.points_spin.configure(state="disabled")
+        self.optitrack_chk.configure(state="disabled")
         self.status_var.set("接続中...")
         self.count_var.set("サンプル数: 0")
         # FPS 計測の初期化
@@ -1225,15 +1451,22 @@ class App(tk.Tk):
         self._fps_win_opti = 0
         self._fps_win_vna = 0
         self.fps_var.set("OptiTrack: -- FPS / NanoVNA: -- FPS")
-        if com_port == TEST_MODE:
-            msg = "計測を開始しました。【VNAなしテストモード】OptiTrack のみ取得（VNA 列は 0）。"
+        if points <= 1:
+            sweep_desc = "単一周波数 {:.4f} MHz (1点)".format(start_hz / 1e6)
         else:
-            msg = "計測を開始しました。COM Port = {}（{} を計測）".format(
-                com_port, VNA_SPARAM)
+            sweep_desc = "掃引 {:.3f}-{:.3f} MHz {}点".format(
+                start_hz / 1e6, stop_hz / 1e6, points)
+        opt_desc = "OptiTrack ON" if use_optitrack else "OptiTrack OFF(VNAのみ)"
+        if com_port == TEST_MODE:
+            msg = ("計測を開始しました。【VNAなしテストモード】OptiTrack のみ取得"
+                   "（VNA 列は 0, {}, {}）。").format(sweep_desc, opt_desc)
+        else:
+            msg = "計測を開始しました。COM Port = {}（{}, {}, {}）".format(
+                com_port, VNA_SPARAM, sweep_desc, opt_desc)
         self._log(msg)
         self._console_event("[計測開始] " + msg)  # 重要イベントはコンソールにも残す
         self.controller = MeasurementController(self.msg_queue)
-        self.controller.start(com_port)
+        self.controller.start(com_port, start_hz, stop_hz, points, use_optitrack)
 
     # ---- 計測終了 -> 保存 -> 終了 ----
     def on_stop(self):
@@ -1426,6 +1659,10 @@ class App(tk.Tk):
         self.stop_btn.configure(state="disabled")
         self.port_combo.configure(state="readonly")  # ポート再選択を許可
         self.rescan_btn.configure(state="normal")
+        self.start_entry.configure(state="normal")   # 掃引条件の再編集を許可
+        self.stop_entry.configure(state="normal")
+        self.points_spin.configure(state="normal")
+        self.optitrack_chk.configure(state="normal")
         self.status_var.set("エラーで停止。再開できます")
 
 
