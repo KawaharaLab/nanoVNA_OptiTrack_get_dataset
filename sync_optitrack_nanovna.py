@@ -7,17 +7,18 @@ OptiTrack (Motive 3.1 / NatNet) + JNCRadio VNA 3G 同期計測スクリプト
 受信しつつ、USB シリアル接続された JNCRadio VNA 3G から特定単一周波数の S11 を
 連続取得し、両者を同期して CSV に保存する。
 
-計測対象は腕に取り付けた 3 個の対象(リジッドボディ または ラベル付きマーカー):
-  1. 上腕   (Upper Arm)
-  2. 関節   (Joint / 肘など)
-  3. 前腕   (Forearm)
+計測対象は腕に取り付けた 4 個の対象(リジッドボディ または ラベル付きマーカー):
+  1. 胸     (Chest)
+  2. 上腕   (Upper Arm)
+  3. 関節   (Joint / 肘など)
+  4. 前腕   (Forearm)
 各対象の [X, Y, Z] 座標を同時に取得し、S11 / インピーダンスと紐付けて 1 行に記録する。
 
 ★ID の自動判別(キャリブレーション)★
   Motive はセッションごとに ID を自動採番するため実行のたびに ID が変わる。本スクリプトは
-  名前付けや ID 指定を不要にするため、計測開始時の最初の有効フレームで 3 対象の「高さ」を
-  比較し、一番高い=上腕 / 中間=関節 / 一番低い=前腕 として ID と部位の対応を自動確定する。
-  以後はその ID を固定して座標を取得する(設定は HEIGHT_AXIS_INDEX / OBJECT_SOURCE)。
+  名前付けや ID 指定を不要にするため、計測開始時の最初の有効フレームで 4 対象の「高さ」を
+  比較し、一番高い=胸 / 2番目=上腕 / 3番目=関節 / 一番低い=前腕 として ID と部位の対応を
+  自動確定する。以後はその ID を固定して座標を取得する(設定は HEIGHT_AXIS_INDEX / OBJECT_SOURCE)。
 
 動作確認環境:
   - Windows 10/11, Python 3.8+
@@ -26,9 +27,9 @@ OptiTrack (Motive 3.1 / NatNet) + JNCRadio VNA 3G 同期計測スクリプト
 
 GUI / スレッド構成:
   - tkinter GUI(メインスレッド): [計測開始]/[計測終了] ボタン。GUI は固まらない。
-  - 計測ワーカー(バックグラウンド): VNA から S11 を取得し、3 対象の最新座標と結合して
+  - 計測ワーカー(バックグラウンド): VNA から S11 を取得し、4 対象の最新座標と結合して
     メモリ上(self.rows)へ蓄積する。
-  - NatNet 受信(SDK 内部スレッド): new_frame_with_data_listener が 3 対象の最新座標を更新。
+  - NatNet 受信(SDK 内部スレッド): new_frame_with_data_listener が 4 対象の最新座標を更新。
     最初の有効フレームで「開始時の高さ」による自動判別を実行する。
   - 共有変数は threading.Lock() で保護してスレッド安全に読み書きする。
   - 終了時(終了ボタン / ウィンドウ×)は必ずクリーンアップを実行する:
@@ -49,6 +50,7 @@ VNA 接続(COM ポート):
 
 CSV ヘッダー:
   [Timestamp,
+   Chest_X,    Chest_Y,    Chest_Z,
    UpperArm_X, UpperArm_Y, UpperArm_Z,
    Joint_X,    Joint_Y,    Joint_Z,
    Forearm_X,  Forearm_Y,  Forearm_Z,
@@ -62,7 +64,6 @@ import time
 import queue
 import threading
 import collections
-from datetime import datetime
 
 import serial  # pip install pyserial
 from serial.tools import list_ports  # 利用可能な COM ポートの列挙に使用
@@ -158,11 +159,12 @@ NATNET_LOCAL_IP  = "127.0.0.1"  # 同一PCなので localhost
 NATNET_USE_MULTICAST = False    # 同一PCループバックは Unicast 推奨
 
 # --- 自動判別(キャリブレーション)方式 ---
-# Motive 側で名前付けや ID 設定をしなくても、計測開始時の「高さ」で 3 つの対象を
-# 自動的に upperarm / joint / forearm へ割り当てる。
-#   計測開始時の最初の有効フレームで 3 対象の高さ(座標)を降順ソートし、
-#     1番高い  -> UpperArm(上腕)
-#     2番目    -> Joint(関節)
+# Motive 側で名前付けや ID 設定をしなくても、計測開始時の「高さ」で 4 つの対象を
+# 自動的に chest / upperarm / joint / forearm へ割り当てる。
+#   計測開始時の最初の有効フレームで 4 対象の高さ(座標)を降順ソートし、
+#     1番高い  -> Chest(胸)
+#     2番目    -> UpperArm(上腕)
+#     3番目    -> Joint(関節)
 #     1番低い  -> Forearm(前腕)
 #   として ID と部位の対応を確定し、以後はその ID を固定して座標を取得する。
 #
@@ -177,8 +179,8 @@ HEIGHT_AXIS_INDEX = 1
 #   "auto"           : リジッドボディがあればそれを、無ければラベル付きマーカーを使う
 OBJECT_SOURCE = "auto"
 
-# キャリブレーションに必要な対象数(上腕・関節・前腕の 3 個)。
-EXPECTED_OBJECT_COUNT = 3
+# キャリブレーションに必要な対象数(胸・上腕・関節・前腕の 4 個)。
+EXPECTED_OBJECT_COUNT = 4
 
 # 自動判別(キャリブレーション)が完了するまで待つ最大秒数。
 CALIBRATION_TIMEOUT_SEC = 10.0
@@ -193,8 +195,10 @@ STREAM_STALE_SEC = 2.0
 # --- 出力 ---
 OUTPUT_CSV = "sync_dataset.csv"
 
-# 位置情報の先頭 10 列(タイムスタンプ + 3 部位 × XYZ)
+# 位置情報の先頭 13 列(計測開始からの経過秒 + 4 部位 × XYZ)
+# Timestamp 列の中身は「計測ループ開始(最初のサンプル取得直前)を 0 とした経過時間[秒]」
 _POSITION_HEADER = ["Timestamp",
+                    "Chest_X",    "Chest_Y",    "Chest_Z",
                     "UpperArm_X", "UpperArm_Y", "UpperArm_Z",
                     "Joint_X",    "Joint_Y",    "Joint_Z",
                     "Forearm_X",  "Forearm_Y",  "Forearm_Z"]
@@ -229,18 +233,18 @@ def build_csv_header(freq_grid_hz):
 CSV_HEADER = build_csv_header(FREQ_GRID_HZ)
 
 
-PART_NAMES = ("UpperArm", "Joint", "Forearm")
+PART_NAMES = ("Chest", "UpperArm", "Joint", "Forearm")
 
 
 # =============================================================================
 # 自動判別(キャリブレーション): 開始時の高さで ID -> 部位 を確定する
 # =============================================================================
 #
-# 計測開始時の最初の有効フレームで 3 対象の高さ(HEIGHT_AXIS_INDEX 軸の座標)を
-# 降順ソートし、ID -> 部位(UpperArm/Joint/Forearm) の対応表を一度だけ作る。
+# 計測開始時の最初の有効フレームで 4 対象の高さ(HEIGHT_AXIS_INDEX 軸の座標)を
+# 降順ソートし、ID -> 部位(Chest/UpperArm/Joint/Forearm) の対応表を一度だけ作る。
 # 確定後は _id_to_part を固定し、毎フレーム ID 一致で座標を取り出す。
 _calib_lock = threading.Lock()
-_id_to_part = {}                      # obj_id(int) -> "UpperArm"/"Joint"/"Forearm"
+_id_to_part = {}                      # obj_id(int) -> "Chest"/"UpperArm"/"Joint"/"Forearm"
 _calibrated = threading.Event()       # 自動判別が完了したら set
 
 
@@ -280,14 +284,14 @@ _calib_warn_time = [0.0]
 def try_calibrate(objects):
     """
     まだ未確定であれば、与えられた (obj_id, pos) 群から ID->部位 を確定する。
-    高さ(HEIGHT_AXIS_INDEX 軸)の降順で UpperArm > Joint > Forearm に割り当てる。
-    確定できたら True、まだ条件を満たさなければ False を返す。
+    高さ(HEIGHT_AXIS_INDEX 軸)の降順で PART_NAMES(Chest > UpperArm > Joint > Forearm)
+    の順に割り当てる。確定できたら True、まだ条件を満たさなければ False を返す。
     """
     if len(objects) < EXPECTED_OBJECT_COUNT:
         return False
 
     if len(objects) > EXPECTED_OBJECT_COUNT:
-        # 対象が多すぎると高さ順の中間(Joint)が一意に決まらないので確定しない。
+        # 対象が多すぎると高さ順の中間(UpperArm/Joint)が一意に決まらないので確定しない。
         now = time.time()
         if now - _calib_warn_time[0] > 2.0:
             _calib_warn_time[0] = now
@@ -299,11 +303,7 @@ def try_calibrate(objects):
     # 高さ(指定軸の座標)で降順ソート: [0]=最も高い, [-1]=最も低い
     ordered = sorted(
         objects, key=lambda t: t[1][HEIGHT_AXIS_INDEX], reverse=True)
-    mapping = {
-        ordered[0][0]: "UpperArm",   # 一番高い  -> 上腕
-        ordered[1][0]: "Joint",      # 2番目     -> 関節
-        ordered[2][0]: "Forearm",    # 一番低い  -> 前腕
-    }
+    mapping = {oid: part for (oid, _pos), part in zip(ordered, PART_NAMES)}
 
     with _calib_lock:
         _id_to_part.clear()
@@ -312,7 +312,7 @@ def try_calibrate(objects):
 
     axis_name = {0: "X", 1: "Y", 2: "Z"}.get(HEIGHT_AXIS_INDEX, "?")
     _dbg("[INFO] 自動判別 完了(開始時の高さ {} 軸で降順):".format(axis_name))
-    for part, (oid, pos) in zip(("UpperArm", "Joint", "Forearm"), ordered):
+    for part, (oid, pos) in zip(PART_NAMES, ordered):
         _dbg("       {:8s} <- id={}  (高さ {}={:.3f})".format(
             part, oid, axis_name, pos[HEIGHT_AXIS_INDEX]))
     return True
@@ -325,13 +325,14 @@ def get_id_to_part():
 
 
 # =============================================================================
-# スレッド間共有: 3 マーカーの最新 OptiTrack 座標
+# スレッド間共有: 4 マーカーの最新 OptiTrack 座標
 # =============================================================================
 
 # Lock で保護される共有状態。NatNet コールバック(書き込み)と
 # VNA ループ(読み出し)の双方からアクセスされる。各部位ごとに {x,y,z,valid} を保持。
 _pos_lock = threading.Lock()
 _latest_positions = {
+    "Chest":    {"x": None, "y": None, "z": None, "valid": False},
     "UpperArm": {"x": None, "y": None, "z": None, "valid": False},
     "Joint":    {"x": None, "y": None, "z": None, "valid": False},
     "Forearm":  {"x": None, "y": None, "z": None, "valid": False},
@@ -386,9 +387,9 @@ def mark_frame_received():
 
 def read_latest_positions():
     """
-    VNA ループから呼ばれ、3 マーカーすべての最新座標のスナップショットを
+    VNA ループから呼ばれ、4 マーカーすべての最新座標のスナップショットを
     同一ロック下で一括取得する。
-    戻り値: {"UpperArm": (x,y,z,valid), "Joint": (...), "Forearm": (...)}
+    戻り値: {"Chest": (x,y,z,valid), "UpperArm": (...), "Joint": (...), "Forearm": (...)}
     """
     snapshot = {}
     with _pos_lock:
@@ -900,7 +901,8 @@ class MeasurementController:
             while not _stop_event.is_set() and not _calibrated.is_set():
                 if time.time() > deadline:
                     self._post("status",
-                               "[警告] 自動判別が完了しません。3対象のトラッキング/配信設定を確認してください。")
+                               "[警告] 自動判別が完了しません。{}対象のトラッキング/配信設定を確認してください。"
+                               .format(EXPECTED_OBJECT_COUNT))
                     break
                 time.sleep(0.05)
             if _calibrated.is_set():
@@ -913,6 +915,9 @@ class MeasurementController:
         self._post("status", "計測中...")
         last_stale_warn = 0.0
         npts = self.points
+        # 経過時間の基準(この時点=最初のサンプル取得直前を 0 秒とする)。
+        # 単調増加時計 perf_counter を使い、システム時刻補正の影響を受けないようにする。
+        t0 = time.perf_counter()
         while not _stop_event.is_set():
             if test_mode:
                 # VNA は使わない。全点ダミー 0。間隔をあけてサンプリング。
@@ -956,7 +961,8 @@ class MeasurementController:
                                "[警告] OptiTrack フレームが {:.1f}s 途絶(座標が古い可能性)".format(elapsed))
 
             snap = read_latest_positions()
-            ts = datetime.now().isoformat(timespec="milliseconds")
+            # タイムスタンプ = 計測開始からの経過時間[秒](ミリ秒精度)
+            ts = "{:.3f}".format(time.perf_counter() - t0)
 
             # 各掃引点の (S11_Real, S11_Imag, Z_R, Z_X) を 1 行に展開
             vna_cols = []
@@ -967,6 +973,7 @@ class MeasurementController:
                              "{:.4f}".format(z_x[i])]
             row = (
                 [ts]
+                + _fmt_xyz(snap, "Chest")
                 + _fmt_xyz(snap, "UpperArm")
                 + _fmt_xyz(snap, "Joint")
                 + _fmt_xyz(snap, "Forearm")
@@ -1051,7 +1058,8 @@ class App(tk.Tk):
         self.msg_queue = queue.Queue()
         self.controller = None
         self.measuring = False
-        self._finalizing = False  # 停止→保存→終了の処理中フラグ
+        self._finalizing = False  # 停止→保存→(終了 or 待機復帰)の処理中フラグ
+        self._exit_after_save = False  # True: 保存後にアプリ終了 / False: 待機状態へ戻る
         self._latest_plot = None  # 直近の (z_r, z_x)。poll ごとに1回だけ描画する
         self._counter_active = False  # コンソールの \r カウンタ行が出ているか
 
@@ -1473,6 +1481,7 @@ class App(tk.Tk):
         if not self.measuring or self._finalizing:
             return
         self._finalizing = True
+        self._exit_after_save = False        # 保存後はウィンドウを閉じず待機状態へ戻す
         self._meas_stop_time = time.time()  # 平均 FPS 算出用に停止時刻を記録
         self.stop_btn.configure(state="disabled")
         self.status_var.set("停止処理中...")
@@ -1491,8 +1500,8 @@ class App(tk.Tk):
         threading.Thread(target=_finalize, name="Finalizer",
                           daemon=True).start()
 
-    # ---- 保存ダイアログ -> 保存 -> 終了 ----
-    def _do_save_and_exit(self):
+    # ---- 保存ダイアログ -> 保存 -> (待機復帰 or 終了) ----
+    def _do_save_then_finish(self):
         n = self.controller.get_sample_count() if self.controller else 0
         self.status_var.set("保存先を選択してください")
         path = filedialog.asksaveasfilename(
@@ -1516,13 +1525,41 @@ class App(tk.Tk):
                 messagebox.showerror("保存エラー", "保存に失敗しました:\n{}".format(e))
         else:
             # キャンセル時: データ破棄の確認
+            tail = "終了しますか?" if self._exit_after_save else "破棄しますか?(いいえ=保存ダイアログに戻る)"
             if n > 0 and not messagebox.askyesno(
-                    "確認", "保存をキャンセルしました。{} サンプルを破棄して終了しますか?".format(n)):
-                # 終了を取りやめ -> 保存ダイアログを再表示できるよう finalizing 解除しない。
-                # ここでは再度保存を促す。
-                self._do_save_and_exit()
+                    "確認", "保存をキャンセルしました。{} サンプルを{}".format(n, tail)):
+                # 取りやめ -> 保存ダイアログを再表示
+                self._do_save_then_finish()
                 return
-        self.destroy()
+
+        # 保存/破棄が完了 -> ウィンドウ × からの場合は終了、計測終了ボタンなら待機状態へ戻す
+        if self._exit_after_save:
+            self.destroy()
+        else:
+            self._log("待機状態に戻りました。続けて[計測開始]できます。")
+            self._reset_to_idle()
+
+    # ---- 計測 1 回ぶんを終えて待機状態(初期状態)に戻す ----
+    def _reset_to_idle(self):
+        self.measuring = False
+        self._finalizing = False
+        self.controller = None
+        self._counter_active = False
+        self._meas_start_time = None
+        self._meas_stop_time = None
+        self._fps_win_start = None
+        self._opti_fps = 0.0
+        self._vna_fps = 0.0
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.port_combo.configure(state="readonly")
+        self.rescan_btn.configure(state="normal")
+        self.start_entry.configure(state="normal")
+        self.stop_entry.configure(state="normal")
+        self.points_spin.configure(state="normal")
+        self.optitrack_chk.configure(state="normal")
+        self.status_var.set("待機中")
+        self.fps_var.set("OptiTrack: -- FPS / NanoVNA: -- FPS")
 
     # ---- ウィンドウ × ----
     def on_window_close(self):
@@ -1533,6 +1570,7 @@ class App(tk.Tk):
                     "終了確認", "計測中です。停止して終了しますか?"):
                 return
             self._finalizing = True
+            self._exit_after_save = True         # ウィンドウ × は保存後にアプリを終了する
             self._meas_stop_time = time.time()  # 平均 FPS 算出用に停止時刻を記録
             self.status_var.set("停止処理中...")
             self._log("ウィンドウを閉じています。クリーンアップ中...")
@@ -1582,8 +1620,10 @@ class App(tk.Tk):
                     self.status_var.set("停止しました")
                     self.count_var.set("サンプル数: {}".format(
                         self.controller.get_sample_count() if self.controller else 0))
-                    self._do_save_and_exit()
-                    return  # ウィンドウ破棄後に after を再登録しない
+                    self._do_save_then_finish()
+                    if not self.winfo_exists():
+                        return  # 終了(ウィンドウ破棄)した場合は再ポーリングしない
+                    # 待機状態へ戻した場合はそのままポーリングを継続する
         except queue.Empty:
             pass
 
