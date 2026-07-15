@@ -7,18 +7,20 @@ OptiTrack (Motive 3.1 / NatNet) + JNCRadio VNA 3G 同期計測スクリプト
 受信しつつ、USB シリアル接続された JNCRadio VNA 3G から特定単一周波数の S11 を
 連続取得し、両者を同期して CSV に保存する。
 
-計測対象は腕に取り付けた 4 個の対象(リジッドボディ または ラベル付きマーカー):
-  1. 胸     (Chest)
-  2. 上腕   (Upper Arm)
-  3. 関節   (Joint / 肘など)
-  4. 前腕   (Forearm)
-各対象の [X, Y, Z] 座標を同時に取得し、S11 / インピーダンスと紐付けて 1 行に記録する。
+計測対象は身体に取り付けた 7 個のラベル付きマーカー:
+  R_forearm, R_joint, R_upperarm, chest, L_forearm, L_joint, L_upperarm
+各マーカーの [X, Y, Z] 座標を同時に取得し、S11 / インピーダンスと紐付けて 1 行に記録する。
 
-★ID の自動判別(キャリブレーション)★
-  Motive はセッションごとに ID を自動採番するため実行のたびに ID が変わる。本スクリプトは
-  名前付けや ID 指定を不要にするため、計測開始時の最初の有効フレームで 4 対象の「高さ」を
-  比較し、一番高い=胸 / 2番目=上腕 / 3番目=関節 / 一番低い=前腕 として ID と部位の対応を
-  自動確定する。以後はその ID を固定して座標を取得する(設定は HEIGHT_AXIS_INDEX / OBJECT_SOURCE)。
+★マーカーの識別(ラベル認識)★
+  Motive 側で各マーカーにラベル(名前)を付け、マーカーセットとして配信する。本スクリプトは
+  マーカーセット内の「並び順」を EXPECTED_MARKER_NAMES に対応付けて各マーカーの座標を取得する
+  (高さによる自動判別は廃止)。実際にどの順序・形式で配信されているかは、起動直後に出力される
+  診断ログ(MARKER_DIAGNOSTIC_FRAMES)で確認できる。
+
+★マーカー消失時の扱い★
+  いずれかのマーカーが認識できない(オクルージョン/未検出)フレームでは、そのとき取得した
+  VNA サンプルを CSV に記録せず自動的に破棄する。マーカーセット内の隠れマーカーは Motive から
+  (0,0,0) で配信されるため、原点近傍を「未認識」とみなす(OCCLUSION_ORIGIN_EPS)。
 
 動作確認環境:
   - Windows 10/11, Python 3.8+
@@ -27,10 +29,14 @@ OptiTrack (Motive 3.1 / NatNet) + JNCRadio VNA 3G 同期計測スクリプト
 
 GUI / スレッド構成:
   - tkinter GUI(メインスレッド): [計測開始]/[計測終了] ボタン。GUI は固まらない。
-  - 計測ワーカー(バックグラウンド): VNA から S11 を取得し、4 対象の最新座標と結合して
-    メモリ上(self.rows)へ蓄積する。
-  - NatNet 受信(SDK 内部スレッド): new_frame_with_data_listener が 4 対象の最新座標を更新。
-    最初の有効フレームで「開始時の高さ」による自動判別を実行する。
+  - VNA リーダー: 各 nanoVNA を掃引して最新の S11→Z11 を publish する。
+      交互モード(既定): 1 本のスレッドが全チャンネルを 1 台ずつ順番に掃引する。
+        → 2 台が同時に送信しないので RF 干渉によるノイズを防ぐ(VNA_ALTERNATE_SWEEP)。
+      並列モード: チャンネルごとに専用スレッドで同時掃引する(高速だが 2 台同時だと干渉)。
+  - コンバイナ(バックグラウンド): 全チャンネルの最新掃引と 7 マーカー座標を結合して
+    メモリ上(self.rows)へ蓄積する。全マーカーが認識できているサンプルのみ記録する。
+  - NatNet 受信(SDK 内部スレッド): new_frame_with_data_listener が 7 マーカーの最新座標を更新。
+    マーカーの marker_id をラベル名に対応付ける。未検出のマーカーは無効化する。
   - 共有変数は threading.Lock() で保護してスレッド安全に読み書きする。
   - 終了時(終了ボタン / ウィンドウ×)は必ずクリーンアップを実行する:
       VNA のクローズ → NatNet の shutdown() → 全スレッドの join。
@@ -39,7 +45,7 @@ GUI / スレッド構成:
 
 操作の流れ:
   1. プログラム起動で GUI が立ち上がる。
-  2. [計測開始] で計測スタート(最初の有効フレームで自動判別が走る)。
+  2. [計測開始] で計測スタート(全マーカーが揃ったサンプルのみ記録される)。
   3. [計測終了] で計測停止 → 保存ダイアログでファイル名指定 → CSV 保存 → 終了。
 
 VNA 接続(COM ポート):
@@ -48,13 +54,20 @@ VNA 接続(COM ポート):
   選択ポートが開けない(存在しない/他ソフトが占有)場合は、クラッシュさせず
   messagebox.showerror で警告を表示する。
 
-CSV ヘッダー:
+CSV ヘッダー(位置列は EXPECTED_MARKER_NAMES 順、VNA 列は VNA_CHANNEL_NAMES 順に自動生成):
   [Timestamp,
-   Chest_X,    Chest_Y,    Chest_Z,
-   UpperArm_X, UpperArm_Y, UpperArm_Z,
-   Joint_X,    Joint_Y,    Joint_Z,
-   Forearm_X,  Forearm_Y,  Forearm_Z,
-   S11_Real, S11_Imag, Z_R, Z_X]
+   R_forearm_X,  R_forearm_Y,  R_forearm_Z,
+   R_joint_X,    R_joint_Y,    R_joint_Z,
+   R_upperarm_X, R_upperarm_Y, R_upperarm_Z,
+   chest_X,      chest_Y,      chest_Z,
+   L_forearm_X,  L_forearm_Y,  L_forearm_Z,
+   L_joint_X,    L_joint_Y,    L_joint_Z,
+   L_upperarm_X, L_upperarm_Y, L_upperarm_Z,
+   leftbody_S11_Real[_MHz],  ..., leftbody_Z_R[_MHz],  leftbody_Z_X[_MHz],
+   rightbody_S11_Real[_MHz], ..., rightbody_Z_R[_MHz], rightbody_Z_X[_MHz]]
+
+計測中の GUI 表示: leftbody / rightbody それぞれのスミスチャート(S11=Γ をプロット)と、
+「読み取り周波数」に最も近い掃引点のインピーダンス Z=R+jX の数値表示。
 """
 
 import os
@@ -84,7 +97,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 # コンソール出力ポリシー
 # =============================================================================
 # 計測中の細かいログはコンソールに出さず GUI ログに集約する。
-# CONSOLE_VERBOSE=True にすると、補助的な [INFO]/自動判別結果などもコンソールに出す。
+# CONSOLE_VERBOSE=True にすると、補助的な [INFO] などもコンソールに出す。
 # (重要イベント[計測開始/保存完了/エラー]とエラー詳細は常にコンソールへ出力する)
 CONSOLE_VERBOSE = False
 
@@ -103,6 +116,26 @@ def _dbg(*args):
 NANOVNA_PORT   = "COM3"        # Windows のデバイスマネージャーで確認した COM 番号
 NANOVNA_BAUD   = 115200        # ボーレート(JNCRadio VNA 3G は 115200 を推奨)
 Z0             = 50.0          # 特性インピーダンス [Ω]
+
+# --- VNA チャンネル(複数台の計測) ---
+# nanoVNA を複数台つないで、それぞれ別の対象の S11 を計測する。ここに列挙した
+# 名前ぶんだけ COM ポート選択欄が GUI に並ぶ(掃引の並行/交互は VNA_ALTERNATE_SWEEP 参照)。
+# CSV 列は leftbody_..., rightbody_... のようにチャンネル名で区別されるので、
+# 保存データからどちらの対象のインピーダンスかを判別できる。
+# GUI ではチャンネル名ごとに COM ポートを選ぶ(どの COM がどちらの body かは画面で割り当てる)。
+# 1 台だけ使う場合は ["leftbody"] のように 1 要素にする。
+VNA_CHANNEL_NAMES = ["leftbody", "rightbody"]
+
+# --- 交互計測(RF 干渉対策) ---
+# 2 台の nanoVNA を「同時に」掃引すると、両機が同じ周波数帯で同時に送信するため RF が
+# 干渉し、両方のインピーダンスに大きなノイズが乗る。これを防ぐため、既定では実機を
+# 1 台ずつ順番に掃引する(交互計測)。掃引と掃引の間に待ち時間は入れないので、各台の FPS は
+# 「並列同時掃引の約 1/実機台数」になる(=同時に送信しないための物理的な下限)。
+# 片方をテストモードにすると実機は 1 台だけになり干渉しないので、その 1 台を全速で掃引する
+# (テストモード側は掃引せずダミー 0 を埋めるだけ)。
+#   True  : 1 本のスレッドで実機のみをラウンドロビン掃引(同時送信しない/推奨)
+#   False : チャンネルごとに専用スレッドで並列掃引(高速だが 2 台同時だと干渉する)
+VNA_ALTERNATE_SWEEP = True
 
 # --- 掃引(スイープ)範囲の既定値 ---
 # 実際の掃引条件は GUI の入力欄(開始/終了周波数・点数)で変更でき、[計測開始]時に
@@ -147,7 +180,7 @@ VNA_OUTMASK = 2
 # VNA の接続・初期化を一切スキップし、OptiTrack の座標だけを取得する。
 # VNA 由来のカラム(S11_Real, S11_Imag, Z_R, Z_X)にはダミー値 0 を入れて同期させる。
 NO_VNA_DISPLAY = "None（VNAなしテストモード）"  # ドロップダウンの表示名
-TEST_MODE = "__TEST_NO_VNA__"                  # get_selected_port が返す内部センチネル
+TEST_MODE = "__TEST_NO_VNA__"                  # get_selected_ports が返す内部センチネル
 TEST_MODE_INTERVAL_SEC = 0.1                    # テストモードの1サンプル間隔[秒](律速が無いため)
 
 # 使用する COM ポートは GUI のドロップダウンで選択する(下記は初期選択の候補)。
@@ -158,36 +191,46 @@ NATNET_SERVER_IP = "127.0.0.1"  # 同一PCなので localhost (Motive と同じ 
 NATNET_LOCAL_IP  = "127.0.0.1"  # 同一PCなので localhost
 NATNET_USE_MULTICAST = False    # 同一PCループバックは Unicast 推奨
 
-# --- 自動判別(キャリブレーション)方式 ---
-# Motive 側で名前付けや ID 設定をしなくても、計測開始時の「高さ」で 4 つの対象を
-# 自動的に chest / upperarm / joint / forearm へ割り当てる。
-#   計測開始時の最初の有効フレームで 4 対象の高さ(座標)を降順ソートし、
-#     1番高い  -> Chest(胸)
-#     2番目    -> UpperArm(上腕)
-#     3番目    -> Joint(関節)
-#     1番低い  -> Forearm(前腕)
-#   として ID と部位の対応を確定し、以後はその ID を固定して座標を取得する。
+# --- マーカーの識別(ラベル認識)方式 ---
+# Motive 側で 7 個のマーカーにラベル(名前)を付けて配信する。フレームデータにマーカー名は
+# 含まれないため、本スクリプトは「マーカーの並び(marker_id または セット内 index)」を下記の
+# EXPECTED_MARKER_NAMES に順番どおり対応付けて座標を取得する(高さによる自動判別は廃止)。
 #
-# 高さに使う座標軸のインデックス: 0=X, 1=Y, 2=Z。
-# NatNet(Motive)の既定配信は Y-Up のため「高さ = Y(=1)」。
-# Motive を Z-Up でストリーミングしている場合は 2 に変更する。
-HEIGHT_AXIS_INDEX = 1
+# 【重要】EXPECTED_MARKER_NAMES の並び順が、実際の配信順と一致している必要がある。
+# 実際の並びは起動直後の診断ログ(MARKER_DIAGNOSTIC_FRAMES)で確認し、必要ならここを並べ替える。
+# CSV の位置列もこの順序で生成される。
 
-# 判別に使うフレームデータのソース:
-#   "rigid_body"     : リジッドボディのみを対象にする
-#   "labeled_marker" : ラベル付きマーカーのみを対象にする
-#   "auto"           : リジッドボディがあればそれを、無ければラベル付きマーカーを使う
-OBJECT_SOURCE = "auto"
+#EXPECTED_MARKER_NAMES = ["R_joint",  "R_forearm","chest","L_forearm", "L_joint","L_upperarm","R_upperarm",]
 
-# キャリブレーションに必要な対象数(胸・上腕・関節・前腕の 4 個)。
-EXPECTED_OBJECT_COUNT = 4
+EXPECTED_MARKER_NAMES = ["R_forearm","R_joint","R_upperarm","chest","L_upperarm","L_joint","L_forearm",]
 
-# 自動判別(キャリブレーション)が完了するまで待つ最大秒数。
-CALIBRATION_TIMEOUT_SEC = 10.0
+# 座標取得のソース:
+#   "labeled_marker" : ラベル付きマーカーを marker_id(1..N)で EXPECTED_MARKER_NAMES に対応付ける。
+#                      → marker_id=i のマーカー を EXPECTED_MARKER_NAMES[i-1] に割り当てる。
+#   "marker_set"     : マーカーセット内の「並び順(index)」で対応付ける。
+# Motive で個別マーカーにラベルを付けてアセット配信している場合は "labeled_marker"。
+MARKER_SOURCE = "labeled_marker"
 
-# オクルージョン(隠れ)状態のマーカーは座標が無効なため更新をスキップし、
-# 直前の有効値を保持する。
-SKIP_OCCLUDED = True
+# labeled_marker のとき、対象アセットの model_id(id_num の上位16bit)。
+# None なら model_id を問わず marker_id が 1..len(EXPECTED_MARKER_NAMES) の範囲のものを使う。
+# 余計なラベル付きマーカー(別アセット/点群)が混じる場合は、診断ログの model= の値を指定する。
+MARKER_MODEL_ID = None
+
+# marker_set のとき、位置取得に使うマーカーセット名。
+# 空文字 "" のときは、マーカー数が len(EXPECTED_MARKER_NAMES) と一致するセットを
+# 自動採用する(全点をまとめた "all" セットは除外)。
+MARKER_SET_NAME = ""
+
+# オクルージョン(隠れ)判定:
+# 隠れマーカーは occluded ビット付き、または (0,0,0) で配信される。原点近傍
+# (各軸の絶対値がこの値以内)や NaN を「未認識」とみなす。
+OCCLUSION_ORIGIN_EPS = 1e-6
+
+# 起動直後、受信フレームの構造(マーカーセット名・個数・各マーカー座標、
+# ラベル付きマーカー、リジッドボディ)を GUI ログへ出力する回数。0 で無効。
+# どの形式・並び順で配信されているかを確認し、EXPECTED_MARKER_NAMES / MARKER_SOURCE を
+# 合わせるために使う。
+MARKER_DIAGNOSTIC_FRAMES = 5
 
 # ストリーミング途絶の警告しきい値 [秒](この時間フレームが来なければ警告)
 STREAM_STALE_SEC = 2.0
@@ -195,13 +238,15 @@ STREAM_STALE_SEC = 2.0
 # --- 出力 ---
 OUTPUT_CSV = "sync_dataset.csv"
 
-# 位置情報の先頭 13 列(計測開始からの経過秒 + 4 部位 × XYZ)
+# 計測対象マーカー名(EXPECTED_MARKER_NAMES を確定した並び順で固定)。
+# 共有状態・CSV 列・スナップショットなどはすべてこの順序に従う。
+MARKER_NAMES = tuple(EXPECTED_MARKER_NAMES)
+
+# 位置情報の先頭列(計測開始からの経過秒 + 各マーカー × XYZ)を動的生成する。
 # Timestamp 列の中身は「計測ループ開始(最初のサンプル取得直前)を 0 とした経過時間[秒]」
-_POSITION_HEADER = ["Timestamp",
-                    "Chest_X",    "Chest_Y",    "Chest_Z",
-                    "UpperArm_X", "UpperArm_Y", "UpperArm_Z",
-                    "Joint_X",    "Joint_Y",    "Joint_Z",
-                    "Forearm_X",  "Forearm_Y",  "Forearm_Z"]
+_POSITION_HEADER = ["Timestamp"]
+for _mk in MARKER_NAMES:
+    _POSITION_HEADER += ["{}_X".format(_mk), "{}_Y".format(_mk), "{}_Z".format(_mk)]
 
 
 def _fmt_mhz(hz):
@@ -211,21 +256,32 @@ def _fmt_mhz(hz):
     return s.rstrip("0").rstrip(".")
 
 
-def build_csv_header(freq_grid_hz):
-    """
-    位置情報 + S パラメータ/インピーダンス列を並べた CSV ヘッダーを作る。
-    - 単一周波数(1 点)のとき: 周波数サフィックスを付けないシンプルな
-      [..., S11_Real, S11_Imag, Z_R, Z_X] にフォールバックする(test2.csv 互換)。
-    - 2 点以上のとき: 各掃引周波数ごとに 4 列(S11_Real_<MHz> ...)を動的生成する。
-    """
-    cols = list(_POSITION_HEADER)
+def _vna_columns_for(prefix, freq_grid_hz):
+    """1 チャンネルぶんの S パラメータ/インピーダンス列名を返す(先頭に prefix_ を付ける)。"""
+    cols = []
     if len(freq_grid_hz) <= 1:
-        cols += ["S11_Real", "S11_Imag", "Z_R", "Z_X"]
+        cols += ["{}_S11_Real".format(prefix), "{}_S11_Imag".format(prefix),
+                 "{}_Z_R".format(prefix), "{}_Z_X".format(prefix)]
     else:
         for hz in freq_grid_hz:
             lbl = _fmt_mhz(hz)
-            cols += ["S11_Real_{}".format(lbl), "S11_Imag_{}".format(lbl),
-                     "Z_R_{}".format(lbl), "Z_X_{}".format(lbl)]
+            cols += ["{}_S11_Real_{}".format(prefix, lbl),
+                     "{}_S11_Imag_{}".format(prefix, lbl),
+                     "{}_Z_R_{}".format(prefix, lbl),
+                     "{}_Z_X_{}".format(prefix, lbl)]
+    return cols
+
+
+def build_csv_header(freq_grid_hz, channel_names=VNA_CHANNEL_NAMES):
+    """
+    位置情報 + 各 VNA チャンネルの S パラメータ/インピーダンス列を並べた CSV ヘッダーを作る。
+    - 位置列(Timestamp + 各マーカー XYZ)のあとに、チャンネルごとに 4 列 × 点数を並べる。
+    - 列名は "<チャンネル名>_S11_Real[_<MHz>]" のようにチャンネル名で区別する。
+      (単一周波数のときは MHz サフィックスを省く)
+    """
+    cols = list(_POSITION_HEADER)
+    for name in channel_names:
+        cols += _vna_columns_for(name, freq_grid_hz)
     return cols
 
 
@@ -233,109 +289,193 @@ def build_csv_header(freq_grid_hz):
 CSV_HEADER = build_csv_header(FREQ_GRID_HZ)
 
 
-PART_NAMES = ("Chest", "UpperArm", "Joint", "Forearm")
-
-
 # =============================================================================
-# 自動判別(キャリブレーション): 開始時の高さで ID -> 部位 を確定する
+# ラベル認識: マーカーの並び(marker_id / セット内 index)を名前に対応付けて座標を取り出す
 # =============================================================================
 #
-# 計測開始時の最初の有効フレームで 4 対象の高さ(HEIGHT_AXIS_INDEX 軸の座標)を
-# 降順ソートし、ID -> 部位(Chest/UpperArm/Joint/Forearm) の対応表を一度だけ作る。
-# 確定後は _id_to_part を固定し、毎フレーム ID 一致で座標を取り出す。
-_calib_lock = threading.Lock()
-_id_to_part = {}                      # obj_id(int) -> "Chest"/"UpperArm"/"Joint"/"Forearm"
-_calibrated = threading.Event()       # 自動判別が完了したら set
+# フレームデータにマーカー名は含まれない。ラベル付きマーカーは marker_id(1..N)、マーカーセットは
+# セット内の並び順で毎フレーム配信されるため、EXPECTED_MARKER_NAMES にその並びを記述しておき、
+# marker_id / index で名前へ対応付ける。隠れマーカーは occluded ビット付き or (0,0,0) で来る。
+
+# 診断ログ(受信フレームの構造ダンプ)の残り出力回数。フレームコールバックから減算する。
+_diag_remaining = [MARKER_DIAGNOSTIC_FRAMES]
+
+# フレームコールバック(NatNet 受信スレッド)から GUI ログへ文字列を送るためのシンク。
+# コントローラが計測開始時に設定する。未設定時は _dbg にフォールバックする。
+_frame_log_sink = [None]
 
 
-def collect_frame_objects(mocap):
+def set_frame_log_sink(fn):
+    """フレーム受信スレッドからのログ出力先を設定する(None で解除)。"""
+    _frame_log_sink[0] = fn
+
+
+def _flog(msg):
+    """フレーム受信スレッドからのログ。GUI ログへ送る(無ければコンソール)。"""
+    sink = _frame_log_sink[0]
+    if sink is not None:
+        try:
+            sink(msg)
+            return
+        except Exception:
+            pass
+    print(msg)
+
+
+def _decode_name(raw):
+    """マーカーセットの model_name(bytes/str)を文字列にする。"""
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", "replace")
+    return str(raw) if raw is not None else ""
+
+
+def _is_occluded_pos(pos):
+    """位置が「未認識(隠れ)」か判定する。原点近傍 or NaN を未認識とみなす。"""
+    try:
+        x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
+    except (TypeError, ValueError, IndexError):
+        return True
+    if x != x or y != y or z != z:   # NaN チェック
+        return True
+    eps = OCCLUSION_ORIGIN_EPS
+    return abs(x) <= eps and abs(y) <= eps and abs(z) <= eps
+
+
+def _iter_marker_sets(mocap):
+    """(セット名, MarkerData) の列を返す。"""
+    ms = getattr(mocap, "marker_set_data", None)
+    for md in getattr(ms, "marker_data_list", None) or []:
+        yield _decode_name(getattr(md, "model_name", b"")), md
+
+
+def select_marker_set(mocap):
     """
-    現在フレームの MoCapData から、判別/取得対象の (obj_id, pos) のリストを得る。
-    OBJECT_SOURCE に従い、リジッドボディ または ラベル付きマーカー から収集する。
-    SKIP_OCCLUDED=True の場合、トラッキング無効/オクルージョン中の対象は除外する。
+    座標取得に使うマーカーセットを選ぶ。
+    - MARKER_SET_NAME が指定されていればその名前のセット。
+    - 空文字なら、マーカー数が len(MARKER_NAMES) と一致するセット("all" は除外)。
+    見つからなければ None。
     """
-    objects = []
-
-    # --- リジッドボディ ---
-    if OBJECT_SOURCE in ("rigid_body", "auto"):
-        rb_data = getattr(mocap, "rigid_body_data", None)
-        for rb in getattr(rb_data, "rigid_body_list", None) or []:
-            if SKIP_OCCLUDED and not getattr(rb, "tracking_valid", True):
-                continue
-            objects.append((int(rb.id_num), rb.pos))
-
-    # --- ラベル付きマーカー(auto はリジッドボディが無いときだけ使う) ---
-    use_lm = OBJECT_SOURCE == "labeled_marker" or \
-        (OBJECT_SOURCE == "auto" and not objects)
-    if use_lm:
-        lm_data = getattr(mocap, "labeled_marker_data", None)
-        for m in getattr(lm_data, "labeled_marker_list", None) or []:
-            if SKIP_OCCLUDED and (getattr(m, "param", 0) & 0x01):
-                continue
-            objects.append((int(m.id_num), m.pos))
-
-    return objects
+    want = len(MARKER_NAMES)
+    sets = list(_iter_marker_sets(mocap))
+    if MARKER_SET_NAME:
+        for nm, md in sets:
+            if nm == MARKER_SET_NAME:
+                return md
+        return None
+    candidates = [(nm, md) for nm, md in sets if nm.lower() != "all"]
+    for nm, md in candidates:
+        if len(getattr(md, "marker_pos_list", []) or []) == want:
+            return md
+    return None
 
 
-# キャリブレーション時の「対象数が合わない」警告を間引くための直近出力時刻
-_calib_warn_time = [0.0]
-
-
-def try_calibrate(objects):
+def _collect_from_labeled_markers(mocap):
     """
-    まだ未確定であれば、与えられた (obj_id, pos) 群から ID->部位 を確定する。
-    高さ(HEIGHT_AXIS_INDEX 軸)の降順で PART_NAMES(Chest > UpperArm > Joint > Forearm)
-    の順に割り当てる。確定できたら True、まだ条件を満たさなければ False を返す。
+    ラベル付きマーカーを marker_id で MARKER_NAMES に対応付ける。
+    id_num は 上位16bit=model_id / 下位16bit=marker_id。marker_id は 1 始まりを想定し、
+    marker_id=i のマーカーを MARKER_NAMES[i-1] に割り当てる。
+    occluded ビット付き / 原点近傍 / NaN は未認識として除外する。
+    MARKER_MODEL_ID が指定されていれば、その model_id 以外は無視する。
     """
-    if len(objects) < EXPECTED_OBJECT_COUNT:
-        return False
-
-    if len(objects) > EXPECTED_OBJECT_COUNT:
-        # 対象が多すぎると高さ順の中間(UpperArm/Joint)が一意に決まらないので確定しない。
-        now = time.time()
-        if now - _calib_warn_time[0] > 2.0:
-            _calib_warn_time[0] = now
-            _dbg("[WARN] 有効な対象が {} 個あります(期待値 {})。"
-                 "余分な対象を Motive 側で外すか OBJECT_SOURCE を見直してください。"
-                 .format(len(objects), EXPECTED_OBJECT_COUNT))
-        return False
-
-    # 高さ(指定軸の座標)で降順ソート: [0]=最も高い, [-1]=最も低い
-    ordered = sorted(
-        objects, key=lambda t: t[1][HEIGHT_AXIS_INDEX], reverse=True)
-    mapping = {oid: part for (oid, _pos), part in zip(ordered, PART_NAMES)}
-
-    with _calib_lock:
-        _id_to_part.clear()
-        _id_to_part.update(mapping)
-    _calibrated.set()
-
-    axis_name = {0: "X", 1: "Y", 2: "Z"}.get(HEIGHT_AXIS_INDEX, "?")
-    _dbg("[INFO] 自動判別 完了(開始時の高さ {} 軸で降順):".format(axis_name))
-    for part, (oid, pos) in zip(PART_NAMES, ordered):
-        _dbg("       {:8s} <- id={}  (高さ {}={:.3f})".format(
-            part, oid, axis_name, pos[HEIGHT_AXIS_INDEX]))
-    return True
+    result = {}
+    lm = getattr(mocap, "labeled_marker_data", None)
+    for mk in getattr(lm, "labeled_marker_list", None) or []:
+        if getattr(mk, "param", 0) & 0x01:   # occluded ビット
+            continue
+        model_id = mk.id_num >> 16
+        marker_id = mk.id_num & 0xFFFF
+        if MARKER_MODEL_ID is not None and model_id != MARKER_MODEL_ID:
+            continue
+        idx = marker_id - 1                   # marker_id は 1 始まり
+        if not (0 <= idx < len(MARKER_NAMES)):
+            continue
+        if _is_occluded_pos(mk.pos):
+            continue
+        result[MARKER_NAMES[idx]] = (float(mk.pos[0]), float(mk.pos[1]), float(mk.pos[2]))
+    return result
 
 
-def get_id_to_part():
-    """フレームコールバックから呼ぶ: 確定済み ID->部位 マップのスナップショット。"""
-    with _calib_lock:
-        return dict(_id_to_part)
+def _collect_from_marker_set(mocap):
+    """マーカーセット内の並び順(index)を MARKER_NAMES に対応付ける。隠れ(0,0,0)は除外。"""
+    result = {}
+    md = select_marker_set(mocap)
+    if md is None:
+        return result
+    positions = getattr(md, "marker_pos_list", []) or []
+    for name, pos in zip(MARKER_NAMES, positions):
+        if _is_occluded_pos(pos):
+            continue
+        result[name] = (float(pos[0]), float(pos[1]), float(pos[2]))
+    return result
+
+
+def collect_named_markers(mocap):
+    """
+    フレームから {マーカー名: (x, y, z)} を返す(認識できているものだけ)。
+    MARKER_SOURCE に従い、ラベル付きマーカー(marker_id)またはマーカーセット(並び順)から集める。
+    """
+    if MARKER_SOURCE == "marker_set":
+        return _collect_from_marker_set(mocap)
+    return _collect_from_labeled_markers(mocap)
+
+
+def log_frame_diagnostic(mocap, named):
+    """
+    起動直後の数フレーム、受信フレームの構造を GUI ログへ出力する。
+    どの形式・並び順で配信されているかを確認し、EXPECTED_MARKER_NAMES /
+    MARKER_SET_NAME を合わせるために使う。
+    """
+    if _diag_remaining[0] <= 0:
+        return
+    _diag_remaining[0] -= 1
+    n = MARKER_DIAGNOSTIC_FRAMES - _diag_remaining[0]
+
+    lines = ["[診断 {}/{}] 受信フレームの構造:".format(n, MARKER_DIAGNOSTIC_FRAMES)]
+
+    sets = list(_iter_marker_sets(mocap))
+    lines.append("  MarkerSet 数: {}".format(len(sets)))
+    for nm, md in sets:
+        pl = getattr(md, "marker_pos_list", []) or []
+        lines.append("   - set '{}' : {} 個".format(nm, len(pl)))
+        for i, p in enumerate(pl):
+            tag = " <隠れ>" if _is_occluded_pos(p) else ""
+            lines.append("       [{}] ({:.3f}, {:.3f}, {:.3f}){}".format(
+                i, p[0], p[1], p[2], tag))
+
+    lm = getattr(mocap, "labeled_marker_data", None)
+    lm_list = getattr(lm, "labeled_marker_list", None) or []
+    lines.append("  LabeledMarker 数: {}".format(len(lm_list)))
+    for mk in lm_list:
+        occ = bool(getattr(mk, "param", 0) & 0x01)
+        lines.append("   - id={} (model={}, marker={}) occ={} pos=({:.3f},{:.3f},{:.3f})".format(
+            mk.id_num, mk.id_num >> 16, mk.id_num & 0xFFFF, occ,
+            mk.pos[0], mk.pos[1], mk.pos[2]))
+
+    rb = getattr(mocap, "rigid_body_data", None)
+    rb_list = getattr(rb, "rigid_body_list", None) or []
+    lines.append("  RigidBody 数: {}".format(len(rb_list)))
+    for r in rb_list:
+        lines.append("   - id={} valid={} pos=({:.3f},{:.3f},{:.3f})".format(
+            r.id_num, getattr(r, "tracking_valid", None),
+            r.pos[0], r.pos[1], r.pos[2]))
+
+    lines.append("  → 名前解決できたマーカー: {}".format(sorted(named.keys())))
+    missing = [nm for nm in MARKER_NAMES if nm not in named]
+    if missing:
+        lines.append("  → 未解決/未認識: {}".format(missing))
+    _flog("\n".join(lines))
 
 
 # =============================================================================
-# スレッド間共有: 4 マーカーの最新 OptiTrack 座標
+# スレッド間共有: 各マーカーの最新 OptiTrack 座標
 # =============================================================================
 
 # Lock で保護される共有状態。NatNet コールバック(書き込み)と
-# VNA ループ(読み出し)の双方からアクセスされる。各部位ごとに {x,y,z,valid} を保持。
+# VNA ループ(読み出し)の双方からアクセスされる。各マーカーごとに {x,y,z,valid} を保持。
 _pos_lock = threading.Lock()
 _latest_positions = {
-    "Chest":    {"x": None, "y": None, "z": None, "valid": False},
-    "UpperArm": {"x": None, "y": None, "z": None, "valid": False},
-    "Joint":    {"x": None, "y": None, "z": None, "valid": False},
-    "Forearm":  {"x": None, "y": None, "z": None, "valid": False},
+    name: {"x": None, "y": None, "z": None, "valid": False}
+    for name in MARKER_NAMES
 }
 
 # 最後にフレームを受信した時刻(ストリーミング途絶検知用)。Lock 下で更新。
@@ -346,11 +486,11 @@ _stop_event = threading.Event()
 
 # --- FPS 計測用の累計カウンタ ---
 # OptiTrack: NatNet コールバック(受信スレッド)で 1 フレームごとに +1
-# NanoVNA  : 計測ワーカーで 1 サンプル(1 掃引)ごとに +1
+# NanoVNA  : 各チャンネルのリーダースレッドで 1 掃引ごとに +1(チャンネルごとに独立)
 # どちらも reset_runtime_state() で 0 にリセットする。
 _fps_lock = threading.Lock()
-_opti_frame_count = [0]   # OptiTrack 受信フレーム累計
-_vna_sample_count = [0]   # NanoVNA 取得サンプル累計
+_opti_frame_count = [0]                              # OptiTrack 受信フレーム累計
+_vna_sample_counts = [0] * len(VNA_CHANNEL_NAMES)    # 各チャンネルの取得掃引累計
 
 
 def incr_opti_frame():
@@ -358,25 +498,35 @@ def incr_opti_frame():
         _opti_frame_count[0] += 1
 
 
-def incr_vna_sample():
+def incr_vna_sample(ch_index):
+    """指定チャンネルの掃引取得カウンタを +1 する。"""
     with _fps_lock:
-        _vna_sample_count[0] += 1
+        _vna_sample_counts[ch_index] += 1
 
 
 def read_fps_counters():
-    """(OptiTrack 累計, NanoVNA 累計) を返す。"""
+    """(OptiTrack 累計, [各チャンネルの掃引累計]) を返す。"""
     with _fps_lock:
-        return _opti_frame_count[0], _vna_sample_count[0]
+        return _opti_frame_count[0], list(_vna_sample_counts)
 
 
 def update_latest_position(name, x, y, z):
-    """NatNet コールバックから呼ばれ、指定部位の最新座標をスレッド安全に更新する。"""
+    """NatNet コールバックから呼ばれ、指定マーカーの最新座標をスレッド安全に更新する。"""
     with _pos_lock:
         slot = _latest_positions[name]
         slot["x"] = x
         slot["y"] = y
         slot["z"] = z
         slot["valid"] = True
+
+
+def mark_position_invalid(name):
+    """
+    NatNet コールバックから呼ばれ、指定マーカーを「このフレームでは未検出(消失/オクルージョン中)」
+    として無効化する。古い座標をそのまま出力し続けないよう、valid を False に戻す。
+    """
+    with _pos_lock:
+        _latest_positions[name]["valid"] = False
 
 
 def mark_frame_received():
@@ -387,9 +537,9 @@ def mark_frame_received():
 
 def read_latest_positions():
     """
-    VNA ループから呼ばれ、4 マーカーすべての最新座標のスナップショットを
+    VNA ループから呼ばれ、全マーカーの最新座標のスナップショットを
     同一ロック下で一括取得する。
-    戻り値: {"Chest": (x,y,z,valid), "UpperArm": (...), "Joint": (...), "Forearm": (...)}
+    戻り値: {マーカー名: (x, y, z, valid), ...}(MARKER_NAMES 全件)
     """
     snapshot = {}
     with _pos_lock:
@@ -409,13 +559,10 @@ def seconds_since_last_frame():
 def reset_runtime_state():
     """
     1 回の計測を開始する前に、全スレッド共有の状態を初期化する。
-    (停止フラグ・自動判別結果・最新座標・受信時刻をクリアする)
+    (停止フラグ・最新座標・受信時刻・診断ログ回数をクリアする)
     GUI で計測をやり直す場合に、前回の状態が残らないようにする。
     """
     _stop_event.clear()
-    _calibrated.clear()
-    with _calib_lock:
-        _id_to_part.clear()
     with _pos_lock:
         for slot in _latest_positions.values():
             slot["x"] = None
@@ -423,10 +570,11 @@ def reset_runtime_state():
             slot["z"] = None
             slot["valid"] = False
         _last_frame_time[0] = 0.0
-    _calib_warn_time[0] = 0.0
+    _diag_remaining[0] = MARKER_DIAGNOSTIC_FRAMES
     with _fps_lock:
         _opti_frame_count[0] = 0
-        _vna_sample_count[0] = 0
+        for i in range(len(_vna_sample_counts)):
+            _vna_sample_counts[i] = 0
 
 
 # =============================================================================
@@ -468,6 +616,18 @@ def list_serial_ports():
     return out
 
 
+# --- VNA 通信の堅牢化パラメータ(無応答/切断時にフリーズしないため) ---
+# 書き込みタイムアウト[秒]: これが無いと、デバイスがハングしたとき write()/flush() が
+# 無限にブロックし、close() 時に固まって保存できなくなる。
+SERIAL_WRITE_TIMEOUT = 2.0
+# 掃引読み取り中、これ以上「新しいデータが来ない」状態が続いたら無応答とみなして打ち切る[秒]。
+SERIAL_STALL_SEC = 2.5
+# 連続で掃引取得に失敗した回数がこれを超えたら GUI に警告を出す。
+VNA_STALL_WARN_FAILS = 2
+# 連続失敗がこの回数に達したら「VNA 無応答」として計測を止め、保存フローへ移る。
+VNA_STALL_LOST_FAILS = 8
+
+
 class NanoVNA:
     """
     JNCRadio VNA 3G (NanoVNA 互換) のコンソールコマンドを扱う薄いラッパ。
@@ -485,7 +645,7 @@ class NanoVNA:
 
     PROMPT = b"ch> "
 
-    def __init__(self, port, baud=115200, timeout=2.0,
+    def __init__(self, port, baud=115200, timeout=1.0,
                  start_hz=SWEEP_START_HZ, stop_hz=SWEEP_STOP_HZ,
                  points=SCAN_POINTS):
         # 計測は S11 固定。scan には周波数ビット(1)を足して "周波数+S11"(=3)を出力させる。
@@ -501,7 +661,10 @@ class NanoVNA:
             # 論理点数は 1、周波数は開始値に揃える
             self.points = 1
             self.stop_hz = self.start_hz
-        self.ser = serial.Serial(port, baud, timeout=timeout)
+        # write_timeout を必ず設定する。これが無いとデバイスがハングしたとき
+        # write()/flush() が無限にブロックし、停止・保存時にフリーズする。
+        self.ser = serial.Serial(port, baud, timeout=timeout,
+                                 write_timeout=SERIAL_WRITE_TIMEOUT)
         time.sleep(0.2)
         self.ser.reset_input_buffer()
         self.ser.reset_output_buffer()
@@ -530,24 +693,56 @@ class NanoVNA:
         self._read_until_prompt()
 
     def _send_raw(self, cmd):
-        """コマンドを CR 終端で送信する(本機の終端は <CR>)。"""
+        """
+        コマンドを CR 終端で送信する(本機の終端は <CR>)。
+        flush() は使わない(デバイスがハングすると無限にブロックしうるため)。
+        write() は write_timeout により有限時間で戻る(超過時は SerialTimeoutException)。
+        """
         self.ser.write((cmd + "\r").encode("ascii"))
-        self.ser.flush()
 
-    def _read_until_prompt(self, max_wait=3.0):
-        """プロンプト 'ch> ' が現れるまで読み、受信テキスト全体を返す。"""
+    def _read_until_prompt(self, max_wait=3.0, stall_sec=SERIAL_STALL_SEC):
+        """
+        プロンプト 'ch> ' が現れるまで読み、受信テキスト全体を返す。
+        - 停止フラグ(_stop_event)が立ったら即座に打ち切る(停止・保存を速くする)。
+        - stall_sec の間まったくデータが来なければ、デバイス無応答とみなして打ち切る
+          (無応答のまま max_wait いっぱいブロックし続けるのを防ぐ)。
+        """
         buf = bytearray()
-        deadline = time.time() + max_wait
+        now = time.time()
+        deadline = now + max_wait
+        last_data = now
         while time.time() < deadline:
+            if _stop_event.is_set():
+                break
             chunk = self.ser.read(self.ser.in_waiting or 1)
             if chunk:
                 buf += chunk
+                last_data = time.time()
                 if self.PROMPT in buf:
                     break
             else:
                 if self.PROMPT in buf:
                     break
+                if time.time() - last_data > stall_sec:
+                    break  # 無応答: 打ち切る
         return buf.decode("ascii", errors="ignore")
+
+    def recover(self):
+        """
+        無応答からのリカバリを試みる: 入出力バッファをクリアし pause / sweep を再送する。
+        失敗しても例外は投げない(呼び出し側は継続してリトライする)。
+        """
+        try:
+            self.ser.reset_input_buffer()
+            self.ser.reset_output_buffer()
+        except Exception:
+            pass
+        try:
+            self._send_raw("pause")
+            self._read_until_prompt(max_wait=1.0)
+            self.setup_sweep()
+        except Exception:
+            pass
 
     @staticmethod
     def _parse_scan_lines(text):
@@ -649,8 +844,8 @@ def _on_frame_with_data(data_dict):
     NatNetClient の new_frame_with_data_listener コールバック。
     1 フレームごとに呼ばれ、data_dict["mocap_data"] に MoCapData が入る。
 
-    未確定なら最初の有効フレームで「開始時の高さ」によって ID->部位 を自動判別し、
-    確定後は固定した ID->部位 マップで各対象の座標を更新する。
+    マーカーセット内の並び順を MARKER_NAMES に対応付けて各マーカーの座標を更新する。
+    このフレームで認識できなかったマーカーは無効化し、古い座標を保持し続けないようにする。
     """
     mark_frame_received()
     incr_opti_frame()  # OptiTrack FPS 計測: 受信フレームをカウント
@@ -659,20 +854,19 @@ def _on_frame_with_data(data_dict):
     if mocap is None:
         return
 
-    objects = collect_frame_objects(mocap)
+    # マーカーセットの並び順からラベル名 -> 座標 を得る(認識できているものだけ)。
+    named = collect_named_markers(mocap)
 
-    # まだ判別前なら、このフレームで確定を試みる。
-    if not _calibrated.is_set():
-        if not try_calibrate(objects):
-            return  # まだ条件を満たさない(対象数が揃っていない等)
+    # 起動直後の数フレームは受信構造を診断ログに出す(並び順/形式の確認用)。
+    log_frame_diagnostic(mocap, named)
 
-    # 確定済みの ID->部位 マップで座標を更新(2フレーム目以降はこのパスのみ)。
-    mapping = get_id_to_part()
-    for oid, pos in objects:
-        part = mapping.get(oid)
-        if part is None:
-            continue  # 判別対象外の ID
-        update_latest_position(part, float(pos[0]), float(pos[1]), float(pos[2]))
+    # 認識できたマーカーは更新、できなかったマーカーは無効化する。
+    for name in MARKER_NAMES:
+        pos = named.get(name)
+        if pos is None:
+            mark_position_invalid(name)
+        else:
+            update_latest_position(name, pos[0], pos[1], pos[2])
 
 
 def start_natnet():
@@ -728,8 +922,8 @@ def start_natnet():
         _dbg("[INFO] NatNet 起動。Motive からのフレーム受信待ち...")
         _dbg("       (まだサーバ応答なし。Motive の Data Streaming 設定を確認してください)")
 
-    # 自動判別(キャリブレーション)の完了待ちは呼び出し側(ワーカー)が
-    # 停止フラグを見ながら中断可能な形で行う。ここではブロックしない。
+    # 最初のフレーム受信待ちは呼び出し側(ワーカー)が停止フラグを見ながら行う。
+    # ここではブロックしない。
     return client
 
 
@@ -761,7 +955,7 @@ def shutdown_natnet(client):
 # =============================================================================
 
 def _fmt_xyz(snap, name):
-    """部位の (x,y,z) を CSV セル 3 個へ整形。未受信なら空欄。"""
+    """マーカーの (x,y,z) を CSV セル 3 個へ整形。未受信なら空欄。"""
     x, y, z, valid = snap[name]
     if not valid:
         return ["", "", ""]
@@ -779,6 +973,36 @@ def _short_xyz(snap, name):
 # 計測コントローラ: バックグラウンドで VNA + OptiTrack を回しデータを蓄積する
 # =============================================================================
 
+class VnaChannel:
+    """
+    1 台の nanoVNA の状態を保持する。各チャンネルは専用のリーダースレッドで並行して
+    掃引し、最新の掃引結果(seq, S11, Z_R, Z_X)をロック下で publish する。
+    コンバイナ(ワーカー)は各チャンネルの最新結果を read_latest で読み、位置と結合する。
+    """
+
+    def __init__(self, index, name, com_port):
+        self.index = index          # 0,1,... (FPS カウンタ等のインデックス)
+        self.name = name            # 列名プレフィックス("VNA1" 等)
+        self.com_port = com_port    # 接続先("COM3" 等 / TEST_MODE)
+        self.test_mode = (com_port == TEST_MODE)
+        self.vna = None
+        self.reader = None
+        self._lock = threading.Lock()
+        self._seq = 0
+        self._latest = None         # (seq, s11_arr, z_r, z_x)
+
+    def publish(self, s11_arr, z_r, z_x):
+        """リーダースレッドから: 最新の掃引結果を差し替える(seq をインクリメント)。"""
+        with self._lock:
+            self._seq += 1
+            self._latest = (self._seq, s11_arr, z_r, z_x)
+
+    def read_latest(self):
+        """コンバイナから: 最新の (seq, s11_arr, z_r, z_x)。未取得なら None。"""
+        with self._lock:
+            return self._latest
+
+
 class MeasurementController:
     """
     計測のライフサイクル(接続→ループ→停止→クリーンアップ)を管理する。
@@ -794,16 +1018,17 @@ class MeasurementController:
 
     def __init__(self, out_queue):
         self.out_queue = out_queue
-        self.vna = None
+        self.channels = []          # VnaChannel のリスト(GUI で選択したチャンネル数ぶん)
         self.client = None
         self.worker = None
+        self._reader_threads = []   # VNA リーダースレッド(交互:1本 / 並列:台数ぶん)
         self.rows = []
         self.rows_lock = threading.Lock()
         self.sample_count = 0
         self._cleaned = False
         self._cleanup_lock = threading.Lock()
         # [計測開始]時に GUI から渡される計測条件(既定値で初期化)
-        self.com_port = NANOVNA_PORT
+        self.com_ports = [NANOVNA_PORT]
         self.start_hz = SWEEP_START_HZ
         self.stop_hz = SWEEP_STOP_HZ
         self.points = SCAN_POINTS
@@ -819,15 +1044,16 @@ class MeasurementController:
             pass
 
     # ---- 開始 ----
-    def start(self, com_port, start_hz, stop_hz, points, use_optitrack=True):
+    def start(self, com_ports, start_hz, stop_hz, points, use_optitrack=True):
         """
         共有状態を初期化し、計測ワーカースレッドを起動する。
-        com_port は GUI で選択された接続先 COM ポート(例 "COM3")。
-        start_hz/stop_hz/points は GUI で指定された掃引条件。
+        com_ports は GUI で選択された各チャンネルの接続先 COM ポートのリスト
+        (例 ["COM3", "COM4"])。要素数ぶんの nanoVNA を並行して計測する。
+        start_hz/stop_hz/points は GUI で指定された掃引条件(全チャンネル共通)。
         use_optitrack=False のときは OptiTrack(NatNet)を使わず VNA のみ計測する。
         この条件から周波数グリッドと CSV ヘッダーを動的に生成する。
         """
-        self.com_port = com_port
+        self.com_ports = list(com_ports)
         self.use_optitrack = bool(use_optitrack)
         self.start_hz = int(start_hz)
         self.stop_hz = int(stop_hz)
@@ -837,7 +1063,13 @@ class MeasurementController:
             self.points = 1
             self.stop_hz = self.start_hz
         self.freq_grid_hz = make_freq_grid(self.start_hz, self.stop_hz, self.points)
-        self.csv_header = build_csv_header(self.freq_grid_hz)
+        self.csv_header = build_csv_header(self.freq_grid_hz, VNA_CHANNEL_NAMES)
+
+        # チャンネルを構築(名前は VNA_CHANNEL_NAMES、ポートは GUI 選択)
+        self.channels = [
+            VnaChannel(i, VNA_CHANNEL_NAMES[i], self.com_ports[i])
+            for i in range(len(self.com_ports))
+        ]
 
         reset_runtime_state()
         with self.rows_lock:
@@ -848,40 +1080,37 @@ class MeasurementController:
             target=self._worker_loop, name="MeasurementWorker", daemon=True)
         self.worker.start()
 
-    # ---- ワーカースレッド本体 ----
+    # ---- ワーカースレッド本体(接続 → リーダー起動 → コンバイナ) ----
     def _worker_loop(self):
-        test_mode = (self.com_port == TEST_MODE)
-
-        # 1) VNA 接続(S11 固定)。テストモードなら接続・初期化を完全にスキップする。
-        if test_mode:
-            self.vna = None
-            self._post("status",
-                       "【VNAなしテストモード】VNA 接続をスキップしました（VNA 列は 0）。")
-        else:
-            # COM ポートが開けない場合は friendly なエラーを通知。
+        # 1) 全チャンネルの VNA を接続。1 台でも開けなければ中止する。
+        for ch in self.channels:
+            if ch.test_mode:
+                self._post("status",
+                           "[{}] 【VNAなしテストモード】接続をスキップ(列は 0)。".format(ch.name))
+                continue
             # SerialException / FileNotFoundError はいずれも OSError のサブクラス。
             try:
-                # GUI で指定された掃引条件を反映して接続・初期化
-                self.vna = NanoVNA(self.com_port, NANOVNA_BAUD,
-                                   start_hz=self.start_hz, stop_hz=self.stop_hz,
-                                   points=self.points)
+                ch.vna = NanoVNA(ch.com_port, NANOVNA_BAUD,
+                                 start_hz=self.start_hz, stop_hz=self.stop_hz,
+                                 points=self.points)
             except OSError as e:
                 self._post("error",
-                           "VNAの接続に失敗しました。\n"
-                           "COM番号({})が正しいか、他のソフトが占有していないか確認してください。\n"
-                           "（VNA を後から挿した場合は「ポート再検索」で一覧を更新できます）\n"
-                           "\n詳細: {}".format(self.com_port, e))
+                           "[{}] VNAの接続に失敗しました(COM: {})。\n"
+                           "COM番号が正しいか、他のソフトが占有していないか確認してください。\n"
+                           "(2 台の VNA が同じポートを指していないかも確認してください)\n"
+                           "\n詳細: {}".format(ch.name, ch.com_port, e))
+                self._close_all_vnas()
                 self._post("finished")
                 return
             except Exception as e:
-                self._post("error", "VNA 初期化中に予期せぬ例外: {}".format(e))
+                self._post("error", "[{}] VNA 初期化中に予期せぬ例外: {}".format(ch.name, e))
+                self._close_all_vnas()
                 self._post("finished")
                 return
             self._post("status",
-                       "VNA 接続 OK: {} @ {}bps / 掃引 {:.3f}-{:.3f} MHz {}点を記録 ({})".format(
-                           self.com_port, NANOVNA_BAUD,
-                           self.start_hz / 1e6, self.stop_hz / 1e6, self.points,
-                           VNA_SPARAM))
+                       "[{}] VNA 接続 OK: {} @ {}bps / 掃引 {:.3f}-{:.3f} MHz {}点 ({})".format(
+                           ch.name, ch.com_port, NANOVNA_BAUD,
+                           self.start_hz / 1e6, self.stop_hz / 1e6, self.points, VNA_SPARAM))
 
         # 2) NatNet 開始(ブロックしない)。OptiTrack を使わないモードでは丸ごとスキップ。
         if not self.use_optitrack:
@@ -889,68 +1118,206 @@ class MeasurementController:
             self._post("status",
                        "【OptiTrack なしモード】NatNet を使用しません(VNA のみ計測)。座標列は空欄になります。")
         else:
+            # フレーム受信スレッドからの診断ログを GUI ログへ流すシンクを登録する。
+            set_frame_log_sink(lambda m: self._post("log", m))
             self.client = start_natnet()
             if self.client is None:
                 self._post("status", "OptiTrack なしで継続(座標列は空欄になります)。")
             else:
-                self._post("status", "OptiTrack 受信開始。最初の有効フレームで自動判別します...")
+                self._post("status",
+                           "OptiTrack 受信開始。全 {} マーカーが揃ったサンプルのみ記録します"
+                           "(未認識のフレームは自動破棄)。".format(len(MARKER_NAMES)))
 
-        # 3) 自動判別の完了を「停止フラグを見ながら」中断可能に待つ
+        # 3) 最初のフレーム受信を「停止フラグを見ながら」少し待つ(状態表示のため)
         if self.client is not None:
-            deadline = time.time() + CALIBRATION_TIMEOUT_SEC
-            while not _stop_event.is_set() and not _calibrated.is_set():
+            deadline = time.time() + STREAM_STALE_SEC
+            while not _stop_event.is_set() and seconds_since_last_frame() is None:
                 if time.time() > deadline:
                     self._post("status",
-                               "[警告] 自動判別が完了しません。{}対象のトラッキング/配信設定を確認してください。"
-                               .format(EXPECTED_OBJECT_COUNT))
+                               "[警告] OptiTrack フレームがまだ届きません。Motive の Data Streaming"
+                               "(Markers / 127.0.0.1 / Unicast)を確認してください。")
                     break
                 time.sleep(0.05)
-            if _calibrated.is_set():
-                mapping = get_id_to_part()
-                part_to_id = {p: i for i, p in mapping.items()}
-                self._post("status", "自動判別 完了: " + " / ".join(
-                    "{}=id{}".format(p, part_to_id.get(p, "?")) for p in PART_NAMES))
 
-        # 4) 計測ループ(メモリへ蓄積 + グラフ更新)
+        # 4) リーダースレッドを起動して各 VNA を掃引する。
+        #    交互モード(既定): 1 本のスレッドが「実機だけ」を 1 台ずつ順番に掃引する。
+        #      → 2 台が同時に送信しないため RF 干渉によるノイズを防げる。テストモードの
+        #        チャンネルは掃引せずダミー 0 を埋めるだけなので、実機 1 台だけのときは
+        #        その 1 台を全速で掃引でき、交互待ちで FPS を損なわない。
+        #    並列モード: チャンネルごとに専用スレッドで同時掃引する(高速だが干渉しうる)。
+        n_real = sum(1 for ch in self.channels if not ch.test_mode)
+        self._reader_threads = []
+        if not _stop_event.is_set():
+            if VNA_ALTERNATE_SWEEP:
+                t = threading.Thread(
+                    target=self._alternating_reader_loop,
+                    name="VnaReader-alt", daemon=True)
+                self._reader_threads.append(t)
+                t.start()
+                if n_real >= 2:
+                    self._post("status",
+                               "交互計測モード: 実機 {} 台を 1 台ずつ順番に掃引します"
+                               "(RF 干渉対策。各台の FPS は同時掃引の約 1/{} になります)。".format(
+                                   n_real, n_real))
+                elif n_real == 1:
+                    self._post("status",
+                               "接続された実機 1 台のみを全速で掃引します"
+                               "(他チャンネルはテストモード=ダミー 0。交互待ちなしで FPS を損ないません)。")
+            else:
+                for ch in self.channels:
+                    t = threading.Thread(
+                        target=self._reader_loop, args=(ch,),
+                        name="VnaReader-{}".format(ch.name), daemon=True)
+                    ch.reader = t
+                    self._reader_threads.append(t)
+                    t.start()
+
+        # 5) コンバイナ: 全チャンネルの最新掃引 + 位置を 1 行に結合して蓄積する
         self._post("status", "計測中...")
-        last_stale_warn = 0.0
+        self._combine_loop()
+
+        self._post("finished")
+
+    # ---- 1 台を 1 回だけ掃引して publish する(交互/並列で共用) ----
+    def _sweep_once(self, ch, npts, state):
+        """
+        指定チャンネルを 1 回掃引し、成功したら ch へ publish する。
+        戻り値: 継続してよければ True、停止/VNA 無応答なら False。
+
+        state: {ch.index: {"warn": 最後に警告した時刻, "fails": 連続失敗回数}} を保持する dict。
+        VNA が応答しない(データ取得失敗が続く)場合でも "error" は投げない。
+        代わりに警告→リカバリ試行→(連続失敗が続けば)"vna_lost" を送って計測を止め、
+        それまでに集めたデータを保存できるようにする。
+        """
+        st = state.setdefault(ch.index, {"warn": 0.0, "fails": 0})
+
+        if ch.test_mode:
+            # VNA は使わない。全点ダミー 0。間隔をあけて publish。
+            s11 = np.zeros(npts, dtype=complex)
+            z_r = np.zeros(npts)
+            z_x = np.zeros(npts)
+            if _stop_event.wait(TEST_MODE_INTERVAL_SEC):
+                return False
+        else:
+            try:
+                result = ch.vna.measure_sweep()
+            except serial.SerialException as e:
+                # ポート切断など: 復帰不能とみなし、保存フローへ移る(データは保持)
+                self._post("vna_lost",
+                           "[{}] VNA との通信が切断されました: {}".format(ch.name, e))
+                _stop_event.set()
+                return False
+            except Exception as e:
+                self._post("vna_lost",
+                           "[{}] VNA 取得中に予期せぬ例外: {}".format(ch.name, e))
+                _stop_event.set()
+                return False
+
+            # データ取得の成否を判定(None=取得失敗 / 点数不一致=不正)
+            fail_reason = None
+            if result is None:
+                fail_reason = "掃引データを取得できません"
+            elif len(result[1]) != npts:
+                fail_reason = "掃引点数が {} 点でした(期待 {} 点)".format(
+                    len(result[1]), npts)
+
+            if fail_reason is not None:
+                st["fails"] += 1
+                now = time.time()
+                # 何度か失敗したらリカバリ(pause/sweep 再送)を試みる
+                if st["fails"] % 3 == 0 and ch.vna is not None:
+                    ch.vna.recover()
+                # 連続失敗が続けば「無応答」として停止・保存へ
+                if st["fails"] >= VNA_STALL_LOST_FAILS:
+                    self._post("vna_lost",
+                               "[{}] VNA が応答しません({}。{} 回連続で失敗)。"
+                               "計測を停止して保存します。".format(
+                                   ch.name, fail_reason, st["fails"]))
+                    _stop_event.set()
+                    return False
+                # 警告は間引いて出す
+                if st["fails"] >= VNA_STALL_WARN_FAILS and now - st["warn"] > 2.0:
+                    st["warn"] = now
+                    self._post("status",
+                               "[{}][警告] {}(リトライ中 {} 回)。".format(
+                                   ch.name, fail_reason, st["fails"]))
+                return True  # スキップして次のリトライへ
+
+            # 成功: 連続失敗カウンタをリセットして変換・publish
+            st["fails"] = 0
+            freqs, s11 = result
+            # scikit-rf で全点をまとめて Z11 に変換(この計測の周波数グリッドで)
+            z_r, z_x = s11_sweep_to_z(s11, self.freq_grid_hz, Z0)
+        ch.publish(s11, z_r, z_x)
+        incr_vna_sample(ch.index)  # チャンネル別 FPS 計測
+        return True
+
+    # ---- 並列モード: 1 チャンネル専用リーダースレッド ----
+    def _reader_loop(self, ch):
+        """1 台の nanoVNA を連続して掃引し publish する(並列モード用)。"""
+        warn_state = {}
+        while not _stop_event.is_set():
+            if not self._sweep_once(ch, self.points, warn_state):
+                break
+
+    def _publish_test_dummy(self, ch):
+        """テストモードのチャンネルにダミー 0 の掃引を publish する(待ち時間なし)。"""
         npts = self.points
-        # 経過時間の基準(この時点=最初のサンプル取得直前を 0 秒とする)。
+        ch.publish(np.zeros(npts, dtype=complex), np.zeros(npts), np.zeros(npts))
+        incr_vna_sample(ch.index)
+
+    # ---- 交互モード: 1 本のスレッドで「実機だけ」を 1 台ずつ順番に掃引 ----
+    def _alternating_reader_loop(self):
+        """
+        実機のチャンネルだけをラウンドロビンで 1 台ずつ掃引する。同時に 2 台が送信しないため
+        RF 干渉によるノイズを防ぐ。掃引間に待ち時間は入れないので FPS 低下を最小化する。
+        テストモードのチャンネルは掃引せず、実機の掃引ごとにダミー 0 を埋める
+        (実機 1 台だけのときは、その 1 台を全速で掃引できる)。
+        全チャンネルがテストモードのときは、全チャンネルをダミーで順に埋める。
+        """
+        warn_state = {}
+        real = [ch for ch in self.channels if not ch.test_mode]
+        test = [ch for ch in self.channels if ch.test_mode]
+        # 掃引対象: 実機があれば実機のみ。全てテストなら全チャンネル(ダミー生成)。
+        sweep_list = real if real else self.channels
+        while not _stop_event.is_set():
+            for ch in sweep_list:
+                if _stop_event.is_set():
+                    break
+                if not self._sweep_once(ch, self.points, warn_state):
+                    return
+                # 実機掃引のたびにテストチャンネルを埋め、コンバイナが行を作れるようにする
+                if real:
+                    for tch in test:
+                        self._publish_test_dummy(tch)
+
+    # ---- コンバイナ: 全チャンネルの最新掃引が揃ったら位置と結合して 1 行にする ----
+    def _combine_loop(self):
+        """
+        各チャンネルが「前回消費より新しい掃引」を持つのを待ち、その瞬間の
+        マーカー座標と結合して 1 行にする。ペースは最も遅い VNA に律速される。
+        マーカーが 1 個でも未認識のサンプルは破棄する。
+        """
+        npts = self.points
+        nch = len(self.channels)
+        last_stale_warn = 0.0
+        last_missing_warn = 0.0
+        last_seqs = [0] * nch
+        # 経過時間の基準(この時点=最初の結合直前を 0 秒とする)。
         # 単調増加時計 perf_counter を使い、システム時刻補正の影響を受けないようにする。
         t0 = time.perf_counter()
         while not _stop_event.is_set():
-            if test_mode:
-                # VNA は使わない。全点ダミー 0。間隔をあけてサンプリング。
-                s11_arr = np.zeros(npts, dtype=complex)
-                z_r = np.zeros(npts)
-                z_x = np.zeros(npts)
-                # _stop_event.wait() は停止時に即座に抜けられる中断可能な待機。
-                if _stop_event.wait(TEST_MODE_INTERVAL_SEC):
+            # 全チャンネルが「前回消費より新しい掃引」を持つまで待つ
+            latests = [ch.read_latest() for ch in self.channels]
+            if any(l is None for l in latests) or \
+                    not all(latests[i][0] > last_seqs[i] for i in range(nch)):
+                if _stop_event.wait(0.003):
                     break
-            else:
-                try:
-                    result = self.vna.measure_sweep()
-                except serial.SerialException as e:
-                    self._post("error", "VNA シリアル通信が切断されました: {}".format(e))
-                    break
-                except Exception as e:
-                    self._post("error", "VNA 取得中に例外: {}".format(e))
-                    break
-                if result is None:
-                    continue  # パース失敗はスキップ
-                freqs, s11_arr = result
-                if len(s11_arr) != npts:
-                    # 期待点数と異なる掃引はヘッダーと整合しないのでスキップ(警告は間引く)
-                    now = time.time()
-                    if now - last_stale_warn > 2.0:
-                        last_stale_warn = now
-                        self._post("status",
-                                   "[警告] 掃引点数が {} 点でした(期待 {} 点)。スキップします。".format(
-                                       len(s11_arr), npts))
-                    continue
-                # scikit-rf で全点をまとめて Z11 に変換(この計測の周波数グリッドで)
-                z_r, z_x = s11_sweep_to_z(s11_arr, self.freq_grid_hz, Z0)
+                continue
+            for i in range(nch):
+                last_seqs[i] = latests[i][0]
 
+            # OptiTrack ストリーミング途絶の警告(座標が古い可能性)
             if self.client is not None:
                 elapsed = seconds_since_last_frame()
                 now = time.time()
@@ -961,34 +1328,44 @@ class MeasurementController:
                                "[警告] OptiTrack フレームが {:.1f}s 途絶(座標が古い可能性)".format(elapsed))
 
             snap = read_latest_positions()
+
+            # OptiTrack 使用時、マーカーのいずれかが未認識ならこのサンプルは行ごと破棄する。
+            if self.client is not None and not all(snap[m][3] for m in MARKER_NAMES):
+                now = time.time()
+                if now - last_missing_warn > 2.0:
+                    last_missing_warn = now
+                    missing = [m for m in MARKER_NAMES if not snap[m][3]]
+                    self._post("status",
+                               "[警告] マーカー未認識のためサンプルを破棄: {}".format(
+                                   ", ".join(missing)))
+                continue
+
             # タイムスタンプ = 計測開始からの経過時間[秒](ミリ秒精度)
             ts = "{:.3f}".format(time.perf_counter() - t0)
-
-            # 各掃引点の (S11_Real, S11_Imag, Z_R, Z_X) を 1 行に展開
+            pos_cols = []
+            for name in MARKER_NAMES:
+                pos_cols += _fmt_xyz(snap, name)
+            # 各チャンネルの掃引を順に展開(列順は VNA_CHANNEL_NAMES と一致)
             vna_cols = []
-            for i in range(npts):
-                vna_cols += ["{:.6f}".format(s11_arr[i].real),
-                             "{:.6f}".format(s11_arr[i].imag),
-                             "{:.4f}".format(z_r[i]),
-                             "{:.4f}".format(z_x[i])]
-            row = (
-                [ts]
-                + _fmt_xyz(snap, "Chest")
-                + _fmt_xyz(snap, "UpperArm")
-                + _fmt_xyz(snap, "Joint")
-                + _fmt_xyz(snap, "Forearm")
-                + vna_cols
-            )
+            for i in range(nch):
+                _, s11, z_r, z_x = latests[i]
+                for k in range(npts):
+                    vna_cols += ["{:.6f}".format(s11[k].real),
+                                 "{:.6f}".format(s11[k].imag),
+                                 "{:.4f}".format(z_r[k]),
+                                 "{:.4f}".format(z_x[k])]
+            row = [ts] + pos_cols + vna_cols
             with self.rows_lock:
                 self.rows.append(row)
                 self.sample_count += 1
                 count = self.sample_count
-            incr_vna_sample()  # NanoVNA FPS 計測: 取得サンプルをカウント
             self._post("sample", count)
-            # リアルタイムグラフ用に最新の Z スイープを送る(GUI 側で間引いて描画)
-            self._post("plot", (np.asarray(z_r), np.asarray(z_x)))
-
-        self._post("finished")
+            # リアルタイムグラフ用に全チャンネルの (S11, Z_R, Z_X) を送る(GUI 側で間引いて描画)
+            plot_payload = [
+                (np.asarray(latests[i][1]), np.asarray(latests[i][2]),
+                 np.asarray(latests[i][3]))
+                for i in range(nch)]
+            self._post("plot", plot_payload)
 
     # ---- 停止要求(GUI から。即座に戻る) ----
     def request_stop(self):
@@ -1006,25 +1383,39 @@ class MeasurementController:
                 return
             _stop_event.set()
 
-            # 1) ワーカースレッドの終了を待つ
+            # 1) ワーカー(コンバイナ)スレッドの終了を待つ
             if self.worker is not None and self.worker.is_alive():
                 if self.worker is not threading.current_thread():
                     self.worker.join(timeout=8.0)
 
-            # 2) VNA(シリアル)を閉じる -> COM ポート解放
-            if self.vna is not None:
-                try:
-                    self.vna.close()
-                except Exception as e:
-                    _dbg("[WARN] VNA close 中に例外(無視): {}".format(e))
-                self.vna = None
+            # 2) リーダースレッド(交互:1本 / 並列:台数ぶん)の終了を待つ
+            #    (measure_sweep が最長 ~8s ブロックしうるため余裕をもって join する)
+            for r in self._reader_threads:
+                if r is not None and r.is_alive() and r is not threading.current_thread():
+                    r.join(timeout=10.0)
 
-            # 3) NatNet を停止 -> UDP ソケット/受信スレッド解放
+            # 3) 全チャンネルの VNA(シリアル)を閉じる -> COM ポート解放
+            self._close_all_vnas()
+
+            # 4) NatNet を停止 -> UDP ソケット/受信スレッド解放
             if self.client is not None:
                 shutdown_natnet(self.client)
                 self.client = None
 
+            # フレーム受信スレッドからのログ出力先を解除する。
+            set_frame_log_sink(None)
+
             self._cleaned = True
+
+    # ---- 全チャンネルの VNA を閉じる(冪等) ----
+    def _close_all_vnas(self):
+        for ch in self.channels:
+            if ch.vna is not None:
+                try:
+                    ch.vna.close()
+                except Exception as e:
+                    _dbg("[WARN] [{}] VNA close 中に例外(無視): {}".format(ch.name, e))
+                ch.vna = None
 
     # ---- CSV 保存 ----
     def save_csv(self, path):
@@ -1060,26 +1451,23 @@ class App(tk.Tk):
         self.measuring = False
         self._finalizing = False  # 停止→保存→(終了 or 待機復帰)の処理中フラグ
         self._exit_after_save = False  # True: 保存後にアプリ終了 / False: 待機状態へ戻る
-        self._latest_plot = None  # 直近の (z_r, z_x)。poll ごとに1回だけ描画する
+        self._latest_plot = None  # 直近の各チャンネル [(s11, z_r, z_x), ...]。poll ごとに1回描画
         self._counter_active = False  # コンソールの \r カウンタ行が出ているか
 
         # --- FPS 計測の状態(GUI=メインスレッドで 1 秒ごとに算出) ---
-        self._latest_count = 0          # 直近のサンプル数
+        n_ch = len(VNA_CHANNEL_NAMES)
+        self._latest_count = 0          # 直近のサンプル数(結合行数)
         self._opti_fps = 0.0            # 直近 1 秒の OptiTrack FPS
-        self._vna_fps = 0.0             # 直近 1 秒の NanoVNA FPS
+        self._vna_fps = [0.0] * n_ch    # 直近 1 秒の 各 VNA 掃引 FPS
         self._fps_win_start = None      # FPS 計算ウィンドウの起点時刻
         self._fps_win_opti = 0          # ウィンドウ起点での OptiTrack 累計
-        self._fps_win_vna = 0           # ウィンドウ起点での NanoVNA 累計
+        self._fps_win_vna = [0] * n_ch  # ウィンドウ起点での 各 VNA 累計
         self._meas_start_time = None    # 計測全体の開始時刻(平均 FPS 用)
         self._meas_stop_time = None     # 計測全体の停止時刻(平均 FPS 用)
 
-        # グラフ横軸(周波数 MHz)。掃引モードでは周波数グリッド、単一周波数モードでは
-        # 時系列(直近サンプル)に切り替える。
-        self._freq_mhz = FREQ_GRID_HZ / 1e6
-        self._plot_mode = "sweep"   # "sweep"(周波数軸) または "time"(時系列)
-        # 単一周波数モードの時系列バッファ(直近 TIME_PLOT_WINDOW サンプル)
-        self._tr_zr = collections.deque(maxlen=TIME_PLOT_WINDOW)
-        self._tr_zx = collections.deque(maxlen=TIME_PLOT_WINDOW)
+        # スミスチャート用の周波数グリッド(Hz)。計測条件に合わせて更新され、
+        # 「読み取り周波数」に最も近い掃引点を探すのに使う。
+        self._plot_freq_hz = np.asarray(FREQ_GRID_HZ, dtype=float)
 
         self._build_widgets()
 
@@ -1105,26 +1493,31 @@ class App(tk.Tk):
 
         info = ttk.Label(
             self,
-            text=("計測: {}（固定）  /  高さ軸: {}\n"
-                  "COM ポートと掃引条件を設定して[計測開始]。最初の有効フレームで自動判別します。"
-                  ).format(
-                VNA_SPARAM,
-                {0: "X", 1: "Y", 2: "Z"}.get(HEIGHT_AXIS_INDEX, "?")),
+            text=("計測: {}（固定）  /  VNA: {} 台  /  マーカー: {} 個（ラベル認識）\n"
+                  "各 VNA の COM ポートと掃引条件を設定して[計測開始]。全マーカーが揃ったサンプルのみ記録します。"
+                  ).format(VNA_SPARAM, len(VNA_CHANNEL_NAMES), len(MARKER_NAMES)),
             justify="left")
         info.pack(anchor="w", **pad)
 
-        # --- VNA 接続先 COM ポート選択 + 再検索 ---
-        port_frame = ttk.Frame(self)
-        port_frame.pack(fill="x", **pad)
-        ttk.Label(port_frame, text="COM Port:").pack(side="left")
-        self.port_var = tk.StringVar(value="")
-        self.port_combo = ttk.Combobox(
-            port_frame, textvariable=self.port_var,
-            values=[], state="readonly", width=34)
-        self.port_combo.pack(side="left", padx=6)
-        self.rescan_btn = ttk.Button(
-            port_frame, text="ポート再検索", command=self.on_rescan_ports)
-        self.rescan_btn.pack(side="left", padx=4)
+        # --- VNA 接続先 COM ポート選択(チャンネルぶん) + 再検索 ---
+        # nanoVNA を複数台つなぐ場合、チャンネルごとに別々の COM ポートを選ぶ。
+        self.port_vars = []
+        self.port_combos = []
+        for i, name in enumerate(VNA_CHANNEL_NAMES):
+            row = ttk.Frame(self)
+            row.pack(fill="x", **pad)
+            ttk.Label(row, text="{} COM:".format(name), width=10).pack(side="left")
+            var = tk.StringVar(value="")
+            combo = ttk.Combobox(row, textvariable=var, values=[],
+                                 state="readonly", width=34)
+            combo.pack(side="left", padx=6)
+            self.port_vars.append(var)
+            self.port_combos.append(combo)
+            # 再検索ボタンは最初の行にだけ置く(押すと全チャンネルの一覧を更新する)
+            if i == 0:
+                self.rescan_btn = ttk.Button(
+                    row, text="ポート再検索", command=self.on_rescan_ports)
+                self.rescan_btn.pack(side="left", padx=4)
 
         # 表示名 -> デバイス名("COM3") の対応表。実際の接続にはデバイス名を使う。
         # 実際のスキャンは __init__ で全ウィジェット(self.log を含む)構築後に行う。
@@ -1149,6 +1542,20 @@ class App(tk.Tk):
             from_=POINTS_MIN, to=POINTS_MAX, increment=1, width=8)
         self.points_spin.pack(side="left", padx=2)
         ttk.Label(sweep_frame, text="(1刻みで指定可)").pack(side="left", padx=2)
+
+        # --- 読み取り周波数(スミスチャート上の数値表示に使う) ---
+        # ここで指定した周波数に最も近い掃引点のインピーダンスを数値で表示する。
+        # 計測中でも変更でき、次の更新から反映される。
+        readout_frame = ttk.Frame(self)
+        readout_frame.pack(fill="x", **pad)
+        ttk.Label(readout_frame, text="読み取り周波数[MHz]:").pack(side="left")
+        self.readout_var = tk.StringVar(value="{:g}".format(TARGET_FREQ_HZ / 1e6))
+        self.readout_entry = ttk.Entry(
+            readout_frame, textvariable=self.readout_var, width=10)
+        self.readout_entry.pack(side="left", padx=(2, 8))
+        ttk.Label(readout_frame,
+                  text="(この周波数のインピーダンスを各 body について数値表示)"
+                  ).pack(side="left")
 
         # --- 計測モード(OptiTrack を使うか) ---
         opt_frame = ttk.Frame(self)
@@ -1182,7 +1589,7 @@ class App(tk.Tk):
         # --- サンプリングレート(FPS)表示 ---
         fps_frame = ttk.Frame(self)
         fps_frame.pack(fill="x", **pad)
-        self.fps_var = tk.StringVar(value="OptiTrack: -- FPS / NanoVNA: -- FPS")
+        self.fps_var = tk.StringVar(value=self._fps_default_text())
         ttk.Label(fps_frame, text="取得レート:").pack(side="left")
         ttk.Label(fps_frame, textvariable=self.fps_var,
                   foreground="#06c").pack(side="left", padx=6)
@@ -1199,100 +1606,113 @@ class App(tk.Tk):
         self.log.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
 
-    # ---- リアルタイムグラフの構築 ----
+    # ---- FPS 表示テキストの生成 ----
+    def _fps_default_text(self):
+        parts = ["OptiTrack: --"] + ["{}: --".format(n) for n in VNA_CHANNEL_NAMES]
+        return " / ".join(parts) + " FPS"
+
+    def _fps_text(self, opti, vna_list):
+        parts = ["OptiTrack: {:.1f}".format(opti)]
+        for name, f in zip(VNA_CHANNEL_NAMES, vna_list):
+            parts.append("{}: {:.1f}".format(name, f))
+        return " / ".join(parts) + " FPS"
+
+    # ---- リアルタイムグラフ(スミスチャート)の構築 ----
     def _build_plot(self, pad):
-        plot_frame = ttk.LabelFrame(self, text="周波数 vs インピーダンス (Z11)")
+        plot_frame = ttk.LabelFrame(
+            self, text="スミスチャート (S11 / インピーダンス Z11)")
         plot_frame.pack(fill="both", expand=True, **pad)
 
-        self.fig = Figure(figsize=(6.4, 3.4), dpi=100)
-        self.ax = self.fig.add_subplot(111)
+        # チャンネル数ぶんのスミスチャートを横に並べる
+        n = len(VNA_CHANNEL_NAMES)
+        colors = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e"]
+        self.fig = Figure(figsize=(3.6 * n, 3.8), dpi=100)
+        self._smith_axes = []
+        self._trace_lines = []    # 掃引全点の Γ(=S11) トレース
+        self._marker_lines = []   # 読み取り周波数の点(★)
 
-        # matplotlib の既定フォントは日本語グリフを持たないため、グラフ内は ASCII で表記する
-        zeros = np.zeros_like(self._freq_mhz)
-        (self.line_zr,) = self.ax.plot(
-            self._freq_mhz, zeros, color="#d62728", label="Z_R (Resistance)")
-        (self.line_zx,) = self.ax.plot(
-            self._freq_mhz, zeros, color="#1f77b4", label="Z_X (Reactance)")
+        for i, name in enumerate(VNA_CHANNEL_NAMES):
+            ax = self.fig.add_subplot(1, n, i + 1)
+            # scikit-rf のスミスチャート格子を描く(インピーダンス基準)
+            rf.plotting.smith(ax=ax, chart_type="z", draw_labels=False)
+            ax.set_title(name, fontsize=10)
+            ax.set_aspect("equal")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            color = colors[i % len(colors)]
+            (trace,) = ax.plot([], [], color=color, marker=".", markersize=3,
+                               linewidth=1.0, zorder=3)
+            (marker,) = ax.plot([], [], marker="*", markersize=14, color="k",
+                                linestyle="none", zorder=4)
+            self._smith_axes.append(ax)
+            self._trace_lines.append(trace)
+            self._marker_lines.append(marker)
 
-        # 参考: 中心周波数(13.56MHz)の縦線(単一周波数=時系列モードでは隠す)
-        self._target_vline = self.ax.axvline(
-            TARGET_FREQ_HZ / 1e6, color="#888888", linestyle="--", linewidth=0.8)
-
-        self.ax.set_xlabel("Frequency [MHz]")
-        self.ax.set_ylabel("Impedance [Ω]")
-        self.ax.set_xlim(SWEEP_START_HZ / 1e6, SWEEP_STOP_HZ / 1e6)
-        self.ax.set_ylim(-100, 100)
-        self.ax.grid(True, alpha=0.3)
-        self.ax.legend(loc="upper right", fontsize=9)
         self.fig.tight_layout()
-
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
         self.canvas.draw()
 
+        # 各チャンネルの「読み取り周波数でのインピーダンス」数値表示
+        readout_box = ttk.Frame(plot_frame)
+        readout_box.pack(fill="x", padx=6, pady=(0, 4))
+        self.readout_vars = []
+        for i, name in enumerate(VNA_CHANNEL_NAMES):
+            color = colors[i % len(colors)]
+            var = tk.StringVar(value="{}:  Z = --".format(name))
+            ttk.Label(readout_box, textvariable=var, foreground=color,
+                      font=("", 10, "bold")).pack(anchor="w")
+            self.readout_vars.append(var)
+
     def _reconfigure_plot(self, start_hz, stop_hz, points):
-        """
-        掃引条件の変更にあわせてグラフを作り直す。
-        - 2 点以上: 横軸=周波数[MHz] のスイープ波形
-        - 1 点(単一周波数): 横軸=直近サンプル の時系列スクロールチャート
-        """
-        if points <= 1:
-            # 単一周波数 -> 時系列モード
-            self._plot_mode = "time"
-            self._tr_zr.clear()
-            self._tr_zx.clear()
-            self.line_zr.set_data([], [])
-            self.line_zx.set_data([], [])
-            self._target_vline.set_visible(False)
-            self.ax.set_xlabel("Recent samples")
-            self.ax.set_title("Single freq {:.4f} MHz (time series)".format(
-                start_hz / 1e6), fontsize=9)
-            self.ax.set_xlim(0, TIME_PLOT_WINDOW)
-            self.ax.set_ylim(-100, 100)
-        else:
-            # スイープモード -> 横軸=周波数
-            self._plot_mode = "sweep"
-            self._freq_mhz = make_freq_grid(start_hz, stop_hz, points) / 1e6
-            zeros = np.zeros_like(self._freq_mhz)
-            self.line_zr.set_data(self._freq_mhz, zeros)
-            self.line_zx.set_data(self._freq_mhz, zeros)
-            self._target_vline.set_visible(True)
-            self.ax.set_xlabel("Frequency [MHz]")
-            self.ax.set_title("")
-            self.ax.set_xlim(start_hz / 1e6, stop_hz / 1e6)
-            self.ax.set_ylim(-100, 100)
+        """掃引条件の変更にあわせてスミスチャートの周波数グリッドとトレースをリセットする。"""
+        self._plot_freq_hz = np.asarray(
+            make_freq_grid(start_hz, stop_hz, points), dtype=float)
+        for i in range(len(self._trace_lines)):
+            self._trace_lines[i].set_data([], [])
+            self._marker_lines[i].set_data([], [])
+            self.readout_vars[i].set("{}:  Z = --".format(VNA_CHANNEL_NAMES[i]))
         self.canvas.draw_idle()
 
-    def _redraw_plot(self, z_r, z_x):
-        """最新の Z データでグラフを更新する(メインスレッドから呼ぶこと)。"""
-        if self._plot_mode == "time":
-            # 単一周波数: 先頭(唯一)の値を時系列バッファへ追加してスクロール表示
-            if len(z_r) == 0:
-                return
-            self._tr_zr.append(float(z_r[0]))
-            self._tr_zx.append(float(z_x[0]))
-            n = len(self._tr_zr)
-            xs = range(n)
-            self.line_zr.set_data(xs, list(self._tr_zr))
-            self.line_zx.set_data(xs, list(self._tr_zx))
-            self.ax.set_xlim(max(0, n - TIME_PLOT_WINDOW), max(TIME_PLOT_WINDOW, n))
-            allv = np.array(list(self._tr_zr) + list(self._tr_zx), dtype=float)
-        else:
-            # スイープ: 点数が一致しない場合はスキップ(再構成直後など)
-            if len(z_r) != len(self._freq_mhz):
-                return
-            self.line_zr.set_ydata(z_r)
-            self.line_zx.set_ydata(z_x)
-            allv = np.concatenate([np.asarray(z_r, float), np.asarray(z_x, float)])
+    def _readout_index(self, npts):
+        """読み取り周波数[MHz]に最も近い掃引点のインデックスを返す。不正入力なら None。"""
+        try:
+            f_hz = float(self.readout_var.get()) * 1e6
+        except (ValueError, TypeError):
+            return None
+        if len(self._plot_freq_hz) != npts or npts == 0:
+            return None
+        return int(np.argmin(np.abs(self._plot_freq_hz - f_hz)))
 
-        # 有限値のみで y 範囲を自動調整(全反射で inf になっても破綻しないように)
-        finite = allv[np.isfinite(allv)]
-        if finite.size:
-            lo, hi = float(finite.min()), float(finite.max())
-            if lo == hi:
-                lo, hi = lo - 1.0, hi + 1.0
-            margin = (hi - lo) * 0.1
-            self.ax.set_ylim(lo - margin, hi + margin)
+    def _redraw_plot(self, payload):
+        """
+        最新の各チャンネル (s11, z_r, z_x) でスミスチャートと数値表示を更新する。
+        payload: [(s11_complex, z_r, z_x), ...]（チャンネル順）。メインスレッドから呼ぶこと。
+        """
+        n = min(len(payload), len(self._trace_lines))
+        for i in range(n):
+            s11, z_r, z_x = payload[i]
+            s11 = np.asarray(s11)
+            if s11.size == 0:
+                continue
+            # スミスチャート上の点 = 反射係数 Γ = S11(Z0=50Ω 基準)
+            self._trace_lines[i].set_data(s11.real, s11.imag)
+
+            idx = self._readout_index(len(s11))
+            name = VNA_CHANNEL_NAMES[i]
+            if idx is None or idx >= len(s11):
+                self._marker_lines[i].set_data([], [])
+                self.readout_vars[i].set("{}:  Z = --  (読み取り周波数を確認)".format(name))
+            else:
+                g = complex(s11[idx])
+                self._marker_lines[i].set_data([g.real], [g.imag])
+                r = float(z_r[idx])
+                x = float(z_x[idx])
+                f_mhz = float(self._plot_freq_hz[idx]) / 1e6
+                sign = "+" if x >= 0 else "-"
+                self.readout_vars[i].set(
+                    "{}:  Z = {:.2f} {} j{:.2f} Ω   |S11|={:.3f}   @ {:.4f} MHz".format(
+                        name, r, sign, abs(x), abs(g), f_mhz))
         self.canvas.draw_idle()
 
     # ---- COM ポート一覧のスキャン/再検索 ----
@@ -1316,22 +1736,27 @@ class App(tk.Tk):
         # 末尾に「VNAなしテストモード」を必ず追加(実機が無くてもテスト可能にする)
         displays.append(NO_VNA_DISPLAY)
         self._port_display_to_device[NO_VNA_DISPLAY] = TEST_MODE
+        test_index = displays.index(NO_VNA_DISPLAY)
 
-        self.port_combo.configure(values=displays)
-
-        if ports:
-            # 実ポートあり: 先頭の実ポートを選択(displays[0] は最初の実ポート)
-            self.port_combo.current(0)
-        else:
-            # 実ポートなし: テストモードをデフォルト選択
-            self.port_combo.current(displays.index(NO_VNA_DISPLAY))
+        # 各チャンネルの Combobox に一覧を反映する。
+        # 既定選択: チャンネル i には i 番目の実ポートを割り当て(実ポートが足りなければ
+        # テストモード)。2 台つないでいれば VNA1=1台目, VNA2=2台目 が自動で入る。
+        for i, combo in enumerate(self.port_combos):
+            combo.configure(values=displays)
+            if i < len(ports):
+                combo.current(i)
+            else:
+                combo.current(test_index)
 
         return len(ports)
 
-    def get_selected_port(self):
-        """Combobox の選択表示名から、実際のデバイス名("COM3")を返す。"""
-        disp = self.port_var.get()
-        return self._port_display_to_device.get(disp, disp)
+    def get_selected_ports(self):
+        """各チャンネルの Combobox 選択から、実デバイス名("COM3"/TEST_MODE)のリストを返す。"""
+        out = []
+        for var in self.port_vars:
+            disp = var.get()
+            out.append(self._port_display_to_device.get(disp, disp))
+        return out
 
     def on_rescan_ports(self):
         """[ポート再検索] ボタン: COM ポート一覧を更新する。"""
@@ -1359,8 +1784,11 @@ class App(tk.Tk):
 
     def _console_counter(self):
         """計測中の取得数と FPS を「同じ1行」で上書き更新する(\\r)。"""
-        print("\r[計測中] 取得数: {} 件 (OptiTrack: {:.1f} Hz, NanoVNA: {:.1f} Hz)   ".format(
-            self._latest_count, self._opti_fps, self._vna_fps),
+        vna_str = ", ".join(
+            "{}: {:.1f}".format(n, f)
+            for n, f in zip(VNA_CHANNEL_NAMES, self._vna_fps))
+        print("\r[計測中] 取得数: {} 件 (OptiTrack: {:.1f} Hz, {})   ".format(
+            self._latest_count, self._opti_fps, vna_str),
             end="", flush=True)
         self._counter_active = True
 
@@ -1418,13 +1846,21 @@ class App(tk.Tk):
     def on_start(self):
         if self.measuring:
             return
-        # 開始時点で選択されている COM ポートを読み込む
-        com_port = self.get_selected_port()
-        if not com_port:
+        # 開始時点で選択されている各チャンネルの COM ポートを読み込む
+        com_ports = self.get_selected_ports()
+        if any(not p for p in com_ports):
             messagebox.showerror(
                 "COM ポート未選択",
-                "VNA の COM ポートが選択されていません。\n"
+                "VNA の COM ポートが選択されていないチャンネルがあります。\n"
                 "VNA を接続し、[ポート再検索] で一覧を更新してから選択してください。")
+            return
+        # 実ポートの重複禁止(同じ COM を 2 台で同時に開くことはできない)
+        real = [p for p in com_ports if p != TEST_MODE]
+        if len(set(real)) != len(real):
+            messagebox.showerror(
+                "COM ポート重複",
+                "同じ COM ポートを複数のチャンネルに割り当てています。\n"
+                "各 VNA には別々の COM ポートを選択してください。")
             return
 
         # 掃引条件(開始/終了周波数・点数)を読み取り検証
@@ -1440,7 +1876,8 @@ class App(tk.Tk):
         self.measuring = True
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self.port_combo.configure(state="disabled")   # 計測中は変更不可
+        for combo in self.port_combos:                 # 計測中は変更不可
+            combo.configure(state="disabled")
         self.rescan_btn.configure(state="disabled")
         self.start_entry.configure(state="disabled")
         self.stop_entry.configure(state="disabled")
@@ -1451,33 +1888,41 @@ class App(tk.Tk):
         # FPS 計測の初期化
         self._latest_count = 0
         self._opti_fps = 0.0
-        self._vna_fps = 0.0
+        self._vna_fps = [0.0] * len(VNA_CHANNEL_NAMES)
         now = time.time()
         self._meas_start_time = now
         self._meas_stop_time = None
         self._fps_win_start = now
         self._fps_win_opti = 0
-        self._fps_win_vna = 0
-        self.fps_var.set("OptiTrack: -- FPS / NanoVNA: -- FPS")
+        self._fps_win_vna = [0] * len(VNA_CHANNEL_NAMES)
+        self.fps_var.set(self._fps_default_text())
         if points <= 1:
             sweep_desc = "単一周波数 {:.4f} MHz (1点)".format(start_hz / 1e6)
         else:
             sweep_desc = "掃引 {:.3f}-{:.3f} MHz {}点".format(
                 start_hz / 1e6, stop_hz / 1e6, points)
         opt_desc = "OptiTrack ON" if use_optitrack else "OptiTrack OFF(VNAのみ)"
-        if com_port == TEST_MODE:
-            msg = ("計測を開始しました。【VNAなしテストモード】OptiTrack のみ取得"
-                   "（VNA 列は 0, {}, {}）。").format(sweep_desc, opt_desc)
-        else:
-            msg = "計測を開始しました。COM Port = {}（{}, {}, {}）".format(
-                com_port, VNA_SPARAM, sweep_desc, opt_desc)
+        ports_desc = " / ".join(
+            "{}={}".format(VNA_CHANNEL_NAMES[i],
+                           "テストモード" if com_ports[i] == TEST_MODE else com_ports[i])
+            for i in range(len(com_ports)))
+        msg = "計測を開始しました。{}（{}, {}, {}）".format(
+            ports_desc, VNA_SPARAM, sweep_desc, opt_desc)
         self._log(msg)
         self._console_event("[計測開始] " + msg)  # 重要イベントはコンソールにも残す
         self.controller = MeasurementController(self.msg_queue)
-        self.controller.start(com_port, start_hz, stop_hz, points, use_optitrack)
+        self.controller.start(com_ports, start_hz, stop_hz, points, use_optitrack)
 
-    # ---- 計測終了 -> 保存 -> 終了 ----
+    # ---- 計測終了 -> 保存 -> (待機復帰) ----
     def on_stop(self):
+        self._finalize_and_save("計測を停止しています...")
+
+    # ---- 停止 → クリーンアップ → 保存フローへ(on_stop / VNA 無応答から共用) ----
+    def _finalize_and_save(self, reason=""):
+        """
+        計測を止めてクリーンアップし、保存ダイアログへ進む。GUI を固めないよう
+        クリーンアップは別スレッドで行い、完了後に ready_to_save を通知する。
+        """
         if not self.measuring or self._finalizing:
             return
         self._finalizing = True
@@ -1485,14 +1930,17 @@ class App(tk.Tk):
         self._meas_stop_time = time.time()  # 平均 FPS 算出用に停止時刻を記録
         self.stop_btn.configure(state="disabled")
         self.status_var.set("停止処理中...")
-        self._log("計測を停止しています...")
+        if reason:
+            self._log(reason)
 
         # 停止要求(即時に戻る)。クリーンアップは GUI を固めないよう別スレッドで。
-        self.controller.request_stop()
+        if self.controller:
+            self.controller.request_stop()
 
         def _finalize():
             try:
-                self.controller.cleanup()
+                if self.controller:
+                    self.controller.cleanup()
             finally:
                 # メインスレッドで保存ダイアログを出すため通知
                 self.msg_queue.put(("ready_to_save", None))
@@ -1549,17 +1997,18 @@ class App(tk.Tk):
         self._meas_stop_time = None
         self._fps_win_start = None
         self._opti_fps = 0.0
-        self._vna_fps = 0.0
+        self._vna_fps = [0.0] * len(VNA_CHANNEL_NAMES)
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
-        self.port_combo.configure(state="readonly")
+        for combo in self.port_combos:
+            combo.configure(state="readonly")
         self.rescan_btn.configure(state="normal")
         self.start_entry.configure(state="normal")
         self.stop_entry.configure(state="normal")
         self.points_spin.configure(state="normal")
         self.optitrack_chk.configure(state="normal")
         self.status_var.set("待機中")
-        self.fps_var.set("OptiTrack: -- FPS / NanoVNA: -- FPS")
+        self.fps_var.set(self._fps_default_text())
 
     # ---- ウィンドウ × ----
     def on_window_close(self):
@@ -1598,6 +2047,9 @@ class App(tk.Tk):
                     # ステータスは GUI ログのみに出す(コンソールは汚さない)
                     self.status_var.set(value)
                     self._log(value)
+                elif kind == "log":
+                    # フレーム受信スレッドからの診断ログ等(状態表示は更新しない)
+                    self._log(value)
                 elif kind == "sample":
                     self.count_var.set("サンプル数: {}".format(value))
                     self._latest_count = value
@@ -1612,6 +2064,16 @@ class App(tk.Tk):
                     messagebox.showerror("エラー", str(value))
                     # 致命的エラー: 計測を畳んでボタンを戻す
                     self._recover_after_error()
+                elif kind == "vna_lost":
+                    # VNA 無応答/切断: これまでのデータは保持し、停止 → 保存フローへ進む。
+                    self._finalize_counter_line()
+                    self._log("[VNA] " + str(value))
+                    self._console_event("[VNA] " + str(value))
+                    messagebox.showwarning(
+                        "VNA 応答なし",
+                        str(value) + "\n\nこれまでに取得したデータは保存できます。"
+                        "続いて保存先の選択ダイアログを表示します。")
+                    self._finalize_and_save("VNA 応答なしのため計測を停止し、保存します。")
                 elif kind == "finished":
                     self._finalize_counter_line()
                     self._log("計測ループ終了。")
@@ -1634,10 +2096,9 @@ class App(tk.Tk):
         if self.measuring and (fps_updated or got_sample):
             self._console_counter()
 
-        # 今サイクルに届いた最新スイープでグラフを 1 回だけ更新(描画負荷を抑制)
+        # 今サイクルに届いた最新スイープでスミスチャートを 1 回だけ更新(描画負荷を抑制)
         if self._latest_plot is not None:
-            z_r, z_x = self._latest_plot
-            self._redraw_plot(z_r, z_x)
+            self._redraw_plot(self._latest_plot)
         # ウィンドウが破棄されていれば再ポーリングしない
         try:
             if self.winfo_exists():
@@ -1656,32 +2117,32 @@ class App(tk.Tk):
         dt = now - self._fps_win_start
         if dt < 1.0:
             return False
-        opti_total, vna_total = read_fps_counters()
+        opti_total, vna_totals = read_fps_counters()
         self._opti_fps = (opti_total - self._fps_win_opti) / dt
-        self._vna_fps = (vna_total - self._fps_win_vna) / dt
+        self._vna_fps = [
+            (vna_totals[i] - self._fps_win_vna[i]) / dt
+            for i in range(len(vna_totals))]
         # 次ウィンドウへ
         self._fps_win_start = now
         self._fps_win_opti = opti_total
-        self._fps_win_vna = vna_total
-        self.fps_var.set("OptiTrack: {:.1f} FPS / NanoVNA: {:.1f} FPS".format(
-            self._opti_fps, self._vna_fps))
+        self._fps_win_vna = list(vna_totals)
+        self.fps_var.set(self._fps_text(self._opti_fps, self._vna_fps))
         return True
 
     def _log_fps_summary(self):
         """計測全体の平均 FPS を GUI ログとコンソールへ出力する。"""
-        opti_total, vna_total = read_fps_counters()
+        opti_total, vna_totals = read_fps_counters()
         start = self._meas_start_time
         stop = self._meas_stop_time or time.time()
         dur = (stop - start) if start else 0.0
-        if dur > 0:
-            avg_opti = opti_total / dur
-            avg_vna = vna_total / dur
-        else:
-            avg_opti = avg_vna = 0.0
+        avg_opti = (opti_total / dur) if dur > 0 else 0.0
+        vna_parts = []
+        for name, tot in zip(VNA_CHANNEL_NAMES, vna_totals):
+            avg = (tot / dur) if dur > 0 else 0.0
+            vna_parts.append("{} 平均 {:.1f} FPS ({} 掃引)".format(name, avg, tot))
         summary = ("計測サマリー: 計測時間 {:.1f} 秒 / "
-                   "OptiTrack 平均 {:.1f} FPS ({} フレーム) / "
-                   "NanoVNA 平均 {:.1f} FPS ({} サンプル)").format(
-            dur, avg_opti, opti_total, avg_vna, vna_total)
+                   "OptiTrack 平均 {:.1f} FPS ({} フレーム) / {}").format(
+            dur, avg_opti, opti_total, " / ".join(vna_parts))
         self._log(summary)
         self._console_event("[サマリー] " + summary)
 
@@ -1697,7 +2158,8 @@ class App(tk.Tk):
         self.measuring = False
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
-        self.port_combo.configure(state="readonly")  # ポート再選択を許可
+        for combo in self.port_combos:                # ポート再選択を許可
+            combo.configure(state="readonly")
         self.rescan_btn.configure(state="normal")
         self.start_entry.configure(state="normal")   # 掃引条件の再編集を許可
         self.stop_entry.configure(state="normal")
