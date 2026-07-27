@@ -40,11 +40,13 @@ class CameraRecorder:
         info = rec.stop()                # スレッド停止・ファイルクローズ。録画情報 dict を返す
     """
 
-    def __init__(self, index=0, out_path=None, fps=None, use_dshow=True):
+    def __init__(self, index=0, out_path=None, fps=None, use_dshow=True,
+                 warmup_sec=0.8):
         self.index = int(index)
         self.out_path = out_path
         self.forced_fps = fps          # None なら実測 / 取得値を使う
         self.use_dshow = bool(use_dshow)
+        self.warmup_sec = float(warmup_sec)  # オートexposure が落ち着くまでの読み捨て時間[秒]
 
         self._cap = None
         self._writer = None
@@ -59,6 +61,9 @@ class CameraRecorder:
         self.height = None
         self.fps = None
         self.frame_count = 0
+        # 起動直後の参照フレームの明るさ・コントラスト(真っ黒/レンズ塞がり検知用)
+        self.first_mean = None         # グレースケール平均(0=真っ黒〜255)
+        self.first_std = None          # グレースケール標準偏差(小さい=一様=塞がり/黒)
 
     # ---- 起動: カメラを開き、キャプチャスレッドを立ち上げる ----
     def start(self):
@@ -74,18 +79,22 @@ class CameraRecorder:
         if not cap.isOpened():
             raise CameraError("カメラ(index={})を開けませんでした。接続と使用中プロセスを確認してください。".format(self.index))
 
-        # 最初の 1 フレームでサイズを確定する
-        ok, frame = cap.read()
-        if not ok or frame is None:
+        # ウォームアップ: オートexposure が落ち着くまで数フレーム読み捨てつつ、
+        # 実測 FPS と参照フレームを得る(最初の数フレームは暗い/黒いことが多いため)。
+        frame, fps_meas = self._warmup(cap, self.warmup_sec)
+        if frame is None:
             cap.release()
             raise CameraError("カメラ(index={})からフレームを取得できませんでした。".format(self.index))
         self.height, self.width = frame.shape[0], frame.shape[1]
 
         # 書き出し FPS を決める: 明示指定 > 実測 > デバイス申告 > 既定30
-        fps = self.forced_fps or self._measure_fps(cap) or cap.get(cv2.CAP_PROP_FPS)
+        fps = self.forced_fps or fps_meas or cap.get(cv2.CAP_PROP_FPS)
         if not fps or fps <= 1 or fps > 240:
             fps = 30.0
         self.fps = float(fps)
+
+        # 参照フレームの明るさ・コントラストを記録(真っ黒/レンズ塞がりの検知に使う)
+        self._assess_frame(frame)
 
         # 動画ファイルを開く(out_path 指定時)
         if self.out_path:
@@ -105,18 +114,53 @@ class CameraRecorder:
         self._thread = threading.Thread(target=self._loop, name="CameraRecorder", daemon=True)
         self._thread.start()
 
-    def _measure_fps(self, cap, n=15):
-        """起動直後に n フレーム読み取り、実測 FPS を推定する。失敗時 None。"""
+    def _warmup(self, cap, sec):
+        """
+        sec 秒のあいだフレームを読み続け(オートexposure を安定させる)、
+        最後に取得できたフレームと実測 FPS を返す。戻り値: (last_frame or None, fps or None)。
+        """
         t0 = time.time()
         got = 0
-        for _ in range(n):
-            ok, _f = cap.read()
-            if ok:
+        last = None
+        while time.time() - t0 < sec:
+            ok, f = cap.read()
+            if ok and f is not None:
+                got += 1
+                last = f
+            else:
+                time.sleep(0.005)
+        # sec が非常に短い/0 でも最低 1 枚は確保を試みる
+        if last is None:
+            ok, f = cap.read()
+            if ok and f is not None:
+                last = f
                 got += 1
         dt = time.time() - t0
-        if got >= 2 and dt > 0:
-            return got / dt
-        return None
+        fps = (got / dt) if (got >= 2 and dt > 0) else None
+        return last, fps
+
+    def _assess_frame(self, frame):
+        """参照フレームのグレースケール平均・標準偏差を記録する(真っ黒/塞がり検知用)。"""
+        try:
+            if frame.ndim == 3:
+                gray = frame.mean(axis=2)
+            else:
+                gray = frame
+            self.first_mean = float(gray.mean())
+            self.first_std = float(gray.std())
+        except Exception:
+            self.first_mean = None
+            self.first_std = None
+
+    def is_probably_black(self):
+        """
+        起動直後の映像が「真っ黒・一様(=レンズが塞がれている/光が入っていない)」らしいか。
+        暗い(mean が低い)かつ一様(std が非常に小さい)場合に True。
+        実際の映像は暗くても被写体の構造で std が大きくなるため、これらを満たさない。
+        """
+        if self.first_mean is None or self.first_std is None:
+            return False
+        return self.first_mean < 24.0 and self.first_std < 6.0
 
     # ---- キャプチャスレッド本体 ----
     def _loop(self):

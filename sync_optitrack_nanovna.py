@@ -2129,8 +2129,25 @@ class App(tk.Tk):
         self.camera = rec
         self.video_tmp_path = tmp
         self.video_start_wall = rec.start_wall
-        self._log("[カメラ] 録画開始 index={} {}x{} @~{:.0f}fps".format(
-            idx, rec.width, rec.height, rec.fps or 0))
+        self._log("[カメラ] 録画開始 index={} {}x{} @~{:.0f}fps (明るさ mean={:.1f} std={:.1f})".format(
+            idx, rec.width, rec.height, rec.fps or 0,
+            rec.first_mean or 0.0, rec.first_std or 0.0))
+        # 真っ黒(=レンズが塞がれている/光が入っていない)らしいときは即警告する。
+        # ThinkPad は画面上部に物理カメラシャッター(ThinkShutter)があり、閉じていると真っ黒になる。
+        if rec.is_probably_black():
+            warn = ("カメラの映像が真っ黒です（レンズに光が入っていません）。このまま録画すると"
+                    "真っ黒な動画になります。\n\n次を確認してください:\n"
+                    "・ThinkPad の物理カメラシャッター（画面上部のスライダー）が開いているか\n"
+                    "・レンズカバー/テープでふさがれていないか\n"
+                    "・「カメラ番号」が意図したカメラか（外部webカメラなら番号を変える）\n"
+                    "・Windows の設定 > プライバシー > カメラ でアプリのアクセスが許可されているか\n\n"
+                    "計測は続行します（動画が不要なら「カメラ撮影と同期する」を OFF に）。")
+            self._log("[カメラ][警告] 映像が真っ黒です。カメラシャッター/カバー/カメラ番号を確認してください。")
+            self._console_event("[カメラ][警告] 映像が真っ黒（レンズ塞がり）の可能性。")
+            try:
+                messagebox.showwarning("カメラが真っ黒です", warn)
+            except Exception:
+                pass
 
     # ---- ライブ表示ダッシュボード(別ウィンドウ)を開く ----
     def _open_dashboard(self):
