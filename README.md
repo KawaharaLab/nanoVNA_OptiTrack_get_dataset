@@ -583,6 +583,28 @@ python sync_video_with_dataset.py --csv sync_dataset.csv --video clip.mp4 \
 
 > **精度について:** ファイル名の録画開始時刻は**秒精度**で、録画ボタンを押してから実際に最初のフレームが記録されるまでの遅延も乗りえます。そのため `video_time_sec` は**±1 秒程度の系統誤差**を含みえます。フレーム単位で厳密に合わせたい場合は、`--video-start` に手動で微調整した時刻を与えるか、動画内に映る時刻情報（GUI 右下の「現在時刻」など）を基準に補正してください。
 
+### 5.5 取得済みデータ + 動画の再生ビューア（`playback_viewer.py`）
+
+取得後の CSV とカメラ動画を**時刻同期して再生**するビューアです（`view_marker_impedances/viewer_3marker.py` を土台に、再生エンジンを作り替えたもの）。3D マーカー＋ボーン、左右の肘角度（数値＋時系列）、左右 body の S11 スミスチャート、動画パネルを 1 画面に表示し、Play/Pause・フレームスライダー・周波数スライダーで操作できます。
+
+```bash
+# 同期済み CSV(video_time_sec 付き) + 動画
+python playback_viewer.py sync_dataset_video_synced.csv --video WIN_20260727_15_30_45_Pro.mp4
+
+# 生の CSV(WallClock 付き) + 動画（video_time_sec はファイル名 WIN_… から内部計算）
+python playback_viewer.py sync_dataset.csv --video WIN_20260727_15_30_45_Pro.mp4
+
+# 動画なし（マーカー/スミスのみ再生）
+python playback_viewer.py sync_dataset.csv
+```
+
+**再生時の同期の考え方（重要）:** マーカー座標とスミスチャートは「同じ CSV 行」から描くので常に同期します。動画は VNA（＝ CSV 行）より遥かに高 FPS のため、行ごとに動画をシークすると多数のフレームを飛ばして**とびとび**になります。これを避けるため、本ビューアは**動画フレームを順番に（飛ばさず）連続再生**し、その時刻に対応する CSV 行を `video_time_sec` から求めてマーカー/スミスを更新します。
+
+- 動画パネル … 毎フレーム更新（`blit` で高速描画）。**飛ばさないので滑らか**。
+- マーカー/スミス/肘角度 … 対応する CSV 行が変わったときだけ全体を再描画（VNA レートで段階的に切り替わる）。
+
+`video_time_sec` 列（`sync_video_with_dataset.py` が付与）があればそれを使い、無い場合でも `WallClock` 列＋動画ファイル名 `WIN_YYYYMMDD_HH_MM_SS(_Pro).mp4`（または `--video-start`）から内部計算します。動画表示には `opencv-python` が必要です。
+
 ---
 
 ## 6. ラベル認識の仕組み（技術解説）
