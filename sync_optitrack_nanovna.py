@@ -54,13 +54,17 @@ VNA 接続(COM ポート):
   選択ポートが開けない(存在しない/他ソフトが占有)場合は、クラッシュさせず
   messagebox.showerror で警告を表示する。
 
-★ウェブカメラ動画との時刻同期★
+★ウェブカメラ録画・ライブ表示・時刻同期★
   各サンプルには「計測開始からの経過秒(Timestamp)」に加えて「絶対時刻(WallClock,
-  ローカル時刻・ミリ秒精度)」を記録する。動画自体はこのスクリプトでは撮らず、Windows 標準
-  「カメラ」アプリで別途録画・保存する(同じ PC の時計を共有する)。後処理で、CSV の WallClock と
-  Windows カメラが動画ファイルに残す録画開始時刻(ファイル名 WIN_YYYYMMDD_HH_MM_SS_Pro.mp4)を
-  突き合わせれば、各データ行がその動画の何秒目に当たるかを算出できる(sync_video_with_dataset.py)。
-  保存時には CSV の隣に <csv名>.meta.json(計測開始/終了の絶対時刻など)も書き出す。
+  ローカル時刻・ミリ秒精度)」を記録する(カメラ同期 ON 時)。
+  [計測開始]と連動して webカメラ(OpenCV)を録画開始し、計測終了・CSV 保存時に CSV と同じ
+  フォルダへ WIN_YYYYMMDD_HH_MM_SS_Pro.mp4 として保存する。保存時には CSV の隣に
+  <csv名>.meta.json(計測開始/終了の絶対時刻・動画情報)も書き出す。後処理で CSV の WallClock と
+  動画の録画開始時刻を突き合わせれば、各データ行がその動画の何秒目かを算出できる
+  (sync_video_with_dataset.py)。
+  また計測中は別ウィンドウのライブ・ダッシュボード(live_dashboard.py)で 3D マーカー/肘角度/
+  スミスチャート/カメラ映像を表示する。この表示は nanoVNA の掃引レートに律速されず、専用の
+  高速タイマーで最新のマーカー座標・カメラフレーム・各 VNA の最新掃引を直接読んで更新する。
 
 CSV ヘッダー(位置列は EXPECTED_MARKER_NAMES 順、VNA 列は VNA_CHANNEL_NAMES 順に自動生成):
   [Timestamp, WallClock,
@@ -84,6 +88,8 @@ import sys
 import time
 import json
 import queue
+import shutil
+import tempfile
 import datetime
 import threading
 import collections
@@ -101,6 +107,23 @@ import matplotlib            # pip install matplotlib
 matplotlib.use("TkAgg")      # tkinter への埋め込みバックエンド
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+# --- ローカルモジュール(カメラ録画 / ライブ表示ダッシュボード) ---
+# これらが読み込めない環境でも、カメラ/ライブ表示を使わない計測は続行できるようにする。
+# (camera_recorder は cv2 を遅延 import するので、cv2 未導入でも import 自体は成功する)
+_ensure_local_on_path = os.path.dirname(os.path.abspath(__file__))
+if _ensure_local_on_path not in sys.path:
+    sys.path.insert(0, _ensure_local_on_path)
+try:
+    import camera_recorder
+except Exception as _e:          # pragma: no cover
+    camera_recorder = None
+    print("[WARN] camera_recorder を読み込めません(カメラ録画は無効): {}".format(_e))
+try:
+    import live_dashboard
+except Exception as _e:          # pragma: no cover
+    live_dashboard = None
+    print("[WARN] live_dashboard を読み込めません(ライブ表示は無効): {}".format(_e))
 
 
 # =============================================================================
@@ -1064,6 +1087,8 @@ class MeasurementController:
         # save_csv でサイドカー meta.json に書き出す。
         self.meas_start_wall = None
         self.meas_stop_wall = None
+        # webカメラ録画の情報(App が計測後にセット)。meta.json に動画ファイル名・録画開始時刻を残す。
+        self.video_info = None
         self._cleaned = False
         self._cleanup_lock = threading.Lock()
         # [計測開始]時に GUI から渡される計測条件(既定値で初期化)
@@ -1510,10 +1535,19 @@ class MeasurementController:
             "first_sample_wall": first_wall,
             "last_sample_wall": last_wall,
             "video_sync_note": (
-                "動画は Windows 標準カメラで別撮りする。CSV の WallClock と動画ファイルの"
-                "録画開始時刻(ファイル名 WIN_YYYYMMDD_HH_MM_SS_Pro.mp4)を "
-                "sync_video_with_dataset.py で突き合わせて同期する。"),
+                "CSV の WallClock と動画の録画開始時刻を sync_video_with_dataset.py で"
+                "突き合わせて同期する。"),
         }
+        # webカメラを本アプリで録画した場合は、その動画情報も残す(同期の基準に使える)。
+        if self.video_info:
+            vi = self.video_info
+            meta["video_file"] = vi.get("file")
+            meta["video_start_wall"] = (_format_wallclock(vi["start_wall"])
+                                        if vi.get("start_wall") else None)
+            meta["video_fps"] = vi.get("fps")
+            meta["video_frames"] = vi.get("frames")
+            meta["video_size"] = ([vi.get("width"), vi.get("height")]
+                                  if vi.get("width") else None)
         meta_path = os.path.splitext(csv_path)[0] + ".meta.json"
         try:
             with open(meta_path, "w", encoding="utf-8") as f:
@@ -1543,6 +1577,12 @@ class App(tk.Tk):
         self.msg_queue = queue.Queue()
         self.controller = None
         self.measuring = False
+        # webカメラ録画 / ライブ表示ダッシュボード(計測開始で起動、停止でクローズ)
+        self.camera = None            # CameraRecorder(計測中のみ)
+        self.dashboard = None         # LiveDashboard(計測中のみ)
+        self.video_tmp_path = None    # 録画中の一時 mp4 パス(保存時に CSV の隣へ移動)
+        self.video_start_wall = None  # 録画開始のエポック秒(ファイル名/meta 用)
+        self.camera_info = None       # camera.stop() の戻り(保存時に使用)
         self._finalizing = False  # 停止→保存→(終了 or 待機復帰)の処理中フラグ
         self._exit_after_save = False  # True: 保存後にアプリ終了 / False: 待機状態へ戻る
         self._latest_plot = None  # 直近の各チャンネル [(s11, z_r, z_x), ...]。poll ごとに1回描画
@@ -1662,16 +1702,32 @@ class App(tk.Tk):
         self.optitrack_chk.pack(side="left")
 
         # --- カメラ撮影(ウェブカメラ動画)と同期するか ---
-        # 動画は Windows 標準「カメラ」アプリで別撮りする。ON のとき、動画と突き合わせるための
-        # 絶対時刻列 WallClock と、保存時のサイドカー meta.json を記録する。OFF なら従来形式。
+        # ON のとき、計測開始と連動して webカメラ(OpenCV)を録画開始し、絶対時刻列 WallClock と
+        # 保存時のサイドカー meta.json を記録する。動画は計測終了後に CSV の隣へ保存する。OFF なら従来形式。
         cam_frame = ttk.Frame(self)
         cam_frame.pack(fill="x", **pad)
         self.camera_var = tk.BooleanVar(value=True)
         self.camera_chk = ttk.Checkbutton(
             cam_frame,
-            text="カメラ撮影と同期する（動画は Windows 標準カメラで別撮り。絶対時刻 WallClock 列と meta.json を記録）",
+            text="カメラ撮影と同期する（計測開始でwebカメラを録画。WallClock列/meta.jsonも記録）",
             variable=self.camera_var)
         self.camera_chk.pack(side="left")
+        ttk.Label(cam_frame, text="  カメラ番号:").pack(side="left")
+        self.camera_index_var = tk.StringVar(value="0")
+        self.camera_index_spin = ttk.Spinbox(
+            cam_frame, textvariable=self.camera_index_var, from_=0, to=8, width=4)
+        self.camera_index_spin.pack(side="left", padx=2)
+
+        # --- 計測中にライブ表示(3D/肘角度/スミス/カメラ)を別ウィンドウで開くか ---
+        # 表示は nanoVNA の掃引レートに律速されず、専用の高速タイマーで最新値を直接読んで更新する。
+        live_frame = ttk.Frame(self)
+        live_frame.pack(fill="x", **pad)
+        self.live_var = tk.BooleanVar(value=True)
+        self.live_chk = ttk.Checkbutton(
+            live_frame,
+            text="計測中にライブ表示を開く（別ウィンドウ：3Dマーカー/肘角度/スミス/カメラ映像。掃引レート非依存で更新）",
+            variable=self.live_var)
+        self.live_chk.pack(side="left")
 
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill="x", **pad)
@@ -2001,6 +2057,8 @@ class App(tk.Tk):
         self.points_spin.configure(state="disabled")
         self.optitrack_chk.configure(state="disabled")
         self.camera_chk.configure(state="disabled")
+        self.camera_index_spin.configure(state="disabled")
+        self.live_chk.configure(state="disabled")
         self.status_var.set("接続中...")
         self.count_var.set("サンプル数: 0")
         # FPS 計測の初期化
@@ -2028,14 +2086,141 @@ class App(tk.Tk):
         msg = "計測を開始しました。{}（{}, {}, {}, {}）".format(
             ports_desc, VNA_SPARAM, sweep_desc, opt_desc, cam_desc)
         self._log(msg)
-        # 動画同期 ON のとき: 開始の絶対時刻を残す(Windows カメラの録画も併せて開始/確認する)。
+        # 動画同期 ON のとき: 開始の絶対時刻を残す(webカメラ録画も計測開始と連動して始まる)。
         if use_camera_sync:
-            self._log("開始時刻(壁時計): {} ／ 動画は Windows 標準カメラで別途録画してください。"
-                      .format(_format_wallclock(time.time())))
+            self._log("開始時刻(壁時計): {}".format(_format_wallclock(time.time())))
         self._console_event("[計測開始] " + msg)  # 重要イベントはコンソールにも残す
         self.controller = MeasurementController(self.msg_queue)
         self.controller.start(com_ports, start_hz, stop_hz, points,
                               use_optitrack, use_camera_sync)
+        # 計測開始と連動して webカメラ録画を開始し、ライブ表示ウィンドウを開く
+        self._start_camera(use_camera_sync)
+        self._open_dashboard()
+
+    # ---- webカメラ録画の開始(計測開始と連動) ----
+    def _start_camera(self, use_camera_sync):
+        """
+        カメラ同期 ON かつ OpenCV 利用可のとき、計測開始と連動して webカメラ録画を始める。
+        録画は一時 mp4 に書き、計測終了・CSV 保存時に CSV の隣へ移動する。
+        失敗しても計測は止めず、ログに理由を出して録画なしで続行する。
+        """
+        self.camera = None
+        self.video_tmp_path = None
+        self.video_start_wall = None
+        self.camera_info = None
+        if not use_camera_sync:
+            return
+        if camera_recorder is None or getattr(camera_recorder, "cv2", None) is None:
+            self._log("[カメラ] OpenCV(cv2)が無いため録画をスキップします "
+                      "(pip install opencv-python で有効化)。")
+            return
+        try:
+            idx = int(float(self.camera_index_var.get()))
+        except (ValueError, TypeError):
+            idx = 0
+        tmp = os.path.join(tempfile.gettempdir(),
+                           "nanovna_cam_{}.mp4".format(time.strftime("%Y%m%d_%H%M%S")))
+        try:
+            rec = camera_recorder.CameraRecorder(index=idx, out_path=tmp)
+            rec.start()
+        except Exception as e:
+            self._log("[カメラ] 録画を開始できませんでした(index={}): {}".format(idx, e))
+            return
+        self.camera = rec
+        self.video_tmp_path = tmp
+        self.video_start_wall = rec.start_wall
+        self._log("[カメラ] 録画開始 index={} {}x{} @~{:.0f}fps".format(
+            idx, rec.width, rec.height, rec.fps or 0))
+
+    # ---- ライブ表示ダッシュボード(別ウィンドウ)を開く ----
+    def _open_dashboard(self):
+        """
+        ライブ表示 ON かつ live_dashboard 利用可のとき、別ウィンドウの
+        ライブ・ダッシュボードを開く。表示は掃引レートに律速されず、専用タイマーで
+        最新のマーカー座標・カメラフレーム・各 VNA の最新掃引を直接読んで更新する。
+        """
+        self.dashboard = None
+        if not bool(self.live_var.get()):
+            return
+        if live_dashboard is None:
+            self._log("[ライブ表示] モジュールが無いため開けません。")
+            return
+        ctrl = self.controller
+
+        def get_sweep(i):
+            try:
+                chans = ctrl.channels
+                if 0 <= i < len(chans):
+                    latest = chans[i].read_latest()
+                    if latest is not None:
+                        return latest[1]  # s11(複素配列)
+            except Exception:
+                pass
+            return None
+
+        get_frame = self.camera.get_latest_frame if self.camera is not None else None
+        try:
+            self.dashboard = live_dashboard.LiveDashboard(
+                self, VNA_CHANNEL_NAMES, ctrl.freq_grid_hz,
+                get_positions=read_latest_positions,
+                get_sweep=get_sweep,
+                get_frame=get_frame,
+                has_video=(self.camera is not None),
+                interval_ms=50)
+        except Exception as e:
+            self._log("[ライブ表示] 開けませんでした: {}".format(e))
+            self.dashboard = None
+
+    # ---- ライブ表示を閉じる(メインスレッドから) ----
+    def _close_dashboard(self):
+        if self.dashboard is not None:
+            try:
+                self.dashboard.close()
+            except Exception:
+                pass
+            self.dashboard = None
+
+    # ---- webカメラ録画を停止して mp4 を確定する ----
+    def _stop_camera(self):
+        if self.camera is not None:
+            try:
+                self.camera_info = self.camera.stop()
+            except Exception as e:
+                self._console_event("[カメラ] 停止中に例外: {}".format(e))
+                self.camera_info = None
+            self.camera = None
+
+    # ---- 録画した動画を CSV の隣へ移動し、controller.video_info をセットする ----
+    def _finalize_video_next_to_csv(self, csv_path):
+        """
+        一時 mp4 を CSV と同じフォルダへ WIN_YYYYMMDD_HH_MM_SS_Pro.mp4 の名前で移動する。
+        この名前は sync_video_with_dataset.py がファイル名から録画開始時刻を読めるため、
+        そのまま同期に使える。移動情報は controller.video_info に入れて meta.json へ残す。
+        """
+        if not self.video_tmp_path or not os.path.isfile(self.video_tmp_path):
+            return
+        start = self.video_start_wall or time.time()
+        fname = "WIN_{}_Pro.mp4".format(
+            datetime.datetime.fromtimestamp(start).strftime("%Y%m%d_%H_%M_%S"))
+        dest = os.path.join(os.path.dirname(os.path.abspath(csv_path)), fname)
+        base, ext = os.path.splitext(dest)
+        k = 1
+        while os.path.exists(dest):
+            dest = "{}_{}{}".format(base, k, ext)
+            k += 1
+        try:
+            shutil.move(self.video_tmp_path, dest)
+        except Exception as e:
+            self._log("[カメラ] 動画の移動に失敗(一時ファイルのまま): {}".format(e))
+            dest = self.video_tmp_path
+        info = dict(self.camera_info or {})
+        info["file"] = os.path.basename(dest)
+        info["path"] = dest
+        info["start_wall"] = start
+        if self.controller is not None:
+            self.controller.video_info = info
+        self.video_tmp_path = None
+        self._log("[カメラ] 動画を保存しました: {}".format(dest))
 
     # ---- 計測終了 -> 保存 -> (待機復帰) ----
     def on_stop(self):
@@ -2057,6 +2242,9 @@ class App(tk.Tk):
         if reason:
             self._log(reason)
 
+        # ライブ表示を閉じる(Toplevel 破棄はメインスレッドで)
+        self._close_dashboard()
+
         # 停止要求(即時に戻る)。クリーンアップは GUI を固めないよう別スレッドで。
         if self.controller:
             self.controller.request_stop()
@@ -2065,6 +2253,7 @@ class App(tk.Tk):
             try:
                 if self.controller:
                     self.controller.cleanup()
+                self._stop_camera()   # webカメラ録画を停止して mp4 を確定
             finally:
                 # メインスレッドで保存ダイアログを出すため通知
                 self.msg_queue.put(("ready_to_save", None))
@@ -2084,6 +2273,8 @@ class App(tk.Tk):
         )
         if path:
             try:
+                # 録画した動画を CSV の隣へ移動し、meta.json に動画情報を含める(保存前に実施)
+                self._finalize_video_next_to_csv(path)
                 written = self.controller.save_csv(path)
                 if getattr(self.controller, "use_camera_sync", False):
                     meta_path = os.path.splitext(path)[0] + ".meta.json"
@@ -2108,6 +2299,10 @@ class App(tk.Tk):
                 # 取りやめ -> 保存ダイアログを再表示
                 self._do_save_then_finish()
                 return
+            # 破棄を選択: 録画した動画は一時ファイルとして残るので場所を知らせる
+            if self.video_tmp_path and os.path.isfile(self.video_tmp_path):
+                self._log("[カメラ] 録画した動画は一時ファイルに残っています: {}".format(
+                    self.video_tmp_path))
 
         # 保存/破棄が完了 -> ウィンドウ × からの場合は終了、計測終了ボタンなら待機状態へ戻す
         if self._exit_after_save:
@@ -2127,6 +2322,12 @@ class App(tk.Tk):
         self._fps_win_start = None
         self._opti_fps = 0.0
         self._vna_fps = [0.0] * len(VNA_CHANNEL_NAMES)
+        # カメラ/ライブ表示/動画一時ファイルの状態をクリア(念のため)
+        self._close_dashboard()
+        self.camera = None
+        self.camera_info = None
+        self.video_tmp_path = None
+        self.video_start_wall = None
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         for combo in self.port_combos:
@@ -2137,6 +2338,8 @@ class App(tk.Tk):
         self.points_spin.configure(state="normal")
         self.optitrack_chk.configure(state="normal")
         self.camera_chk.configure(state="normal")
+        self.camera_index_spin.configure(state="normal")
+        self.live_chk.configure(state="normal")
         self.status_var.set("待機中")
         self.fps_var.set(self._fps_default_text())
 
@@ -2153,12 +2356,14 @@ class App(tk.Tk):
             self._meas_stop_time = time.time()  # 平均 FPS 算出用に停止時刻を記録
             self.status_var.set("停止処理中...")
             self._log("ウィンドウを閉じています。クリーンアップ中...")
+            self._close_dashboard()             # ライブ表示を閉じる(メインスレッド)
 
             def _finalize_close():
                 try:
                     if self.controller:
                         self.controller.request_stop()
                         self.controller.cleanup()
+                    self._stop_camera()          # webカメラ録画を停止して mp4 を確定
                 finally:
                     self.msg_queue.put(("ready_to_save", None))
             threading.Thread(target=_finalize_close, name="FinalizerClose",
@@ -2284,9 +2489,13 @@ class App(tk.Tk):
         if self._finalizing:
             return
 
+        # ライブ表示を閉じる(メインスレッド)。カメラ停止はクリーンアップ側で行う。
+        self._close_dashboard()
+
         def _cl():
             if self.controller:
                 self.controller.cleanup()
+            self._stop_camera()
         threading.Thread(target=_cl, daemon=True).start()
         self.measuring = False
         self.start_btn.configure(state="normal")
@@ -2299,6 +2508,8 @@ class App(tk.Tk):
         self.points_spin.configure(state="normal")
         self.optitrack_chk.configure(state="normal")
         self.camera_chk.configure(state="normal")
+        self.camera_index_spin.configure(state="normal")
+        self.live_chk.configure(state="normal")
         self.status_var.set("エラーで停止。再開できます")
 
 
