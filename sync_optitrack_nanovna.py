@@ -54,8 +54,16 @@ VNA 接続(COM ポート):
   選択ポートが開けない(存在しない/他ソフトが占有)場合は、クラッシュさせず
   messagebox.showerror で警告を表示する。
 
+★ウェブカメラ動画との時刻同期★
+  各サンプルには「計測開始からの経過秒(Timestamp)」に加えて「絶対時刻(WallClock,
+  ローカル時刻・ミリ秒精度)」を記録する。動画自体はこのスクリプトでは撮らず、Windows 標準
+  「カメラ」アプリで別途録画・保存する(同じ PC の時計を共有する)。後処理で、CSV の WallClock と
+  Windows カメラが動画ファイルに残す録画開始時刻(ファイル名 WIN_YYYYMMDD_HH_MM_SS_Pro.mp4)を
+  突き合わせれば、各データ行がその動画の何秒目に当たるかを算出できる(sync_video_with_dataset.py)。
+  保存時には CSV の隣に <csv名>.meta.json(計測開始/終了の絶対時刻など)も書き出す。
+
 CSV ヘッダー(位置列は EXPECTED_MARKER_NAMES 順、VNA 列は VNA_CHANNEL_NAMES 順に自動生成):
-  [Timestamp,
+  [Timestamp, WallClock,
    R_forearm_X,  R_forearm_Y,  R_forearm_Z,
    R_joint_X,    R_joint_Y,    R_joint_Z,
    R_upperarm_X, R_upperarm_Y, R_upperarm_Z,
@@ -74,7 +82,9 @@ import os
 import csv
 import sys
 import time
+import json
 import queue
+import datetime
 import threading
 import collections
 
@@ -242,11 +252,24 @@ OUTPUT_CSV = "sync_dataset.csv"
 # 共有状態・CSV 列・スナップショットなどはすべてこの順序に従う。
 MARKER_NAMES = tuple(EXPECTED_MARKER_NAMES)
 
-# 位置情報の先頭列(計測開始からの経過秒 + 各マーカー × XYZ)を動的生成する。
-# Timestamp 列の中身は「計測ループ開始(最初のサンプル取得直前)を 0 とした経過時間[秒]」
-_POSITION_HEADER = ["Timestamp"]
-for _mk in MARKER_NAMES:
-    _POSITION_HEADER += ["{}_X".format(_mk), "{}_Y".format(_mk), "{}_Z".format(_mk)]
+# 位置情報の先頭列(計測開始からの経過秒 [+ 絶対時刻] + 各マーカー × XYZ)を動的生成する。
+# Timestamp 列の中身は「計測ループ開始(最初のサンプル取得直前)を 0 とした経過時間[秒]」。
+# WallClock 列は同じサンプルの絶対時刻(ローカル時刻・ミリ秒精度: "YYYY-MM-DD HH:MM:SS.fff")。
+# WallClock = 計測開始時の壁時計 + Timestamp となるように基準時刻から算出するため、両列は整合する。
+# ウェブカメラ動画(Windows 標準カメラで別撮り)との同期は、この WallClock を基準に行う。
+# WallClock 列は「カメラ撮影と同期する」を GUI で ON にしたときだけ付与する(include_wallclock)。
+def build_position_header(include_wallclock=True):
+    """位置情報の先頭列を作る。include_wallclock=True で Timestamp の次に WallClock を挿入する。"""
+    cols = ["Timestamp"]
+    if include_wallclock:
+        cols.append("WallClock")
+    for mk in MARKER_NAMES:
+        cols += ["{}_X".format(mk), "{}_Y".format(mk), "{}_Z".format(mk)]
+    return cols
+
+
+# 既定の位置ヘッダー(参考用。実際は計測条件に応じてコントローラが動的生成する)
+_POSITION_HEADER = build_position_header(True)
 
 
 def _fmt_mhz(hz):
@@ -272,14 +295,16 @@ def _vna_columns_for(prefix, freq_grid_hz):
     return cols
 
 
-def build_csv_header(freq_grid_hz, channel_names=VNA_CHANNEL_NAMES):
+def build_csv_header(freq_grid_hz, channel_names=VNA_CHANNEL_NAMES,
+                     include_wallclock=True):
     """
     位置情報 + 各 VNA チャンネルの S パラメータ/インピーダンス列を並べた CSV ヘッダーを作る。
-    - 位置列(Timestamp + 各マーカー XYZ)のあとに、チャンネルごとに 4 列 × 点数を並べる。
+    - 位置列(Timestamp [+ WallClock] + 各マーカー XYZ)のあとに、チャンネルごとに 4 列 × 点数を並べる。
+    - include_wallclock=True のときのみ絶対時刻列 WallClock を含める(カメラ同期 ON 時)。
     - 列名は "<チャンネル名>_S11_Real[_<MHz>]" のようにチャンネル名で区別する。
       (単一周波数のときは MHz サフィックスを省く)
     """
-    cols = list(_POSITION_HEADER)
+    cols = build_position_header(include_wallclock)
     for name in channel_names:
         cols += _vna_columns_for(name, freq_grid_hz)
     return cols
@@ -954,6 +979,16 @@ def shutdown_natnet(client):
 # メイン: VNA サンプリングループ + CSV 書き込み
 # =============================================================================
 
+def _format_wallclock(epoch_sec):
+    """
+    エポック秒(time.time() 由来)をローカル時刻の文字列
+    "YYYY-MM-DD HH:MM:SS.fff"(ミリ秒精度)へ整形する。
+    CSV の WallClock 列・meta.json・GUI 時計表示で共通に使う。動画同期の基準となる。
+    """
+    dt = datetime.datetime.fromtimestamp(epoch_sec)
+    return dt.strftime("%Y-%m-%d %H:%M:%S.") + "{:03d}".format(dt.microsecond // 1000)
+
+
 def _fmt_xyz(snap, name):
     """マーカーの (x,y,z) を CSV セル 3 個へ整形。未受信なら空欄。"""
     x, y, z, valid = snap[name]
@@ -1025,6 +1060,10 @@ class MeasurementController:
         self.rows = []
         self.rows_lock = threading.Lock()
         self.sample_count = 0
+        # 動画同期用: 計測(結合ループ)の開始/終了の絶対時刻(エポック秒)。
+        # save_csv でサイドカー meta.json に書き出す。
+        self.meas_start_wall = None
+        self.meas_stop_wall = None
         self._cleaned = False
         self._cleanup_lock = threading.Lock()
         # [計測開始]時に GUI から渡される計測条件(既定値で初期化)
@@ -1035,6 +1074,7 @@ class MeasurementController:
         self.freq_grid_hz = FREQ_GRID_HZ
         self.csv_header = CSV_HEADER
         self.use_optitrack = True   # False で OptiTrack を使わない(VNA のみ計測)
+        self.use_camera_sync = True  # False でカメラ動画同期を使わない(WallClock 列/meta.json を出さない)
 
     # ---- GUI へ通知 ----
     def _post(self, kind, value=None):
@@ -1044,17 +1084,20 @@ class MeasurementController:
             pass
 
     # ---- 開始 ----
-    def start(self, com_ports, start_hz, stop_hz, points, use_optitrack=True):
+    def start(self, com_ports, start_hz, stop_hz, points, use_optitrack=True,
+              use_camera_sync=True):
         """
         共有状態を初期化し、計測ワーカースレッドを起動する。
         com_ports は GUI で選択された各チャンネルの接続先 COM ポートのリスト
         (例 ["COM3", "COM4"])。要素数ぶんの nanoVNA を並行して計測する。
         start_hz/stop_hz/points は GUI で指定された掃引条件(全チャンネル共通)。
         use_optitrack=False のときは OptiTrack(NatNet)を使わず VNA のみ計測する。
+        use_camera_sync=False のときは動画同期用の絶対時刻(WallClock 列・meta.json)を出さない。
         この条件から周波数グリッドと CSV ヘッダーを動的に生成する。
         """
         self.com_ports = list(com_ports)
         self.use_optitrack = bool(use_optitrack)
+        self.use_camera_sync = bool(use_camera_sync)
         self.start_hz = int(start_hz)
         self.stop_hz = int(stop_hz)
         self.points = int(points)
@@ -1063,7 +1106,9 @@ class MeasurementController:
             self.points = 1
             self.stop_hz = self.start_hz
         self.freq_grid_hz = make_freq_grid(self.start_hz, self.stop_hz, self.points)
-        self.csv_header = build_csv_header(self.freq_grid_hz, VNA_CHANNEL_NAMES)
+        self.csv_header = build_csv_header(
+            self.freq_grid_hz, VNA_CHANNEL_NAMES,
+            include_wallclock=self.use_camera_sync)
 
         # チャンネルを構築(名前は VNA_CHANNEL_NAMES、ポートは GUI 選択)
         self.channels = [
@@ -1175,6 +1220,8 @@ class MeasurementController:
         # 5) コンバイナ: 全チャンネルの最新掃引 + 位置を 1 行に結合して蓄積する
         self._post("status", "計測中...")
         self._combine_loop()
+        # 動画同期用に計測終了の絶対時刻を記録する
+        self.meas_stop_wall = time.time()
 
         self._post("finished")
 
@@ -1306,6 +1353,11 @@ class MeasurementController:
         # 経過時間の基準(この時点=最初の結合直前を 0 秒とする)。
         # 単調増加時計 perf_counter を使い、システム時刻補正の影響を受けないようにする。
         t0 = time.perf_counter()
+        # 動画同期用の絶対時刻(壁時計)の基準。t0 とほぼ同時刻に取得し、
+        # 各サンプルの WallClock = wall0 + (perf_counter - t0) として算出する。
+        # → 相対 Timestamp と絶対 WallClock がドリフトせず整合する。
+        wall0 = time.time()
+        self.meas_start_wall = wall0   # meta.json / ログ用(計測開始の絶対時刻)
         while not _stop_event.is_set():
             # 全チャンネルが「前回消費より新しい掃引」を持つまで待つ
             latests = [ch.read_latest() for ch in self.channels]
@@ -1341,7 +1393,13 @@ class MeasurementController:
                 continue
 
             # タイムスタンプ = 計測開始からの経過時間[秒](ミリ秒精度)
-            ts = "{:.3f}".format(time.perf_counter() - t0)
+            elapsed = time.perf_counter() - t0
+            ts = "{:.3f}".format(elapsed)
+            # 先頭列: Timestamp [+ WallClock(カメラ同期 ON 時のみ)]
+            head_cols = [ts]
+            if self.use_camera_sync:
+                # 絶対時刻(壁時計)。動画(Windows カメラで別撮り)との突き合わせ基準。
+                head_cols.append(_format_wallclock(wall0 + elapsed))
             pos_cols = []
             for name in MARKER_NAMES:
                 pos_cols += _fmt_xyz(snap, name)
@@ -1354,7 +1412,7 @@ class MeasurementController:
                                  "{:.6f}".format(s11[k].imag),
                                  "{:.4f}".format(z_r[k]),
                                  "{:.4f}".format(z_x[k])]
-            row = [ts] + pos_cols + vna_cols
+            row = head_cols + pos_cols + vna_cols
             with self.rows_lock:
                 self.rows.append(row)
                 self.sample_count += 1
@@ -1426,7 +1484,42 @@ class MeasurementController:
             writer = csv.writer(f)
             writer.writerow(self.csv_header)  # 計測条件に応じて動的生成したヘッダー
             writer.writerows(rows)
+        # 動画同期用のサイドカー(<csv>.meta.json)を書き出す(カメラ同期 ON 時のみ)。
+        # 突き合わせ自体は CSV の WallClock 列で行えるが、計測全体の絶対時刻の
+        # 目安として start/end を残しておくと、動画ファイルの録画時刻との対応確認に役立つ。
+        if self.use_camera_sync:
+            self._save_meta(path, len(rows))
         return len(rows)
+
+    def _save_meta(self, csv_path, n_rows):
+        """CSV の隣に <csv>.meta.json を書き出す(動画同期の補助情報)。失敗しても無視する。"""
+        # 先頭行/末尾行の WallClock も入れておく(動画突き合わせの実データ基準)。
+        with self.rows_lock:
+            first_wall = self.rows[0][1] if self.rows else None
+            last_wall = self.rows[-1][1] if self.rows else None
+        meta = {
+            "csv_file": os.path.basename(csv_path),
+            "n_samples": n_rows,
+            "timestamp_column": "Timestamp",       # 計測開始からの経過秒
+            "wallclock_column": "WallClock",        # 絶対時刻(ローカル・ミリ秒)
+            "wallclock_format": "%Y-%m-%d %H:%M:%S.%f (ローカル時刻・ミリ秒)",
+            "meas_start_wall": (_format_wallclock(self.meas_start_wall)
+                                if self.meas_start_wall else None),
+            "meas_stop_wall": (_format_wallclock(self.meas_stop_wall)
+                               if self.meas_stop_wall else None),
+            "first_sample_wall": first_wall,
+            "last_sample_wall": last_wall,
+            "video_sync_note": (
+                "動画は Windows 標準カメラで別撮りする。CSV の WallClock と動画ファイルの"
+                "録画開始時刻(ファイル名 WIN_YYYYMMDD_HH_MM_SS_Pro.mp4)を "
+                "sync_video_with_dataset.py で突き合わせて同期する。"),
+        }
+        meta_path = os.path.splitext(csv_path)[0] + ".meta.json"
+        try:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            _dbg("[WARN] meta.json の保存に失敗(無視): {}".format(e))
 
     def get_sample_count(self):
         with self.rows_lock:
@@ -1443,8 +1536,9 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("OptiTrack × VNA 同期計測")
-        self.geometry("820x720")
-        self.minsize(640, 560)
+        # スミスチャート(目盛ラベル付き)が初期表示から切れずに収まるよう広めにとる。
+        self.geometry("940x860")
+        self.minsize(800, 640)
 
         self.msg_queue = queue.Queue()
         self.controller = None
@@ -1567,6 +1661,18 @@ class App(tk.Tk):
             variable=self.optitrack_var)
         self.optitrack_chk.pack(side="left")
 
+        # --- カメラ撮影(ウェブカメラ動画)と同期するか ---
+        # 動画は Windows 標準「カメラ」アプリで別撮りする。ON のとき、動画と突き合わせるための
+        # 絶対時刻列 WallClock と、保存時のサイドカー meta.json を記録する。OFF なら従来形式。
+        cam_frame = ttk.Frame(self)
+        cam_frame.pack(fill="x", **pad)
+        self.camera_var = tk.BooleanVar(value=True)
+        self.camera_chk = ttk.Checkbutton(
+            cam_frame,
+            text="カメラ撮影と同期する（動画は Windows 標準カメラで別撮り。絶対時刻 WallClock 列と meta.json を記録）",
+            variable=self.camera_var)
+        self.camera_chk.pack(side="left")
+
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill="x", **pad)
         self.start_btn = ttk.Button(
@@ -1586,13 +1692,18 @@ class App(tk.Tk):
         self.count_var = tk.StringVar(value="サンプル数: 0")
         ttk.Label(status_frame, textvariable=self.count_var).pack(side="right")
 
-        # --- サンプリングレート(FPS)表示 ---
+        # --- サンプリングレート(FPS)表示 + 現在時刻(動画同期の基準時計)---
         fps_frame = ttk.Frame(self)
         fps_frame.pack(fill="x", **pad)
-        self.fps_var = tk.StringVar(value=self._fps_default_text())
         ttk.Label(fps_frame, text="取得レート:").pack(side="left")
+        self.fps_var = tk.StringVar(value=self._fps_default_text())
         ttk.Label(fps_frame, textvariable=self.fps_var,
                   foreground="#06c").pack(side="left", padx=6)
+        # 現在時刻(壁時計)。動画は Windows 標準カメラで別撮りし、この時計(=CSV の WallClock)を
+        # 共有の時刻軸として後処理で突き合わせる。PC の時計が動画側と同一であることの確認にも使う。
+        self.clock_var = tk.StringVar(value="現在時刻: --:--:--")
+        ttk.Label(fps_frame, textvariable=self.clock_var,
+                  foreground="#a60").pack(side="right")
 
         # --- リアルタイムグラフ(周波数 vs インピーダンス) ---
         self._build_plot(pad)
@@ -1626,17 +1737,21 @@ class App(tk.Tk):
         # チャンネル数ぶんのスミスチャートを横に並べる
         n = len(VNA_CHANNEL_NAMES)
         colors = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e"]
-        self.fig = Figure(figsize=(3.6 * n, 3.8), dpi=100)
+        # 各チャートの抵抗/リアクタンス目盛ラベルを表示するため、1 枚あたりの領域を広めに取る。
+        self.fig = Figure(figsize=(4.3 * n, 4.2), dpi=100)
         self._smith_axes = []
         self._trace_lines = []    # 掃引全点の Γ(=S11) トレース
         self._marker_lines = []   # 読み取り周波数の点(★)
 
         for i, name in enumerate(VNA_CHANNEL_NAMES):
             ax = self.fig.add_subplot(1, n, i + 1)
-            # scikit-rf のスミスチャート格子を描く(インピーダンス基準)
-            rf.plotting.smith(ax=ax, chart_type="z", draw_labels=False)
+            # scikit-rf のスミスチャート格子を描く(インピーダンス基準)。
+            # draw_labels=True で抵抗円/リアクタンス円の目盛ラベルを表示する
+            # (初期表示でラベルが出ず見づらかったのを改善)。
+            rf.plotting.smith(ax=ax, chart_type="z", draw_labels=True)
             ax.set_title(name, fontsize=10)
             ax.set_aspect("equal")
+            # 直交座標の目盛(-1..1)は不要なので消す。スミス円の目盛ラベルは残る。
             ax.set_xticks([])
             ax.set_yticks([])
             color = colors[i % len(colors)]
@@ -1648,7 +1763,8 @@ class App(tk.Tk):
             self._trace_lines.append(trace)
             self._marker_lines.append(marker)
 
-        self.fig.tight_layout()
+        # ラベルが図の縁で切れないよう、少し余白を持たせて配置する。
+        self.fig.tight_layout(pad=1.2)
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
         self.canvas.draw()
@@ -1869,6 +1985,7 @@ class App(tk.Tk):
             return
         start_hz, stop_hz, points = cfg
         use_optitrack = bool(self.optitrack_var.get())
+        use_camera_sync = bool(self.camera_var.get())
 
         # 新しい掃引条件にあわせてグラフ横軸を作り直す
         self._reconfigure_plot(start_hz, stop_hz, points)
@@ -1883,6 +2000,7 @@ class App(tk.Tk):
         self.stop_entry.configure(state="disabled")
         self.points_spin.configure(state="disabled")
         self.optitrack_chk.configure(state="disabled")
+        self.camera_chk.configure(state="disabled")
         self.status_var.set("接続中...")
         self.count_var.set("サンプル数: 0")
         # FPS 計測の初期化
@@ -1906,12 +2024,18 @@ class App(tk.Tk):
             "{}={}".format(VNA_CHANNEL_NAMES[i],
                            "テストモード" if com_ports[i] == TEST_MODE else com_ports[i])
             for i in range(len(com_ports)))
-        msg = "計測を開始しました。{}（{}, {}, {}）".format(
-            ports_desc, VNA_SPARAM, sweep_desc, opt_desc)
+        cam_desc = "カメラ同期 ON" if use_camera_sync else "カメラ同期 OFF"
+        msg = "計測を開始しました。{}（{}, {}, {}, {}）".format(
+            ports_desc, VNA_SPARAM, sweep_desc, opt_desc, cam_desc)
         self._log(msg)
+        # 動画同期 ON のとき: 開始の絶対時刻を残す(Windows カメラの録画も併せて開始/確認する)。
+        if use_camera_sync:
+            self._log("開始時刻(壁時計): {} ／ 動画は Windows 標準カメラで別途録画してください。"
+                      .format(_format_wallclock(time.time())))
         self._console_event("[計測開始] " + msg)  # 重要イベントはコンソールにも残す
         self.controller = MeasurementController(self.msg_queue)
-        self.controller.start(com_ports, start_hz, stop_hz, points, use_optitrack)
+        self.controller.start(com_ports, start_hz, stop_hz, points,
+                              use_optitrack, use_camera_sync)
 
     # ---- 計測終了 -> 保存 -> (待機復帰) ----
     def on_stop(self):
@@ -1961,7 +2085,12 @@ class App(tk.Tk):
         if path:
             try:
                 written = self.controller.save_csv(path)
-                self._log("保存しました: {} ({} サンプル)".format(path, written))
+                if getattr(self.controller, "use_camera_sync", False):
+                    meta_path = os.path.splitext(path)[0] + ".meta.json"
+                    self._log("保存しました: {} ({} サンプル) / meta: {}".format(
+                        path, written, os.path.basename(meta_path)))
+                else:
+                    self._log("保存しました: {} ({} サンプル)".format(path, written))
                 self._console_event(
                     "[保存完了] {} 件を保存しました: {}".format(written, path))
                 self._log_fps_summary()  # 平均 FPS サマリーを GUI/コンソールへ
@@ -2007,6 +2136,7 @@ class App(tk.Tk):
         self.stop_entry.configure(state="normal")
         self.points_spin.configure(state="normal")
         self.optitrack_chk.configure(state="normal")
+        self.camera_chk.configure(state="normal")
         self.status_var.set("待機中")
         self.fps_var.set(self._fps_default_text())
 
@@ -2089,6 +2219,9 @@ class App(tk.Tk):
         except queue.Empty:
             pass
 
+        # 現在時刻(動画同期の基準時計)を毎サイクル更新する
+        self.clock_var.set("現在時刻: " + _format_wallclock(time.time()))
+
         # --- FPS を約 1 秒ごとに算出して表示(GUI ラベル + コンソール) ---
         fps_updated = self._update_fps_if_due()
 
@@ -2165,6 +2298,7 @@ class App(tk.Tk):
         self.stop_entry.configure(state="normal")
         self.points_spin.configure(state="normal")
         self.optitrack_chk.configure(state="normal")
+        self.camera_chk.configure(state="normal")
         self.status_var.set("エラーで停止。再開できます")
 
 
