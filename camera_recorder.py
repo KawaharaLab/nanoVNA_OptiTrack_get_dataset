@@ -94,11 +94,13 @@ class CameraRecorder:
             raise CameraError("カメラ(index={})からフレームを取得できませんでした。".format(self.index))
         self.height, self.width = frame.shape[0], frame.shape[1]
 
-        # 書き出し FPS を決める: 明示指定 > 実測 > デバイス申告 > 既定30
+        # 書き出し(出力)FPS を決める: 明示指定 > 実測 > デバイス申告 > 既定30。
+        # 実際の書き出しは「実時間で一定間隔」に行う(_loop)ため、この値が実キャプチャレートと
+        # 厳密に一致していなくても動画の内部時刻は実時刻に一致する。滑らかさのため下限15・上限60。
         fps = self.forced_fps or fps_meas or cap.get(cv2.CAP_PROP_FPS)
         if not fps or fps <= 1 or fps > 240:
             fps = 30.0
-        self.fps = float(fps)
+        self.fps = float(min(max(fps, 15.0), 60.0))
 
         # 参照フレームの明るさ・コントラストを記録(真っ黒/レンズ塞がりの検知に使う)
         self._assess_frame(frame)
@@ -171,20 +173,43 @@ class CameraRecorder:
 
     # ---- キャプチャスレッド本体 ----
     def _loop(self):
+        # 動画の内部タイムラインを実時間に一致させるため、最新フレームを self.fps の
+        # 「実時間」一定間隔で書き出す。キャプチャが速ければ間引き、遅ければ直前フレームを
+        # 複製して間を詰める。これにより実キャプチャレートが変動・誤測定でも
+        # 動画の各時刻が壁時計とずれず、再生時に座標/スミス/映像が同期し続ける
+        # (= 動画の n 秒目 == 計測開始から n 秒後、が常に成り立つ)。
+        interval = 1.0 / self.fps if self.fps else (1.0 / 30.0)
+        next_write = self.start_wall or time.time()
+        max_catchup = max(2, int(self.fps * 2)) if self.fps else 60
         while not self._stop.is_set():
             ok, frame = self._cap.read()
-            if not ok or frame is None:
-                if self._stop.wait(0.01):
-                    break
+            if ok and frame is not None:
+                with self._lock:
+                    self._latest = frame
+            else:
+                # 取得失敗は少し待って継続(書き出しの実時間ペースは維持する)
+                self._stop.wait(0.005)
+
+            if self._writer is None:
                 continue
+            now = time.time()
             with self._lock:
-                self._latest = frame
-            if self._writer is not None:
+                latest = self._latest
+            if latest is None:
+                continue
+            # 実時間で next_write に達している分だけ、最新フレームを書き出す(複製で間を詰める)。
+            wrote = 0
+            while now >= next_write and wrote < max_catchup:
                 try:
-                    self._writer.write(frame)
+                    self._writer.write(latest)
                     self.frame_count += 1
                 except Exception:
-                    pass
+                    break
+                next_write += interval
+                wrote += 1
+            # 大きく遅延した場合(長時間の取得停止/クロック跳躍)は基準を今に合わせ暴走を防ぐ。
+            if now - next_write > 1.0:
+                next_write = now
 
     # ---- 最新フレーム(BGR)を返す。未取得なら None ----
     def get_latest_frame(self):
