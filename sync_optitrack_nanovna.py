@@ -175,8 +175,8 @@ VNA_ALTERNATE_SWEEP = True
 # その値が VNA に設定される。下記はその「GUI 初期値 兼 既定値」。
 # 一定範囲を掃引して 101 点分の複素 S11 を一括取得し、服(メアンダコイル)を動かした
 # ときに「どの帯域で整合がずれるか」を Z11 のスイープとして記録・可視化する。
-SWEEP_START_HZ = 12_500_000    # 掃引開始 [Hz] (12.5 MHz)
-SWEEP_STOP_HZ  = 14_500_000    # 掃引終了 [Hz] (14.5 MHz)
+SWEEP_START_HZ = 1_000_000     # 掃引開始 [Hz] (1 MHz)
+SWEEP_STOP_HZ  = 20_000_000    # 掃引終了 [Hz] (20 MHz)
 SCAN_POINTS    = 101           # 掃引点数(GUI 初期値)
 # GUI の点数スピンボックスの範囲(1 刻みで任意指定可能)
 POINTS_MIN = 1                 # 最小点数(1 = 単一周波数ピンポイント測定)
@@ -667,7 +667,10 @@ def list_serial_ports():
 # --- VNA 通信の堅牢化パラメータ(無応答/切断時にフリーズしないため) ---
 # 書き込みタイムアウト[秒]: これが無いと、デバイスがハングしたとき write()/flush() が
 # 無限にブロックし、close() 時に固まって保存できなくなる。
-SERIAL_WRITE_TIMEOUT = 2.0
+SERIAL_WRITE_TIMEOUT = 3.0
+# 接続(初期化ハンドシェイク)を何回まで試みるか。1 回目が Write timeout 等で失敗しても、
+# ポートを開き直して再試行する(前回セッションの残りや列挙直後の不安定状態から回復するため)。
+SERIAL_CONNECT_ATTEMPTS = 3
 # 掃引読み取り中、これ以上「新しいデータが来ない」状態が続いたら無応答とみなして打ち切る[秒]。
 SERIAL_STALL_SEC = 2.5
 # 連続で掃引取得に失敗した回数がこれを超えたら GUI に警告を出す。
@@ -709,18 +712,61 @@ class NanoVNA:
             # 論理点数は 1、周波数は開始値に揃える
             self.points = 1
             self.stop_hz = self.start_hz
-        # write_timeout を必ず設定する。これが無いとデバイスがハングしたとき
-        # write()/flush() が無限にブロックし、停止・保存時にフリーズする。
-        self.ser = serial.Serial(port, baud, timeout=timeout,
+        # 接続情報(再オープン時に使う)。write_timeout を必ず設定する。これが無いと
+        # デバイスがハングしたとき write()/flush() が無限にブロックし、停止・保存時にフリーズする。
+        self.port = port
+        self.baud = baud
+        self.timeout = timeout
+        self.ser = None
+        # ポートを開いて初期化ハンドシェイクを行う(Write timeout 等は開き直して再試行する)。
+        self._open_and_init()
+
+    def _open_serial(self):
+        """シリアルポートを開き、DTR/RTS を明示的に有効化する。"""
+        self.ser = serial.Serial(self.port, self.baud, timeout=self.timeout,
                                  write_timeout=SERIAL_WRITE_TIMEOUT)
-        time.sleep(0.2)
-        self.ser.reset_input_buffer()
-        self.ser.reset_output_buffer()
-        # 連続出力を止めてプロンプト状態を確定させる
-        self._send_raw("pause")
-        self._read_until_prompt()
-        # 掃引範囲・点数をデバイスへ設定(初期化コマンド)
-        self.setup_sweep()
+        # 一部の USB シリアルは DTR/RTS が有効でないと送受信できない/目覚めないことがある。
+        try:
+            self.ser.dtr = True
+            self.ser.rts = True
+        except Exception:
+            pass
+
+    def _open_and_init(self):
+        """
+        ポートを開いて pause→sweep の初期化を行う。Write timeout(デバイスがデータを
+        受け取らない)や SerialException が出た場合は、ポートを閉じて開き直し再試行する。
+        全リトライに失敗したら最後の例外を送出する(呼び出し側が接続失敗として扱う)。
+        """
+        last_err = None
+        for attempt in range(SERIAL_CONNECT_ATTEMPTS):
+            try:
+                if self.ser is None or not self.ser.is_open:
+                    self._open_serial()
+                # 起動直後は少し待つ(USB 列挙/デバイス側の準備待ち)。回を追うごとに長めに。
+                time.sleep(0.3 + 0.4 * attempt)
+                self.ser.reset_input_buffer()
+                self.ser.reset_output_buffer()
+                # 連続出力を止めてプロンプト状態を確定させる
+                self._send_raw("pause")
+                self._read_until_prompt()
+                # 掃引範囲・点数をデバイスへ設定(初期化コマンド)
+                self.setup_sweep()
+                return  # 成功
+            except (serial.SerialTimeoutException, serial.SerialException) as e:
+                last_err = e
+                # ポートを閉じて開き直す(スタック状態の解消を試みる)
+                try:
+                    if self.ser is not None:
+                        self.ser.close()
+                except Exception:
+                    pass
+                self.ser = None
+                time.sleep(0.5)
+        # 全リトライ失敗
+        if last_err is not None:
+            raise last_err
+        raise serial.SerialException("VNA の初期化に失敗しました(不明なエラー)。")
 
     def setup_sweep(self):
         """
@@ -1164,11 +1210,19 @@ class MeasurementController:
                                  start_hz=self.start_hz, stop_hz=self.stop_hz,
                                  points=self.points)
             except OSError as e:
+                hint = ""
+                if "timeout" in str(e).lower():
+                    # Write timeout = デバイスがデータを受け取らない(ハング/前回の残り/USB不調)。
+                    hint = ("\n\n【Write timeout の対処】VNA がコマンドを受け付けていません。\n"
+                            "・VNA を一度 USB から抜き差し(再接続)してから[ポート再検索]→再選択してください。\n"
+                            "・NanoVNA-App など他ソフトが同じ VNA を開いていないか確認してください。\n"
+                            "・USB ハブ経由なら直挿しに、別ポートに変えると改善することがあります。\n"
+                            "・カメラ等と同じ USB バスで帯域が逼迫している場合は、別系統の USB 端子へ。")
                 self._post("error",
                            "[{}] VNAの接続に失敗しました(COM: {})。\n"
                            "COM番号が正しいか、他のソフトが占有していないか確認してください。\n"
-                           "(2 台の VNA が同じポートを指していないかも確認してください)\n"
-                           "\n詳細: {}".format(ch.name, ch.com_port, e))
+                           "(2 台の VNA が同じポートを指していないかも確認してください){}\n"
+                           "\n詳細: {}".format(ch.name, ch.com_port, hint, e))
                 self._close_all_vnas()
                 self._post("finished")
                 return
@@ -1713,7 +1767,7 @@ class App(tk.Tk):
             variable=self.camera_var)
         self.camera_chk.pack(side="left")
         ttk.Label(cam_frame, text="  カメラ番号:").pack(side="left")
-        self.camera_index_var = tk.StringVar(value="0")
+        self.camera_index_var = tk.StringVar(value="1")
         self.camera_index_spin = ttk.Spinbox(
             cam_frame, textvariable=self.camera_index_var, from_=0, to=8, width=4)
         self.camera_index_spin.pack(side="left", padx=2)
