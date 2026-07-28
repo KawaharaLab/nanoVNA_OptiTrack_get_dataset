@@ -429,11 +429,13 @@ BONES = [
 ]
 bone_lines = [ax.plot([], [], [], '-', color=c, lw=2.2, zorder=4)[0] for _, _, c in BONES]
 
-ax.legend(loc='upper right', fontsize=7, ncol=2)
-time_txt    = ax.text2D(0.02, 0.96, '', transform=ax.transAxes, fontsize=10)
-angle_txt_r = ax.text2D(0.02, 0.90, '', transform=ax.transAxes, fontsize=12,
+# マーカー凡例は右端に縦 1 列でまとめ、左上の肘角度テキストと重ならないようにする。
+ax.legend(loc='upper right', fontsize=6.5, ncol=1, labelspacing=0.25,
+          handletextpad=0.3, borderaxespad=0.1, framealpha=0.6)
+time_txt    = ax.text2D(0.02, 0.97, '', transform=ax.transAxes, fontsize=9)
+angle_txt_r = ax.text2D(0.02, 0.91, '', transform=ax.transAxes, fontsize=11,
                         color='crimson', fontweight='bold')
-angle_txt_l = ax.text2D(0.02, 0.84, '', transform=ax.transAxes, fontsize=12,
+angle_txt_l = ax.text2D(0.02, 0.85, '', transform=ax.transAxes, fontsize=11,
                         color='royalblue', fontweight='bold')
 
 # ------------------------------------------------------------------ #
