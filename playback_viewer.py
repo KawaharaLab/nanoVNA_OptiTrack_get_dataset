@@ -310,21 +310,29 @@ def fmt_angle(v):
 
 # ------------------------------------------------------------------ #
 # レイアウト
+#   左 : 動画パネル
+#   中央上 : 3D マーカービュー / 中央下 : 肘角度の時系列
+#   右 : スミスチャート 2 つ(縦積み) / その下 : 周波数スライダー
+#   下部(全幅): 時間(フレーム)スライダー ＋ Play / フレーム番号入力
 # ------------------------------------------------------------------ #
-fig = plt.figure(figsize=(15, 9.5))
+fig = plt.figure(figsize=(16, 9))
 fig.suptitle('Dataset + Video Playback Viewer', fontsize=14, fontweight='bold')
 
+# --- 左: 動画パネル ---
 if HAS_VIDEO:
-    ax = fig.add_axes([0.02, 0.38, 0.27, 0.56], projection='3d')
-    ax_video = fig.add_axes([0.31, 0.40, 0.28, 0.52])
+    ax_video = fig.add_axes([0.015, 0.30, 0.31, 0.60])
     ax_video.axis('off')
     video_img = ax_video.imshow(np.zeros((10, 10, 3), dtype=np.uint8), animated=True)
     video_title = ax_video.text(0.5, 1.02, '', transform=ax_video.transAxes,
-                                ha='center', va='bottom', fontsize=9, fontweight='bold')
+                                ha='center', va='bottom', fontsize=10, fontweight='bold')
 else:
-    ax = fig.add_axes([0.04, 0.38, 0.54, 0.56], projection='3d')
+    ax_video = None
 
-ax_ang = fig.add_axes([0.06, 0.24, 0.50, 0.10])
+# --- 中央上: 3D マーカービュー ---
+ax = fig.add_axes([0.35, 0.50, 0.30, 0.44], projection='3d')
+
+# --- 中央下: 肘角度の時系列(3D の真下) ---
+ax_ang = fig.add_axes([0.37, 0.29, 0.26, 0.16])
 ax_ang.plot(timestamps, angles['R'], color='crimson',   lw=1.2, alpha=0.85, label='R elbow')
 ax_ang.plot(timestamps, angles['L'], color='royalblue', lw=1.2, alpha=0.85, label='L elbow')
 ax_ang.set_ylabel('Elbow (°)', fontsize=8)
@@ -338,6 +346,7 @@ ax_ang.grid(True, lw=0.4, alpha=0.5)
 ax_ang.legend(loc='upper right', fontsize=7, ncol=2)
 vline = ax_ang.axvline(timestamps[0], color='black', lw=1.2, alpha=0.7)
 
+# --- 3D 軸設定 ---
 all_pts = np.vstack(list(pos.values()))
 pad = 0.05
 
@@ -394,28 +403,30 @@ angle_txt_l = ax.text2D(0.02, 0.84, '', transform=ax.transAxes, fontsize=12,
                         color='royalblue', fontweight='bold')
 
 # ------------------------------------------------------------------ #
-# スミスチャート
+# スミスチャート(右: 縦積み 2 つ)
 # ------------------------------------------------------------------ #
 SMITH_STYLE = {
     'leftbody':  dict(color='royalblue', label='Left Body'),
     'rightbody': dict(color='crimson',   label='Right Body'),
 }
+# 右カラムに 2 つ縦積み。タイトルは各チャート上、Z 読み出しは各チャート下に置く。
 SMITH_BLOCK = {
-    'leftbody':  dict(title_y=0.955, rect=[0.63, 0.575, 0.34, 0.335], freq_y=0.560),
-    'rightbody': dict(title_y=0.495, rect=[0.63, 0.115, 0.34, 0.335], freq_y=0.100),
+    'leftbody':  dict(title_y=0.945, rect=[0.685, 0.63, 0.29, 0.29], ztext_y=0.610),
+    'rightbody': dict(title_y=0.585, rect=[0.685, 0.285, 0.29, 0.29], ztext_y=0.265),
 }
+_SMITH_CX = 0.685 + 0.29 / 2.0  # スミスチャート中心の figure x 座標(タイトル/Z テキスト用)
 
 
 def draw_smith_grid(ax_s):
-    theta = np.linspace(0, 2 * np.pi, 300)
+    theta = np.linspace(0, 2 * np.pi, 240)
     ax_s.plot(np.cos(theta), np.sin(theta), color='black', lw=1.2, zorder=1)
     ax_s.plot([-1, 1], [0, 0], color='gray', lw=0.6, zorder=1)
-    x_sweep = np.linspace(-500, 500, 4000)
+    x_sweep = np.linspace(-500, 500, 1500)
     for r in (0.0, 0.2, 0.5, 1.0, 2.0, 5.0):
         z = r + 1j * x_sweep
         g = (z - 1) / (z + 1)
         ax_s.plot(g.real, g.imag, color='gray', lw=0.5, alpha=0.6, zorder=1)
-    r_sweep = np.linspace(0, 500, 4000)
+    r_sweep = np.linspace(0, 500, 1500)
     for x in (0.2, 0.5, 1.0, 2.0, 5.0):
         for sign in (1, -1):
             z = r_sweep + 1j * sign * x
@@ -438,14 +449,14 @@ if HAS_SMITH:
         axs = fig.add_axes(blk['rect'])
         draw_smith_grid(axs)
         fmin, fmax, npts = freqs[side].min(), freqs[side].max(), len(freqs[side])
-        fig.text(0.63 + 0.17, blk['title_y'],
+        fig.text(_SMITH_CX, blk['title_y'],
                  f'{st["label"]} S11 Smith Chart\n{fmin:.2f}-{fmax:.2f} MHz ({npts} pts)',
                  fontsize=9, fontweight='bold', color=st['color'], ha='center', va='top')
         line, = axs.plot([], [], '-', color=st['color'], lw=1.3, zorder=3)
         start_pt, = axs.plot([], [], marker='o', color=st['color'], ms=5, zorder=4)
         marker_pt, = axs.plot([], [], marker='*', color='gold', ms=16,
                               markeredgecolor=st['color'], markeredgewidth=1.3, zorder=6)
-        txt = fig.text(0.63 + 0.17, blk['freq_y'], '', fontsize=9.5,
+        txt = fig.text(_SMITH_CX, blk['ztext_y'], '', fontsize=9.5,
                        ha='center', va='top', color=st['color'], fontweight='bold')
         smith_lines[side] = line
         smith_start_pts[side] = start_pt
@@ -454,16 +465,21 @@ if HAS_SMITH:
 
 # ------------------------------------------------------------------ #
 # ウィジェット
+#   時間(フレーム)スライダー: 下部に全幅で配置(動画・3D・スミスの下)
+#   周波数スライダー: スミスチャート 2 つの下(右側)に配置
 # ------------------------------------------------------------------ #
-ax_slider = fig.add_axes([0.06, 0.15, 0.30, 0.03])
-ax_btn    = fig.add_axes([0.22, 0.02, 0.14, 0.05])
-slider   = Slider(ax_slider, 'Frame', 0, n_frames - 1, valinit=0, valstep=1, color='steelblue')
+ax_slider = fig.add_axes([0.10, 0.115, 0.84, 0.025])
+slider = Slider(ax_slider, 'Time', 0, n_frames - 1,
+                valinit=0, valstep=1, color='steelblue')
+
+ax_btn = fig.add_axes([0.06, 0.035, 0.10, 0.05])
 btn_play = Button(ax_btn, 'Play', color='0.85', hovercolor='0.70')
 
-ax_time_box = fig.add_axes([0.44, 0.15, 0.12, 0.03])
+ax_time_box = fig.add_axes([0.27, 0.04, 0.10, 0.035])
 time_box = TextBox(ax_time_box, f'Frame(0-{n_frames - 1}) ', initial='0')
 
-state = {'playing': False, 'frame': 0, 'updating': False, 'freq': None, 'bg': None}
+state = {'playing': False, 'frame': 0, 'updating': False, 'freq': None,
+         'bg': None, 'vframe': 0}
 
 DEFAULT_FREQ_MHZ = 13.56
 freq_slider = None
@@ -472,7 +488,7 @@ if HAS_SMITH:
     _fmin, _fmax = float(_all_freqs.min()), float(_all_freqs.max())
     _fstep = float(np.min([np.diff(freqs[side]).min() for side in SIDES if len(freqs[side]) > 1] or [0.01]))
     _finit = float(np.clip(DEFAULT_FREQ_MHZ, _fmin, _fmax))
-    ax_freq = fig.add_axes([0.06, 0.09, 0.50, 0.03])
+    ax_freq = fig.add_axes([0.70, 0.215, 0.26, 0.02])
     freq_slider = Slider(ax_freq, 'Freq (MHz)', _fmin, _fmax,
                          valinit=_finit, valstep=_fstep, color='seagreen', valfmt='%.2f')
     state['freq'] = _finit
@@ -504,7 +520,7 @@ def update_freq_display():
 # ------------------------------------------------------------------ #
 # マーカー/スミス/角度の更新(CSV 行が変わったときだけ全体を再描画)
 # ------------------------------------------------------------------ #
-def draw_markers_smith(idx, video_note=''):
+def draw_markers_smith(idx):
     idx = int(np.clip(idx, 0, n_frames - 1))
     state['frame'] = idx
     cur = {name: pos[name][idx] for name, _ in MARKERS}
@@ -516,7 +532,6 @@ def draw_markers_smith(idx, video_note=''):
         pa, pb = cur[a], cur[b]
         line.set_data(np.array([pa[0], pb[0]]), np.array([pa[1], pb[1]]))
         line.set_3d_properties(np.array([pa[2], pb[2]]))
-    # 動画内時刻は動画パネルのタイトルに表示するため、ここでは付けない(凡例と重なるのを防ぐ)
     time_txt.set_text(f'Time: {timestamps[idx]:.3f} s   [{idx + 1} / {n_frames}]')
     angle_txt_r.set_text(f'R Elbow: {fmt_angle(angles["R"][idx])}')
     angle_txt_l.set_text(f'L Elbow: {fmt_angle(angles["L"][idx])}')
@@ -539,9 +554,9 @@ def draw_markers_smith(idx, video_note=''):
         update_freq_display()
 
 
-def full_redraw(idx, video_note=''):
-    """マーカー/スミス/角度を更新して全体を再描画し、動画パネル blit 用の背景を取り直す。"""
-    draw_markers_smith(idx, video_note)
+def full_redraw(idx):
+    """マーカー/スミス/角度を更新して全体を再描画し、動画 blit 用の背景を取り直す。"""
+    draw_markers_smith(idx)
     fig.canvas.draw()
     if HAS_VIDEO:
         state['bg'] = fig.canvas.copy_from_bbox(ax_video.bbox)
@@ -558,59 +573,75 @@ def blit_video():
 
 
 # ------------------------------------------------------------------ #
-# 動画フレーム表示(順次読み。飛ばさない)
+# 動画: フレーム番号で駆動(フレームを飛ばさず順次読み。時刻ずれが累積しない)
+#   録画は「実時間で一定 FPS」で書かれているため、フレーム番号 k の実時刻 = k / video_fps。
+#   これを video_time_sec(= WallClock - 録画開始 = 実経過時間)と突き合わせて行を選ぶので、
+#   宣言 FPS の誤差や POS_MSEC のクセに依存せず、映像とマーカー/スミスが同期し続ける。
 # ------------------------------------------------------------------ #
+if HAS_VIDEO:
+    import cv2
+
+
 def _set_video_image(frame_bgr, t_sec):
     rgb = frame_bgr[:, :, ::-1]
     video_img.set_data(rgb)
     video_img.set_extent((0, rgb.shape[1], rgb.shape[0], 0))
-    video_title.set_text(f'Video t = {t_sec:.3f} s')
+    video_title.set_text(f'Video t = {t_sec:.2f} s')
 
 
-def seek_video_to(t_sec):
-    """動画を t_sec へシーク(スクラブ/ジャンプ時のみ使用。再生中は使わない)。"""
-    import cv2
-    video_cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, t_sec) * 1000.0)
-    ret, frame = video_cap.read()
-    if ret:
-        pos_ms = video_cap.get(cv2.CAP_PROP_POS_MSEC)
-        _set_video_image(frame, pos_ms / 1000.0)
-        return pos_ms / 1000.0
-    return t_sec
+def seek_to_row(idx):
+    """行 idx(= その動画時刻)へ動画をシークし、フレーム番号カウンタを合わせて表示更新する。"""
+    idx = int(np.clip(idx, 0, n_frames - 1))
+    if HAS_VIDEO:
+        t = _vts_full[idx]
+        if not np.isfinite(t):
+            t = T_START
+        vf = max(0, int(round(t * video_fps)))
+        try:
+            video_cap.set(cv2.CAP_PROP_POS_FRAMES, vf)
+            ret, frame = video_cap.read()
+        except Exception:
+            ret, frame = False, None
+        if ret and frame is not None:
+            # mp4 はキーフレーム単位でずれるため、実際に読めたフレーム番号に合わせる
+            actual = int(round(video_cap.get(cv2.CAP_PROP_POS_FRAMES))) - 1
+            state['vframe'] = actual if actual >= 0 else vf
+            _set_video_image(frame, state['vframe'] / video_fps)
+        else:
+            state['vframe'] = vf
+    full_redraw(idx)
 
 
 # ------------------------------------------------------------------ #
 # 再生タイマー
 # ------------------------------------------------------------------ #
 if HAS_VIDEO:
-    import cv2
-    _interval_ms = max(10, int(1000.0 / video_fps))
+    _interval_ms = max(5, int(1000.0 / video_fps))
 else:
-    _interval_ms = max(10, int(dt_ms / max(args.speed, 1e-6)))
+    _interval_ms = max(5, int(dt_ms / max(args.speed, 1e-6)))
 
 timer = fig.canvas.new_timer(interval=_interval_ms)
 
 
 def _tick_video():
-    """動画フレームを 1 枚ずつ順に進める。行が変わったらマーカー/スミスも更新。"""
     if not state['playing']:
         return
-    ret, frame = video_cap.read()
-    if not ret:
+    ret, frame = video_cap.read()          # 次のフレームを 1 枚だけ読む(飛ばさない)
+    if not ret or frame is None:
         _stop_play(); return
-    t_vid = video_cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-    if t_vid > T_END + 1e-6:
+    state['vframe'] += 1
+    t_vid = state['vframe'] / video_fps     # フレーム番号 -> 実時刻(録画が実時間 FPS なので正確)
+    if t_vid > T_END + 1.0 / video_fps:
         _stop_play(); return
     _set_video_image(frame, t_vid)
-    idx = row_for_video_time(t_vid)
+    idx = row_for_video_time(t_vid)         # その時刻に対応する CSV 行
     if idx != state['frame'] or state['bg'] is None:
-        full_redraw(idx, video_note=f'(video {t_vid:.2f}s)')  # 行更新 + 背景再取得(動画も描かれる)
+        full_redraw(idx)                    # 行が変わった: マーカー/スミス更新 + 背景取り直し
     else:
-        blit_video()                                          # 動画だけ高速更新
+        blit_video()                        # 同じ行: 動画だけ高速更新
 
 
 def _tick_novideo():
-    """動画なし: Timestamp に沿って行を 1 つずつ進める。"""
     if not state['playing']:
         return
     nxt = state['frame'] + 1
@@ -623,12 +654,7 @@ def _start_play():
     state['playing'] = True
     btn_play.label.set_text('Pause')
     if HAS_VIDEO:
-        # 現在行の動画時刻へシークしてから連続再生を始める
-        t0 = _vts_full[state['frame']]
-        if not np.isfinite(t0):
-            t0 = T_START
-        seek_video_to(float(t0))
-        full_redraw(state['frame'], video_note=f'(video {float(t0):.2f}s)')
+        seek_to_row(state['frame'])         # 現在行の位置へ動画を合わせてから連続再生
     timer.start()
 
 
@@ -638,25 +664,14 @@ def _stop_play():
     timer.stop()
 
 
-def on_btn(event):
-    if state['playing']:
-        _stop_play()
-    else:
-        _start_play()
+def on_btn(_event):
+    (_stop_play if state['playing'] else _start_play)()
 
 
 def on_slider(val):
     if state['updating']:
         return
-    idx = int(val)
-    if HAS_VIDEO:
-        t = _vts_full[idx]
-        if not np.isfinite(t):
-            t = T_START
-        seek_video_to(float(t))
-        full_redraw(idx, video_note=f'(video {float(t):.2f}s)')
-    else:
-        full_redraw(idx)
+    seek_to_row(int(val))
 
 
 def on_freq_slider(val):
@@ -671,8 +686,7 @@ def on_time_submit(text):
     except ValueError:
         time_box.set_val(str(state['frame']))
         return
-    idx = int(np.clip(idx, 0, n_frames - 1))
-    on_slider(idx)
+    seek_to_row(int(np.clip(idx, 0, n_frames - 1)))
 
 
 timer.add_callback(_tick_video if HAS_VIDEO else _tick_novideo)
@@ -692,8 +706,7 @@ if HAS_VIDEO:
 
 # 初期表示
 if HAS_VIDEO:
-    seek_video_to(T_START)
-    full_redraw(row_for_video_time(T_START), video_note=f'(video {T_START:.2f}s)')
+    seek_to_row(row_for_video_time(T_START))
 else:
     full_redraw(0)
 
