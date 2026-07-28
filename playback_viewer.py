@@ -43,6 +43,7 @@ CSV に video_time_sec 列(sync_video_with_dataset.py が付与)があればそ�
 
 import re
 import sys
+import json
 import argparse
 import datetime
 from pathlib import Path
@@ -184,6 +185,23 @@ def _video_start_from_name(path):
         return None
 
 
+def _video_start_from_meta(csv_path):
+    """
+    CSV と同じ場所の <csv名>.meta.json から録画開始時刻(video_start_wall)を読む。
+    これはミリ秒精度なので、ファイル名(秒精度)より正確に同期できる。無ければ None。
+    """
+    meta_path = Path(csv_path).with_name(Path(csv_path).stem + '.meta.json')
+    if not meta_path.exists():
+        return None
+    try:
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        return None
+    val = meta.get('video_start_wall')
+    return _parse_dt(str(val)) if val else None
+
+
 def _compute_video_time_from_wallclock(video_path):
     """WallClock 列 + 録画開始時刻から video_time_sec を計算する。失敗時 None。"""
     if WALLCLOCK_COL not in df.columns:
@@ -217,7 +235,22 @@ if args.video:
     except ImportError:
         sys.exit('[Error] 動画表示には opencv-python が必要です: pip install opencv-python')
 
-    if VIDEO_TIME_COL in df.columns:
+    # video_time_sec を決める優先順位(ずれ対策で「精密な録画開始時刻」を最優先):
+    #   1) --video-start(明示) + WallClock  -> WallClock からミリ秒精度で計算
+    #   2) meta.json の video_start_wall + WallClock -> ミリ秒精度で計算(ファイル名より正確)
+    #   3) CSV の video_time_sec 列(sync_video_with_dataset.py が付けた値)
+    #   4) 動画ファイル名 WIN_...(秒精度) + WallClock -> 計算(±1秒の系統誤差が残りうる)
+    _explicit_start = _parse_dt(args.video_start) if args.video_start else None
+    _meta_start = _video_start_from_meta(CSV_PATH)
+    _precise_start = _explicit_start or _meta_start
+    if _precise_start is not None and WALLCLOCK_COL in df.columns:
+        _walls = [_parse_dt(str(w)) for w in df[WALLCLOCK_COL].to_numpy()]
+        video_time_sec = np.array(
+            [(w - _precise_start).total_seconds() if w is not None else np.nan
+             for w in _walls], dtype=float)
+        _how = '明示指定' if _explicit_start else 'meta.json'
+        src = f'WallClock - 録画開始({_precise_start}, {_how}・ミリ秒精度)'
+    elif VIDEO_TIME_COL in df.columns:
         video_time_sec = df[VIDEO_TIME_COL].to_numpy(dtype=float)
         src = 'CSV の video_time_sec 列'
     else:
@@ -226,7 +259,7 @@ if args.video:
             sys.exit(f'[Error] CSV に "{VIDEO_TIME_COL}" 列が無く、WallClock からも計算できません。\n'
                      f'        sync_video_with_dataset.py で video_time_sec を付けるか、\n'
                      f'        --video-start で録画開始時刻を指定してください。')
-        src = f'WallClock - 録画開始({vstart})'
+        src = f'WallClock - 録画開始({vstart}, ファイル名・秒精度)'
     if VIDEO_INRANGE_COL in df.columns:
         video_in_range = df[VIDEO_INRANGE_COL].to_numpy().astype(bool)
     else:
@@ -409,10 +442,11 @@ SMITH_STYLE = {
     'leftbody':  dict(color='royalblue', label='Left Body'),
     'rightbody': dict(color='crimson',   label='Right Body'),
 }
-# 右カラムに 2 つ縦積み。タイトルは各チャート上、Z 読み出しは各チャート下に置く。
+# 右カラムに 2 つ縦積み。タイトルは各チャート上(1 行)、Z 読み出しは各チャート下に置く。
+# 1 つ目の Z テキスト(ztext_y)と 2 つ目のタイトル(title_y)が重ならないよう間隔を確保する。
 SMITH_BLOCK = {
-    'leftbody':  dict(title_y=0.945, rect=[0.685, 0.63, 0.29, 0.29], ztext_y=0.610),
-    'rightbody': dict(title_y=0.585, rect=[0.685, 0.285, 0.29, 0.29], ztext_y=0.265),
+    'leftbody':  dict(title_y=0.950, rect=[0.685, 0.655, 0.29, 0.25], ztext_y=0.638),
+    'rightbody': dict(title_y=0.575, rect=[0.685, 0.285, 0.29, 0.25], ztext_y=0.268),
 }
 _SMITH_CX = 0.685 + 0.29 / 2.0  # スミスチャート中心の figure x 座標(タイトル/Z テキスト用)
 
@@ -449,9 +483,10 @@ if HAS_SMITH:
         axs = fig.add_axes(blk['rect'])
         draw_smith_grid(axs)
         fmin, fmax, npts = freqs[side].min(), freqs[side].max(), len(freqs[side])
+        # タイトルは 1 行に収める(2 行にすると下段チャートのタイトルと重なりやすいため)
         fig.text(_SMITH_CX, blk['title_y'],
-                 f'{st["label"]} S11 Smith Chart\n{fmin:.2f}-{fmax:.2f} MHz ({npts} pts)',
-                 fontsize=9, fontweight='bold', color=st['color'], ha='center', va='top')
+                 f'{st["label"]} S11  {fmin:.1f}-{fmax:.1f} MHz ({npts}pt)',
+                 fontsize=9.5, fontweight='bold', color=st['color'], ha='center', va='top')
         line, = axs.plot([], [], '-', color=st['color'], lw=1.3, zorder=3)
         start_pt, = axs.plot([], [], marker='o', color=st['color'], ms=5, zorder=4)
         marker_pt, = axs.plot([], [], marker='*', color='gold', ms=16,

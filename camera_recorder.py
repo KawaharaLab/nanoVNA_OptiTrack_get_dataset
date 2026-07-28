@@ -100,7 +100,9 @@ class CameraRecorder:
         fps = self.forced_fps or fps_meas or cap.get(cv2.CAP_PROP_FPS)
         if not fps or fps <= 1 or fps > 240:
             fps = 30.0
-        self.fps = float(min(max(fps, 15.0), 60.0))
+        # 整数に丸める: mp4 コンテナが FPS を正確に保持でき、再生側の cap.get(FPS) と
+        # ぴったり一致する(フレーム番号→時刻の換算に誤差が入らない)。下限15・上限60。
+        self.fps = float(int(round(min(max(fps, 15.0), 60.0))))
 
         # 参照フレームの明るさ・コントラストを記録(真っ黒/レンズ塞がりの検知に使う)
         self._assess_frame(frame)
