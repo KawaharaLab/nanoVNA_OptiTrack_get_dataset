@@ -79,6 +79,13 @@ class CameraRecorder:
         if not cap.isOpened():
             raise CameraError("カメラ(index={})を開けませんでした。接続と使用中プロセスを確認してください。".format(self.index))
 
+        # 取得遅延を抑える: ドライバ内部バッファを最小化し、read() が常に最新フレームを
+        # 返すようにする(古いフレームが溜まって遅延が増えるのを防ぐ。ベストエフォート)。
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
         # ウォームアップ: オートexposure が落ち着くまで数フレーム読み捨てつつ、
         # 実測 FPS と参照フレームを得る(最初の数フレームは暗い/黒いことが多いため)。
         frame, fps_meas = self._warmup(cap, self.warmup_sec)

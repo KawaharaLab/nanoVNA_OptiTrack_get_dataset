@@ -133,6 +133,15 @@ class LiveDashboard:
         # 3D 軸の表示範囲(見えた点を包含するよう広げる)
         self._lim = None  # [xmin,xmax,ymin,ymax,zmin,zmax]
 
+        # blit 描画(遅延対策):
+        #   マーカー/ボーン/角度線/スミス線/カメラ映像を animated=True にし、静的背景(3D箱・
+        #   スミス格子・軸)を 1 度だけ描いてキャッシュ。毎ティックは背景復元 + draw_artist + blit
+        #   だけで済ませ、重い全体再描画(~0.24s)を「3D範囲拡大/回転/リサイズ時のみ」に限定する。
+        #   → カメラ映像もマーカーもスミスも ~30fps で滑らかに、低遅延で更新される。
+        self._blit_bg = None            # 静的背景のキャッシュ(draw_event で取り直す)
+        self._fast_ms = max(15, min(self.interval_ms, 33))  # 更新間隔(~30fps)
+        self._video_shape = None        # 直近フレーム形状(extent 再設定の判定用)
+
         self.win = tk.Toplevel(parent)
         self.win.title("ライブ表示（3Dマーカー / 肘角度 / スミス / カメラ）")
         self.win.geometry("1360x820")
@@ -154,7 +163,8 @@ class LiveDashboard:
             self.ax3d = self.fig.add_axes([0.02, 0.34, 0.30, 0.60], projection='3d')
             self.ax_video = self.fig.add_axes([0.34, 0.40, 0.30, 0.52])
             self.ax_video.axis('off')
-            self._video_img = self.ax_video.imshow(np.zeros((10, 10, 3), dtype=np.uint8))
+            self._video_img = self.ax_video.imshow(np.zeros((10, 10, 3), dtype=np.uint8),
+                                                   animated=True)
             self._video_title = self.ax_video.text(
                 0.5, 1.02, 'Camera', transform=self.ax_video.transAxes,
                 ha='center', va='bottom', fontsize=9, fontweight='bold')
@@ -165,32 +175,40 @@ class LiveDashboard:
         self.ax3d.set_xlabel('X'); self.ax3d.set_ylabel('Y'); self.ax3d.set_zlabel('Z')
         self.ax3d.set_xlim(-1, 1); self.ax3d.set_ylim(-1, 1); self.ax3d.set_zlim(-1, 1)
 
-        # 現在フレームのマーカー点
+        # 現在フレームのマーカー点(animated=True: blit で毎ティック描画する)
         self._pts = {}
         for name in MARKER_ORDER:
             st = MARKER_STYLE[name]
             pt, = self.ax3d.plot([], [], [], linestyle='None', marker=st['marker'],
-                                 color=st['color'], ms=9, label=st['label'], zorder=5)
+                                 color=st['color'], ms=9, label=st['label'], zorder=5,
+                                 animated=True)
             self._pts[name] = pt
         # ボーン
         self._bone_lines = [
-            self.ax3d.plot([], [], [], '-', color=c, lw=2.2, zorder=4)[0]
+            self.ax3d.plot([], [], [], '-', color=c, lw=2.2, zorder=4, animated=True)[0]
             for _, _, c in BONES]
         self.ax3d.legend(loc='upper right', fontsize=7, ncol=2)
-        self._time_txt = self.ax3d.text2D(0.02, 0.96, '', transform=self.ax3d.transAxes, fontsize=10)
+        self._time_txt = self.ax3d.text2D(0.02, 0.96, '', transform=self.ax3d.transAxes,
+                                          fontsize=10, animated=True)
         self._angle_txt_r = self.ax3d.text2D(0.02, 0.90, '', transform=self.ax3d.transAxes,
-                                             fontsize=12, color='crimson', fontweight='bold')
+                                             fontsize=12, color='crimson', fontweight='bold',
+                                             animated=True)
         self._angle_txt_l = self.ax3d.text2D(0.02, 0.84, '', transform=self.ax3d.transAxes,
-                                             fontsize=12, color='royalblue', fontweight='bold')
+                                             fontsize=12, color='royalblue', fontweight='bold',
+                                             animated=True)
 
         # --- 肘角度の時系列 ---
+        # x 軸は「現在からの相対秒(-history_sec〜0)」で固定する。データ側を (t-now) で流すことで
+        # 軸スクロールによる全体再描画を避け、線だけ animated=True で blit する。
         self.ax_ang = self.fig.add_axes([0.05, 0.06, 0.55, 0.20])
-        (self._ang_line_r,) = self.ax_ang.plot([], [], color='crimson', lw=1.2, label='R elbow')
-        (self._ang_line_l,) = self.ax_ang.plot([], [], color='royalblue', lw=1.2, label='L elbow')
-        self.ax_ang.set_ylabel('Elbow (°)', fontsize=8)
-        self.ax_ang.set_xlabel('Time (s)', fontsize=8)
+        (self._ang_line_r,) = self.ax_ang.plot([], [], color='crimson', lw=1.2,
+                                               label='R elbow', animated=True)
+        (self._ang_line_l,) = self.ax_ang.plot([], [], color='royalblue', lw=1.2,
+                                               label='L elbow', animated=True)
+        self.ax_ang.set_ylabel('Elbow (deg)', fontsize=8)
+        self.ax_ang.set_xlabel('Time (s, now=0)', fontsize=8)
         self.ax_ang.set_ylim(0, 180)
-        self.ax_ang.set_xlim(0, self.history_sec)
+        self.ax_ang.set_xlim(-self.history_sec, 0)
         self.ax_ang.tick_params(labelsize=7)
         self.ax_ang.grid(True, lw=0.4, alpha=0.5)
         self.ax_ang.legend(loc='upper right', fontsize=7, ncol=2)
@@ -214,63 +232,114 @@ class LiveDashboard:
             draw_smith_grid(axs)
             axs.set_title('{}  S11 Smith  ({:.2f}-{:.2f} MHz)'.format(st['label'], fmin, fmax),
                           fontsize=9, color=st['color'], fontweight='bold')
-            line, = axs.plot([], [], '-', color=st['color'], lw=1.3, zorder=3)
-            start_pt, = axs.plot([], [], marker='o', color=st['color'], ms=5, zorder=4)
+            line, = axs.plot([], [], '-', color=st['color'], lw=1.3, zorder=3, animated=True)
+            start_pt, = axs.plot([], [], marker='o', color=st['color'], ms=5, zorder=4,
+                                 animated=True)
             self._smith_lines[i] = line
             self._smith_start[i] = start_pt
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.win)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self._tkwidget = self.canvas.get_tk_widget()
+        self._tkwidget.pack(fill="both", expand=True)
+
+        # blit で毎ティック描画する animated アーティストの一覧(描画順=下→上)
+        self._anim = list(self._pts.values()) + list(self._bone_lines)
+        for i in sorted(self._smith_lines):
+            self._anim.append(self._smith_lines[i])
+            self._anim.append(self._smith_start[i])
+        self._anim += [self._ang_line_r, self._ang_line_l,
+                       self._time_txt, self._angle_txt_r, self._angle_txt_l]
+        if self.has_video:
+            self._anim.append(self._video_img)
+
+        # 全体描画が起きるたび(初回/範囲拡大/回転/リサイズ)に静的背景を取り直す。
+        self.canvas.mpl_connect('draw_event', self._on_draw)
         self.canvas.draw()
 
     # ------------------------------------------------------------------ #
     # 3D 軸範囲を見えた点を含むよう広げる
     # ------------------------------------------------------------------ #
     def _grow_limits(self, pts_xyz):
+        """見えた点を含むよう 3D 範囲を広げる。範囲が実際に変わったら True を返す
+        (True のときだけ背景の取り直し=全体再描画が必要になる)。"""
         if not pts_xyz:
-            return
+            return False
         arr = np.asarray(pts_xyz, float)
         lo = arr.min(axis=0)
         hi = arr.max(axis=0)
-        if self._lim is None:
-            self._lim = [lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]]
-        else:
-            self._lim[0] = min(self._lim[0], lo[0]); self._lim[1] = max(self._lim[1], hi[0])
-            self._lim[2] = min(self._lim[2], lo[1]); self._lim[3] = max(self._lim[3], hi[1])
-            self._lim[4] = min(self._lim[4], lo[2]); self._lim[5] = max(self._lim[5], hi[2])
+        new = [float(lo[0]), float(hi[0]), float(lo[1]), float(hi[1]), float(lo[2]), float(hi[2])]
+        if self._lim is not None:
+            new = [min(self._lim[0], new[0]), max(self._lim[1], new[1]),
+                   min(self._lim[2], new[2]), max(self._lim[3], new[3]),
+                   min(self._lim[4], new[4]), max(self._lim[5], new[5])]
+        if self._lim == new:
+            return False
+        self._lim = new
         pad = 0.05
-        xr = (self._lim[0] - pad, self._lim[1] + pad)
-        yr = (self._lim[2] - pad, self._lim[3] + pad)
-        zr = (self._lim[4] - pad, self._lim[5] + pad)
-        if xr[1] > xr[0]:
-            self.ax3d.set_xlim(*xr)
-        if yr[1] > yr[0]:
-            self.ax3d.set_ylim(*yr)
-        if zr[1] > zr[0]:
-            self.ax3d.set_zlim(*zr)
+        if new[1] + pad > new[0] - pad:
+            self.ax3d.set_xlim(new[0] - pad, new[1] + pad)
+        if new[3] + pad > new[2] - pad:
+            self.ax3d.set_ylim(new[2] - pad, new[3] + pad)
+        if new[5] + pad > new[4] - pad:
+            self.ax3d.set_zlim(new[4] - pad, new[5] + pad)
+        return True
 
     # ------------------------------------------------------------------ #
     # 定期更新(高速タイマー。掃引レートに非依存)
     # ------------------------------------------------------------------ #
-    def _schedule(self):
+    def _schedule(self, delay_ms=None):
         if self._closed:
             return
-        self._after_id = self.win.after(self.interval_ms, self._tick)
+        if delay_ms is None:
+            delay_ms = self._fast_ms
+        self._after_id = self.win.after(int(delay_ms), self._tick)
+
+    def _on_draw(self, _event):
+        """全体描画のたびに静的背景を保存する(animated アーティストは含まれない)。"""
+        try:
+            self._blit_bg = self.canvas.copy_from_bbox(self.fig.bbox)
+        except Exception:
+            self._blit_bg = None
 
     def _tick(self):
         if self._closed:
             return
+        t0 = time.perf_counter()
         try:
-            self._update()
-            # draw_idle ではなく同期 draw を使う。描画完了後に次を予約することで、
-            # 「描画(数百ms)より短い間隔で次ティックが溜まって再入・ビジーループ」になるのを防ぐ。
-            self.canvas.draw()
+            grew = self._refresh()   # 最新値を各 animated アーティストへ(set_data。安価)
+            # 背景が無い/3D範囲や映像サイズが変わったときだけ重い全体再描画で背景を取り直す。
+            if self._blit_bg is None or grew:
+                self.canvas.draw()   # -> draw_event -> _on_draw が背景を保存
+            # 毎ティック: 背景復元 + animated アーティストのみ描画 + 各軸領域を blit(低コスト)。
+            if self._blit_bg is not None:
+                self.canvas.restore_region(self._blit_bg)
+                axes_seen = []
+                for art in self._anim:
+                    ax = art.axes
+                    try:
+                        ax.draw_artist(art)
+                    except Exception:
+                        pass
+                    if ax not in axes_seen:
+                        axes_seen.append(ax)
+                for ax in axes_seen:
+                    self.canvas.blit(ax.bbox)
+                # blit 結果を画面へ反映する。flush_events(~19ms・入力処理も走り重い)ではなく
+                # update_idletasks(再描画のみ・入力は処理しない=軽く再入もしない)を使う。
+                try:
+                    self._tkwidget.update_idletasks()
+                except Exception:
+                    pass
         except Exception:
             # 描画中の一時的な例外で計測を止めない(次のティックで回復)
             pass
-        self._schedule()
+        # 次ティックを適応的に予約する: 1 フレーム(_fast_ms)の残り時間だけ待つ。
+        # 描画が _fast_ms を超えても最低 5ms は空けて他のイベント処理に譲る(ビジーループ防止)。
+        work_ms = (time.perf_counter() - t0) * 1000.0
+        self._schedule(max(5, self._fast_ms - work_ms))
 
-    def _update(self):
+    def _refresh(self):
+        """最新の共有状態を各 animated アーティストへ反映する。3D 範囲が広がったら True。"""
         now = time.perf_counter() - self._t0
 
         # --- マーカー座標 ---
@@ -301,9 +370,9 @@ class LiveDashboard:
             else:
                 line.set_data(np.array([pa[0], pb[0]]), np.array([pa[1], pb[1]]))
                 line.set_3d_properties(np.array([pa[2], pb[2]]))
-        self._grow_limits(seen)
+        grew = self._grow_limits(seen)
 
-        # --- 肘角度 ---
+        # --- 肘角度(テキスト + 相対時系列) ---
         ang_r = _elbow_angle(cur.get('R_upperarm'), cur.get('R_joint'), cur.get('R_forearm'))
         ang_l = _elbow_angle(cur.get('L_upperarm'), cur.get('L_joint'), cur.get('L_forearm'))
         self._time_txt.set_text('Time: {:.2f} s'.format(now))
@@ -311,18 +380,15 @@ class LiveDashboard:
             '{:.1f}°'.format(ang_r) if np.isfinite(ang_r) else 'N/A'))
         self._angle_txt_l.set_text('L Elbow: {}'.format(
             '{:.1f}°'.format(ang_l) if np.isfinite(ang_l) else 'N/A'))
-
         self._hist_t.append(now)
         self._hist_r.append(ang_r)
         self._hist_l.append(ang_l)
         while self._hist_t and (now - self._hist_t[0]) > self.history_sec:
             self._hist_t.popleft(); self._hist_r.popleft(); self._hist_l.popleft()
-        t_arr = np.fromiter(self._hist_t, float)
+        # x 軸は固定(-history_sec〜0)。データを (t-now) で流すので軸再描画は不要。
+        t_arr = np.fromiter(self._hist_t, float) - now
         self._ang_line_r.set_data(t_arr, np.fromiter(self._hist_r, float))
         self._ang_line_l.set_data(t_arr, np.fromiter(self._hist_l, float))
-        if t_arr.size:
-            lo = max(0.0, now - self.history_sec)
-            self.ax_ang.set_xlim(lo, max(lo + self.history_sec, now))
 
         # --- スミスチャート(各チャンネルの最新掃引 Γ=S11) ---
         for i, line in self._smith_lines.items():
@@ -345,10 +411,12 @@ class LiveDashboard:
             if frame is not None:
                 rgb = frame[:, :, ::-1]  # BGR -> RGB
                 self._video_img.set_data(rgb)
-                self._video_img.set_extent((0, rgb.shape[1], rgb.shape[0], 0))
-                self._video_title.set_text('Camera (live)')
-            else:
-                self._video_title.set_text('Camera: no frame')
+                if self._video_shape != rgb.shape:
+                    self._video_img.set_extent((0, rgb.shape[1], rgb.shape[0], 0))
+                    self._video_shape = rgb.shape
+                    self._video_title.set_text('Camera (live)')
+                    grew = True   # extent 変更は背景の取り直しが必要
+        return grew
 
     # ------------------------------------------------------------------ #
     # クローズ
