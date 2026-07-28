@@ -345,7 +345,8 @@ def fmt_angle(v):
 # レイアウト
 #   左 : 動画パネル
 #   中央上 : 3D マーカービュー / 中央下 : 肘角度の時系列
-#   右 : スミスチャート 2 つ(縦積み) / その下 : 周波数スライダー
+#   右上 : スミスチャート 2 つ(左右並び) / 右中 : 左右インピーダンスの相対誤差(右基準)
+#          / その下 : 周波数スライダー
 #   下部(全幅): 時間(フレーム)スライダー ＋ Play / フレーム番号入力
 # ------------------------------------------------------------------ #
 fig = plt.figure(figsize=(16, 9))
@@ -353,7 +354,7 @@ fig.suptitle('Dataset + Video Playback Viewer', fontsize=14, fontweight='bold')
 
 # --- 左: 動画パネル ---
 if HAS_VIDEO:
-    ax_video = fig.add_axes([0.015, 0.30, 0.31, 0.60])
+    ax_video = fig.add_axes([0.015, 0.30, 0.26, 0.60])
     ax_video.axis('off')
     video_img = ax_video.imshow(np.zeros((10, 10, 3), dtype=np.uint8), animated=True)
     video_title = ax_video.text(0.5, 1.02, '', transform=ax_video.transAxes,
@@ -362,10 +363,10 @@ else:
     ax_video = None
 
 # --- 中央上: 3D マーカービュー ---
-ax = fig.add_axes([0.35, 0.50, 0.30, 0.44], projection='3d')
+ax = fig.add_axes([0.30, 0.50, 0.26, 0.44], projection='3d')
 
 # --- 中央下: 肘角度の時系列(3D の真下) ---
-ax_ang = fig.add_axes([0.37, 0.29, 0.26, 0.16])
+ax_ang = fig.add_axes([0.31, 0.29, 0.24, 0.16])
 ax_ang.plot(timestamps, angles['R'], color='crimson',   lw=1.2, alpha=0.85, label='R elbow')
 ax_ang.plot(timestamps, angles['L'], color='royalblue', lw=1.2, alpha=0.85, label='L elbow')
 ax_ang.set_ylabel('Elbow (°)', fontsize=8)
@@ -436,19 +437,17 @@ angle_txt_l = ax.text2D(0.02, 0.84, '', transform=ax.transAxes, fontsize=12,
                         color='royalblue', fontweight='bold')
 
 # ------------------------------------------------------------------ #
-# スミスチャート(右: 縦積み 2 つ)
+# スミスチャート(右上: 左右並び 2 つ)
 # ------------------------------------------------------------------ #
 SMITH_STYLE = {
     'leftbody':  dict(color='royalblue', label='Left Body'),
     'rightbody': dict(color='crimson',   label='Right Body'),
 }
-# 右カラムに 2 つ縦積み。タイトルは各チャート上(1 行)、Z 読み出しは各チャート下に置く。
-# 1 つ目の Z テキスト(ztext_y)と 2 つ目のタイトル(title_y)が重ならないよう間隔を確保する。
+# 右上に 2 つ左右並び。各ブロックに中心 x(cx)を持たせ、タイトルは上・Z 読み出しは下に置く。
 SMITH_BLOCK = {
-    'leftbody':  dict(title_y=0.950, rect=[0.685, 0.655, 0.29, 0.25], ztext_y=0.638),
-    'rightbody': dict(title_y=0.575, rect=[0.685, 0.285, 0.29, 0.25], ztext_y=0.268),
+    'leftbody':  dict(rect=[0.605, 0.61, 0.175, 0.255], cx=0.6925, title_y=0.945, ztext_y=0.596),
+    'rightbody': dict(rect=[0.805, 0.61, 0.175, 0.255], cx=0.8925, title_y=0.945, ztext_y=0.596),
 }
-_SMITH_CX = 0.685 + 0.29 / 2.0  # スミスチャート中心の figure x 座標(タイトル/Z テキスト用)
 
 
 def draw_smith_grid(ax_s):
@@ -483,20 +482,56 @@ if HAS_SMITH:
         axs = fig.add_axes(blk['rect'])
         draw_smith_grid(axs)
         fmin, fmax, npts = freqs[side].min(), freqs[side].max(), len(freqs[side])
-        # タイトルは 1 行に収める(2 行にすると下段チャートのタイトルと重なりやすいため)
-        fig.text(_SMITH_CX, blk['title_y'],
-                 f'{st["label"]} S11  {fmin:.1f}-{fmax:.1f} MHz ({npts}pt)',
-                 fontsize=9.5, fontweight='bold', color=st['color'], ha='center', va='top')
+        fig.text(blk['cx'], blk['title_y'],
+                 f'{st["label"]} S11\n{fmin:.1f}-{fmax:.1f} MHz ({npts}pt)',
+                 fontsize=9, fontweight='bold', color=st['color'], ha='center', va='top')
         line, = axs.plot([], [], '-', color=st['color'], lw=1.3, zorder=3)
         start_pt, = axs.plot([], [], marker='o', color=st['color'], ms=5, zorder=4)
         marker_pt, = axs.plot([], [], marker='*', color='gold', ms=16,
                               markeredgecolor=st['color'], markeredgewidth=1.3, zorder=6)
-        txt = fig.text(_SMITH_CX, blk['ztext_y'], '', fontsize=9.5,
+        txt = fig.text(blk['cx'], blk['ztext_y'], '', fontsize=8.5,
                        ha='center', va='top', color=st['color'], fontweight='bold')
         smith_lines[side] = line
         smith_start_pts[side] = start_pt
         freq_marker_pts[side] = marker_pt
         freq_txt[side] = txt
+
+# ------------------------------------------------------------------ #
+# 左右インピーダンスの相対誤差(右基準)グラフ(スミスチャート 2 つの下)
+#   各周波数で rel(f) = |Z_left(f) - Z_right(f)| / |Z_right(f)| * 100 [%]。
+#   右(rightbody)を基準(分母)にした、左右インピーダンスの相対誤差。フレームごとに更新する。
+# ------------------------------------------------------------------ #
+HAS_ERR = HAS_SMITH and ('leftbody' in SIDES) and ('rightbody' in SIDES)
+err_line = None
+if HAS_ERR:
+    _nerr = min(len(freqs['leftbody']), len(freqs['rightbody']))
+    err_freqs = np.asarray(freqs['leftbody'][:_nerr], dtype=float)
+    # 全フレームの相対誤差から y 上限を決める(外れ値は 99 パーセンタイルで抑制)
+    _zl_all = z_real['leftbody'][:, :_nerr] + 1j * z_react['leftbody'][:, :_nerr]
+    _zr_all = z_real['rightbody'][:, :_nerr] + 1j * z_react['rightbody'][:, :_nerr]
+    _rel_all = np.abs(_zl_all - _zr_all) / (np.abs(_zr_all) + 1e-12) * 100.0
+    _emax = np.nanpercentile(_rel_all, 99) if np.any(np.isfinite(_rel_all)) else 100.0
+    ax_err = fig.add_axes([0.635, 0.335, 0.35, 0.155])
+    (err_line,) = ax_err.plot([], [], color='purple', lw=1.4)
+    ax_err.set_xlim(float(err_freqs.min()), float(err_freqs.max()))
+    ax_err.set_ylim(0, max(float(_emax) * 1.1, 1.0))
+    ax_err.set_xlabel('Frequency (MHz)', fontsize=8)
+    ax_err.set_ylabel('|Z_L - Z_R| / |Z_R|  [%]', fontsize=8)
+    ax_err.set_title('L vs R impedance relative error (ref: Right)',
+                     fontsize=9, fontweight='bold')
+    ax_err.tick_params(labelsize=7)
+    ax_err.grid(True, lw=0.4, alpha=0.5)
+
+
+def update_err_display(idx):
+    """現在フレームの左右インピーダンス相対誤差(右基準)を周波数ごとにプロットする。"""
+    if not HAS_ERR:
+        return
+    zl = z_real['leftbody'][idx, :_nerr] + 1j * z_react['leftbody'][idx, :_nerr]
+    zr = z_real['rightbody'][idx, :_nerr] + 1j * z_react['rightbody'][idx, :_nerr]
+    rel = np.abs(zl - zr) / (np.abs(zr) + 1e-12) * 100.0
+    mask = np.isfinite(rel)
+    err_line.set_data(err_freqs[mask], rel[mask])
 
 # ------------------------------------------------------------------ #
 # ウィジェット
@@ -523,7 +558,7 @@ if HAS_SMITH:
     _fmin, _fmax = float(_all_freqs.min()), float(_all_freqs.max())
     _fstep = float(np.min([np.diff(freqs[side]).min() for side in SIDES if len(freqs[side]) > 1] or [0.01]))
     _finit = float(np.clip(DEFAULT_FREQ_MHZ, _fmin, _fmax))
-    ax_freq = fig.add_axes([0.70, 0.215, 0.26, 0.02])
+    ax_freq = fig.add_axes([0.68, 0.265, 0.28, 0.02])
     freq_slider = Slider(ax_freq, 'Freq (MHz)', _fmin, _fmax,
                          valinit=_finit, valstep=_fstep, color='seagreen', valfmt='%.2f')
     state['freq'] = _finit
@@ -587,6 +622,7 @@ def draw_markers_smith(idx):
             else:
                 smith_start_pts[side].set_data([], [])
         update_freq_display()
+        update_err_display(idx)
 
 
 def full_redraw(idx):
