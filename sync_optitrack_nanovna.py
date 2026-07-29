@@ -235,7 +235,7 @@ NATNET_USE_MULTICAST = False    # 同一PCループバックは Unicast 推奨
 
 #EXPECTED_MARKER_NAMES = ["R_joint",  "R_forearm","chest","L_forearm", "L_joint","L_upperarm","R_upperarm",]
 
-EXPECTED_MARKER_NAMES = ["R_forearm","R_joint","R_upperarm","chest","L_upperarm","L_joint","L_forearm",]
+EXPECTED_MARKER_NAMES = ["chest","R_upperarm","L_upperarm","R_joint","R_forearm","L_forearm","L_joint",]
 
 # 座標取得のソース:
 #   "labeled_marker" : ラベル付きマーカーを marker_id(1..N)で EXPECTED_MARKER_NAMES に対応付ける。
