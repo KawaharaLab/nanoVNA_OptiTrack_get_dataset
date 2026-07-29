@@ -2,24 +2,26 @@
 
 メアンダコイル服（ウェアラブルアンテナ／コイル）の**3次元位置**と**高周波特性（S11・インピーダンス）**を、同一 Windows PC 上で同時かつ同期的に取得し、機械学習・解析用の CSV データセットとして保存するための Python アプリケーションです。
 
-位置トラッキングは身体に取り付けた **7 個のラベル付きマーカー**（**R_forearm / R_joint / R_upperarm / chest / L_forearm / L_joint / L_upperarm**）を対象とします。**Motive 側で各マーカーにラベル（名前）を付けてアセット配信**し、本システムは**ラベル付きマーカーの `marker_id`（1〜7）を名前に対応付けて**座標を取得します（後述「ラベル認識の仕組み」）。
+位置トラッキングは身体に取り付けた **7 個のラベル付きマーカー**（**R_forearm / R_joint / R_upperarm / chest / L_forearm / L_joint / L_upperarm** の 7 部位）を対象とします。**Motive 側で各マーカーにラベル（名前）を付けてアセット配信**し、本システムは**ラベル付きマーカーの `marker_id`（1〜7）を名前に対応付けて**座標を取得します（後述「ラベル認識の仕組み」）。この `marker_id` と部位の対応は Motive 側の設定次第で変わるため、**スクリプトの `EXPECTED_MARKER_NAMES` を Motive に合わせる作業が必要**です（[§6.1](#61-motive-側との整合合わせ毎回必要になりうる作業)）。
 
 VNA は **nanoVNA を 2 台同時に接続**でき、それぞれ別の対象（**leftbody / rightbody**）の S11 を並行して計測します（チャンネル名・台数は `VNA_CHANNEL_NAMES` で変更可能）。各 VNA は **6–20 MHz を 101 点で掃引**し、毎フレーム 101 点分の S11 を取得して `scikit-rf` でインピーダンス **Z11** に変換します。OptiTrack の 7 マーカーの座標と **2 台ぶんの掃引データ**をマルチスレッドかつスレッドセーフに結合し、**1 行に「位置情報 ＋ leftbody の掃引 ＋ rightbody の掃引」を並べた**以下の形式で記録します（VNA 列は `leftbody_` / `rightbody_` で区別され、どちらの対象のインピーダンスか判別できます）。
 
 ```
 [Timestamp,
- R_forearm_X,  R_forearm_Y,  R_forearm_Z,
- R_joint_X,    R_joint_Y,    R_joint_Z,
- R_upperarm_X, R_upperarm_Y, R_upperarm_Z,
- chest_X,      chest_Y,      chest_Z,
- L_forearm_X,  L_forearm_Y,  L_forearm_Z,
- L_joint_X,    L_joint_Y,    L_joint_Z,
- L_upperarm_X, L_upperarm_Y, L_upperarm_Z,
- leftbody_S11_Real_12.5,  leftbody_S11_Imag_12.5,  leftbody_Z_R_12.5,  leftbody_Z_X_12.5,
+ （7 マーカー × X/Y/Z = 21 列。並び順は EXPECTED_MARKER_NAMES = marker_id の順）
+ <marker1>_X, <marker1>_Y, <marker1>_Z,
+ <marker2>_X, <marker2>_Y, <marker2>_Z,
+ ...
+ <marker7>_X, <marker7>_Y, <marker7>_Z,
+ leftbody_S11_Real_6,  leftbody_S11_Imag_6,  leftbody_Z_R_6,  leftbody_Z_X_6,
  ... (leftbody の各掃引周波数ごとに 4 列, 終了周波数まで) ...,
- rightbody_S11_Real_12.5, rightbody_S11_Imag_12.5, rightbody_Z_R_12.5, rightbody_Z_X_12.5,
+ rightbody_S11_Real_6, rightbody_S11_Imag_6, rightbody_Z_R_6, rightbody_Z_X_6,
  ... (rightbody の各掃引周波数ごとに 4 列, 終了周波数まで) ...]
 ```
+
+> **【重要】位置列の並び順は固定ではなく、`EXPECTED_MARKER_NAMES` に書かれた順序がそのまま使われます。** Motive 側で**トレーニング済みマーカー（アセット／マーカーセット）を作り直すたびに `marker_id` の割り当てが変わりうる**ため、**そのつど診断ログで実際の `marker_id` ↔ 部位の対応を確認し、`EXPECTED_MARKER_NAMES` を Motive 側に合わせて並べ替えてください**。手順は [§6.1](#61-motive-側との整合合わせ毎回必要になりうる作業)。
+>
+> 本 README 中に出てくるマーカー名の並びは**すべて説明用のサンプル**です。README の例と実コードの並びが一致していなくても問題ありません（一致させるべきなのは「コードと Motive」であって「コードと README」ではありません）。**解析時は列名で参照し、列位置の決め打ちは避けてください。**
 
 計測中は GUI 上に **leftbody / rightbody それぞれのスミスチャート**（S11=反射係数 Γ をプロット）がリアルタイム表示され、さらに **GUI で指定した「読み取り周波数」でのインピーダンス Z = R + jX を各 body について数値表示**します。腕を動かすと整合のずれ（Γ の軌跡・共振点の移動）が視覚的に確認でき、狙った周波数での R/X 値も即座に読み取れます。
 
@@ -105,7 +107,7 @@ VNA は **nanoVNA を 2 台同時に接続**でき、それぞれ別の対象（
 |------|------|------|
 | **Windows PC（ThinkPad）** | Motive と Python スクリプトを同時実行する計測ホスト | 後述の通り高負荷になるため、できる限り高性能な機体を推奨 |
 | **OptiTrack システム（カメラ群 + Motive）** | 身体に取り付けた 7 個のラベル付きマーカーの 3 次元位置をリアルタイム取得 | Motive のライセンスおよびキャリブレーション済みのキャプチャ空間が必要。マーカーのラベリング（マーカーセット）が必要 |
-| **JNCRadio VNA 3G ×2** | 12.5–14.5 MHz を掃引して S11（反射係数）を測定 | **2 台**を別々の USB ポートに接続し、それぞれ別の対象を同時計測（各台が別の仮想 COM ポートとして認識される）。1 台のみでの運用も可 |
+| **JNCRadio VNA 3G ×2** | 指定範囲（既定 6–20 MHz）を掃引して S11（反射係数）を測定 | **2 台**を別々の USB ポートに接続し、それぞれ別の対象を同時計測（各台が別の仮想 COM ポートとして認識される）。1 台のみでの運用も可 |
 | **メアンダコイル服（DUT）** | 被測定物 | 各 VNA の **PORT1**（S11 測定ポート）に接続。左右の前腕・関節・上腕と胸に各 1 個、計 7 個の反射マーカーを貼付 |
 | **ウェブカメラ（任意）** | 動きの様子を動画で記録し、計測中はライブ表示、後から時刻でデータと同期 | **［計測開始］と連動してこのシステムが OpenCV で録画**（要 `opencv-python`）。計測中は別ウィンドウにライブ表示。CSV の絶対時刻 `WallClock` と突き合わせて同期。→ [5.4](#54-カメラ録画とライブ表示計測と連動) |
 
@@ -134,7 +136,7 @@ pip install pyserial scikit-rf matplotlib numpy pandas opencv-python
 | `scikit-rf`（skrf） | **必須**。掃引した S11 をインピーダンス Z11 に変換 |
 | `matplotlib` | **必須**。GUI 内のリアルタイムグラフ描画 |
 | `numpy` | **必須**。配列演算（skrf/matplotlib の依存でもある） |
-| `pandas` | 取得後のデータセットの読み込み・解析（後処理用、計測本体には任意） |
+| `pandas` | **再生ビューア `playback_viewer.py` に必須**。取得後のデータセットの読み込み・解析にも使う（計測本体には不要） |
 | `opencv-python`（cv2） | **カメラ録画・ライブ映像・フレーム抽出に必要**（[5.4](#54-カメラ録画とライブ表示計測と連動)）。カメラを使わない計測では不要 |
 
 > **補足:** 計測本体の動作には `pyserial` / `scikit-rf` / `matplotlib` / `numpy` が必要です（`scikit-rf` をインストールすると `numpy` / `scipy` / `matplotlib` も併せて入ります）。`pandas` は取得済み CSV の後処理用で任意です。`opencv-python` は webカメラの録画・ライブ映像表示・フレーム抽出に使います（未導入ならカメラ機能だけがスキップされ、計測自体は動きます）。
@@ -155,7 +157,11 @@ OptiTrack との通信には、OptiTrack が公式に配布する **NatNet SDK �
 ```
 # (A) 同梱 SDK 構成（このリポジトリの構成）
 nanoVNA_OptiTrack_get_dataset/
-├── sync_optitrack_nanovna.py
+├── sync_optitrack_nanovna.py     # 計測本体（GUI）。これを実行する
+├── camera_recorder.py            # webカメラの録画・ライブフレーム供給（本体が import）
+├── live_dashboard.py             # 計測中のライブ表示ダッシュボード（本体が import）
+├── sync_video_with_dataset.py    # 後処理: CSV に video_time_sec / in_video を付与
+├── playback_viewer.py            # 後処理: CSV + 動画の同期再生ビューア
 ├── README.md
 └── NatNetSDK/
     └── Samples/
@@ -167,11 +173,17 @@ nanoVNA_OptiTrack_get_dataset/
 # (B) 手動配置構成
 nanoVNA_OptiTrack_get_dataset/
 ├── sync_optitrack_nanovna.py
+├── camera_recorder.py
+├── live_dashboard.py
+├── sync_video_with_dataset.py
+├── playback_viewer.py
 ├── NatNetClient.py
 ├── MoCapData.py
 ├── DataDescriptions.py
 └── README.md
 ```
+
+> `camera_recorder.py` / `live_dashboard.py` は計測本体と**同じフォルダ**に置いてください（本体が起動時に import します）。読み込めない場合はコンソールに `[WARN] ... を読み込めません` が出て、**カメラ録画／ライブ表示だけが無効になり、計測自体は続行**します。
 
 > **対応バージョン:** 本スクリプトは **NatNet 4.x（Motive 3.1 系）** の `NatNetClient.py` に合わせて実装しています。フレーム受信には `new_frame_with_data_listener`（`data_dict["mocap_data"]` に `MoCapData` を渡す）を使用します。
 
@@ -195,6 +207,9 @@ Motive を起動し、キャプチャ空間のキャリブレーションを済�
 4. マーカーが隠れる（オクルージョン）とそのマーカーは occluded フラグ付き、または一覧から消える／`(0,0,0)` で配信されるため、本システムはそのサンプルを破棄します。**7 個すべてがカメラから安定して見える**配置・姿勢で計測してください。
 
 > **ラベリングが必要です。** 高さによる自動判別は廃止したため、Motive 側でマーカーをラベル付けし、アセット（またはマーカーセット）として配信する設定が前提になります。
+
+> **【重要】`marker_id` は Motive 側で決まる番号で、アセットを作り直すと変わりえます。**
+> Motive でトレーニング済みマーカー（アセット）を作り直すたびに `marker_id` と部位の対応が入れ替わる可能性があり、**スクリプト側の `EXPECTED_MARKER_NAMES` をそのつど Motive に合わせ直す必要があります**。合っていなくてもエラーにはならず、名前と座標が入れ替わったまま記録されるので注意してください。確認・修正の具体的な手順は [§6.1](#61-motive-側との整合合わせ毎回必要になりうる作業) にまとめてあります。
 
 #### (b) Data Streaming の設定
 
@@ -232,7 +247,7 @@ S11 を正確に測定するため、**計測を開始する前に本体側で�
    - **L** = Load（50 Ω 終端負荷）
    - **T** = Through（PORT1–PORT2 間。S11 のみであれば省略可）
 2. マニュアル §4.4 / §7.2.14（`cal` コマンド）の手順に従い、各標準器を接続して校正を実施します。校正後は必ず校正データを保存（`save {id}` または本体メニュー）してください。
-3. 掃引範囲（12.5–14.5 MHz）全体を含む周波数範囲で校正されていることを確認します。
+3. 実際に使う掃引範囲（既定 6–20 MHz。GUI で変更した場合はその範囲）全体を含む周波数範囲で校正されていることを確認します。
 
 > **重要:** 未校正のまま測定すると S11 が不正確になり、後段で算出されるインピーダンス Z も信頼できない値になります。データセットの品質を担保するため、校正は必ず実施してください。
 
@@ -264,12 +279,14 @@ VNA_ALTERNATE_SWEEP = True
 
 # --- 掃引（スイープ）条件の既定値（実際の値は GUI で指定する） ---
 # 開始/終了周波数・点数は GUI 入力欄の初期値。[計測開始]時に画面の値が採用される。
-SWEEP_START_HZ = 12_500_000    # 掃引開始 [Hz]（12.5 MHz）= GUI 初期値
-SWEEP_STOP_HZ  = 14_500_000    # 掃引終了 [Hz]（14.5 MHz）= GUI 初期値
+SWEEP_START_HZ = 6_000_000     # 掃引開始 [Hz]（6 MHz）= GUI 初期値
+SWEEP_STOP_HZ  = 20_000_000    # 掃引終了 [Hz]（20 MHz）= GUI 初期値
 SCAN_POINTS    = 101           # 掃引点数 = GUI 初期値
-POINTS_MIN = 2                 # 点数スピンボックスの最小（1 刻みで任意指定可）
+POINTS_MIN = 1                 # 点数スピンボックスの最小（1 = 単一周波数ピンポイント測定）
 POINTS_MAX = 100_000           # 点数スピンボックスの上限
-TARGET_FREQ_HZ = 13_560_000    # 参考: グラフの縦線マーカー（13.56 MHz）
+SINGLE_DEVICE_POINTS = 2       # 1点モードで実機へ投げる scan の点数（縮退 scan 回避のため 2 点を平均）
+TIME_PLOT_WINDOW = 300         # 1点モードの時系列グラフが保持する直近サンプル数
+TARGET_FREQ_HZ = 13_560_000    # 「読み取り周波数[MHz]」欄の初期値 兼 グラフの参考縦線（13.56 MHz）
 
 # --- 計測する S パラメータ（S11 固定） ---
 # scan の outmask: bit0(=1)=周波数, bit1(=2)=S11 →「周波数+S11」(=3) を出力させる。
@@ -284,11 +301,17 @@ NATNET_USE_MULTICAST = False    # 同一PCループバックは Unicast 推奨�
 # --- マーカーの識別（ラベル認識）方式 ---
 # marker_id（アセット内の 1 始まりの番号）の並びと同じ順序でラベル名を列挙する。
 # marker_id=i のマーカー -> EXPECTED_MARKER_NAMES[i-1]。CSV の位置列もこの順序。
-# 実際の対応は起動直後の診断ログ（MARKER_DIAGNOSTIC_FRAMES）で確認して合わせる。
+#
+# 【重要】この並びは Motive 側の配信に合わせる「環境依存の設定値」であり、固定値ではない。
+# Motive でトレーニング済みマーカー（アセット／マーカーセット）を作り直すと marker_id の
+# 割り当てが変わりうるため、そのたびに起動直後の診断ログ（MARKER_DIAGNOSTIC_FRAMES）で
+# marker_id と部位の対応を確認し、ここを Motive 側に合わせて並べ替えること。
+# 下記は記述例（実際のリポジトリのコードは現在の Motive 環境に合わせた並びになっている）。
 EXPECTED_MARKER_NAMES = [
-    "R_forearm", "R_joint", "R_upperarm",
     "chest",
-    "L_forearm", "L_joint", "L_upperarm",
+    "R_upperarm", "L_upperarm",
+    "R_joint", "R_forearm",
+    "L_forearm", "L_joint",
 ]
 # 座標取得のソース: "labeled_marker"（marker_id で対応付け）/ "marker_set"（セット内の並び順）
 MARKER_SOURCE = "labeled_marker"
@@ -301,9 +324,19 @@ MARKER_SET_NAME = ""
 OCCLUSION_ORIGIN_EPS = 1e-6
 # 起動直後に受信フレームの構造をログ出力する回数（0 で無効）。並び順・形式の確認に使う。
 MARKER_DIAGNOSTIC_FRAMES = 5
+# NatNet のフレームがこの秒数届かなければ「ストリーミング途絶」として警告する。
+STREAM_STALE_SEC = 2.0
 
 # --- 出力 ---
 OUTPUT_CSV = "sync_dataset.csv" # 保存ダイアログに出す初期ファイル名（実際の保存先は実行時に選択）
+
+# --- シリアル通信の粘り強さ（無応答対策。§7.5b） ---
+SERIAL_CONNECT_ATTEMPTS = 3    # 接続失敗時にポートを開き直して再試行する回数
+SERIAL_STALL_SEC        = 2.5  # 応答が途切れてから「無応答」とみなすまでの秒数
+VNA_STALL_LOST_FAILS    = 8    # 連続失敗がこの回数に達したら計測を止めて保存へ移る
+
+# --- VNAなしテストモード ---
+TEST_MODE_INTERVAL_SEC = 0.1   # テストモード時の 1 サンプル間隔[秒]（VNA の律速が無いため）
 ```
 
 最低限、以下を環境に合わせて変更してください。
@@ -314,8 +347,8 @@ OUTPUT_CSV = "sync_dataset.csv" # 保存ダイアログに出す初期ファイ�
 | `VNA_ALTERNATE_SWEEP` | `True`（既定）で **1 台ずつ順番に掃引**（RF 干渉対策）。`False` で並列同時掃引（高速だが 2 台同時だと干渉しうる） |
 | `NANOVNA_PORT` | COM ポート一覧の初期選択候補（実際の接続先は **GUI で各チャンネルごとに選択**するため必須ではない） |
 | `SWEEP_START_HZ` / `SWEEP_STOP_HZ` / `SCAN_POINTS` | 掃引条件の **GUI 初期値**（全 VNA 共通。実際の値は画面の入力欄で指定。CSV 列数・グラフ点数は指定点数に追従） |
-| `TARGET_FREQ_HZ` | グラフに引く参考縦線の周波数（既定 13.56 MHz） |
-| `EXPECTED_MARKER_NAMES` | 計測対象マーカーの名前を **`marker_id` の並び**で列挙（`marker_id=i` → `[i-1]`）。CSV 位置列の順序も兼ねる |
+| `TARGET_FREQ_HZ` | GUI「読み取り周波数[MHz]」欄の初期値／グラフに引く参考縦線の周波数（既定 13.56 MHz） |
+| `EXPECTED_MARKER_NAMES` | 計測対象マーカーの名前を **`marker_id` の並び**で列挙（`marker_id=i` → `[i-1]`）。CSV 位置列の順序も兼ねる。**Motive 側のアセットを作り直すたびに要確認・要更新**（下の注意を参照） |
 | `MARKER_SOURCE` | 座標取得のソース。`"labeled_marker"`（既定）または `"marker_set"` |
 | `MARKER_MODEL_ID` | `labeled_marker` で対象アセットを限定する model_id（`None` で無制限。診断ログの `model=` を指定） |
 | `MARKER_SET_NAME` | `marker_set` 使用時のセット名（`""` で自動選択：マーカー数が一致するセット、`all` は除外） |
@@ -323,7 +356,16 @@ OUTPUT_CSV = "sync_dataset.csv" # 保存ダイアログに出す初期ファイ�
 
 > **COM ポートについて:** どの COM ポートに接続するかは **GUI のドロップダウン（VNA チャンネルごとに 1 つ）で選択**します（コード編集は不要）。2 台つないでいれば起動時に自動で leftbody=1 台目, rightbody=2 台目 が割り当てられます。`NANOVNA_PORT` は初期選択候補にすぎません。**同じ COM ポートを 2 チャンネルに割り当てると開始時にエラー**になります（各 VNA は別ポート）。
 
-> **注意:** マーカーの識別は「`marker_id` の並び」に依存します（`marker_id=i` → `EXPECTED_MARKER_NAMES[i-1]`）。この順序が Motive の配信と食い違うと、名前と座標の対応がずれます。**初回は必ず起動直後の診断ログで各マーカーの座標を確認し、並びを合わせてください**（§6 参照）。
+> **【最重要】`EXPECTED_MARKER_NAMES` は Motive 側と整合を取る必要があります。**
+> マーカーの識別は「`marker_id` の並び」だけに依存します（`marker_id=i` → `EXPECTED_MARKER_NAMES[i-1]`）。この `marker_id` は **Motive がアセット（トレーニング済みマーカー／マーカーセット）を作成した時点で自動的に振る番号**であり、**Motive 側でラベリングやトレーニングをやり直すたびに割り当てが変わりえます**。順序が食い違っても計測はエラーにならず、**名前と座標が入れ替わったまま記録される**ため気付きにくいのが厄介な点です。
+>
+> したがって、**Motive 側のアセットを作り直した／別の PC・別のセッションで計測する場合は、そのつど**次を行ってください。
+>
+> 1. ［計測開始］直後の**診断ログ**（`MARKER_DIAGNOSTIC_FRAMES` 回ぶん）で、各 `marker=` 番号の座標を確認する。
+> 2. その座標が実際にどの部位かを判断する（左右は X の符号、胸は X≈0、上腕/前腕は高さ、が目印）。
+> 3. `EXPECTED_MARKER_NAMES` を `marker_id` の昇順に並べ替えて、実際の対応に合わせる。
+>
+> **本 README 中のコード例・列名例に出てくるマーカーの並びは説明用のサンプル**です。リポジトリ内の実コードの並びとも、あなたの Motive 環境の並びとも一致しない場合があります（一致させるべきなのは「コードと Motive」であって「コードと README」ではありません）。手順の詳細は §6・§7.2 を参照してください。
 
 ### 4.2 起動と GUI 操作
 
@@ -369,11 +411,11 @@ python sync_optitrack_nanovna.py
 
 ```
 （GUI のログ欄の例）
-計測を開始しました。leftbody=COM3 / rightbody=COM4（S11, 掃引 12.500-14.500 MHz 101点, OptiTrack ON, カメラ同期 ON）
+計測を開始しました。leftbody=COM3 / rightbody=COM4（S11, 掃引 6.000-20.000 MHz 101点, OptiTrack ON, カメラ同期 ON）
 開始時刻(壁時計): 2026-07-27 15:30:45.123
 [カメラ] 録画開始 index=0 640x480 @~30fps
-[leftbody] VNA 接続 OK: COM3 @ 115200bps / 掃引 12.500-14.500 MHz 101点 (S11)
-[rightbody] VNA 接続 OK: COM4 @ 115200bps / 掃引 12.500-14.500 MHz 101点 (S11)
+[leftbody] VNA 接続 OK: COM3 @ 115200bps / 掃引 6.000-20.000 MHz 101点 (S11)
+[rightbody] VNA 接続 OK: COM4 @ 115200bps / 掃引 6.000-20.000 MHz 101点 (S11)
 OptiTrack 受信開始。全 7 マーカーが揃ったサンプルのみ記録します（未認識のフレームは自動破棄）。
 [診断 1/5] 受信フレームの構造:
   MarkerSet 数: 1
@@ -437,6 +479,8 @@ OptiTrack 受信開始。全 7 マーカーが揃ったサンプルのみ記録�
 
 **先頭 22〜23 列（位置情報）** — `Timestamp`（カメラ同期 ON なら続いて `WallClock`）に続いて、各マーカーの X/Y/Z が `EXPECTED_MARKER_NAMES` の順に並びます。
 
+> **列の「並び順」は固定ではありません。** 下表は各列の意味を示すもので、**上から下への並び順は `EXPECTED_MARKER_NAMES` の記述順（＝ Motive 側の `marker_id` の並び）で決まります**。Motive でアセットを作り直すと変わりうるため、**解析時は列名（ヘッダー行）で参照し、列位置（インデックス）を決め打ちしないでください**。
+
 | カラム名 | 意味 | 単位 |
 |----------|------|------|
 | `Timestamp` | 各サンプルの計測開始からの経過時間（`perf_counter` 基準、ミリ秒精度） | 秒 [s] |
@@ -449,15 +493,17 @@ OptiTrack 受信開始。全 7 マーカーが揃ったサンプルのみ記録�
 | `L_joint_X/Y/Z` | **左関節**マーカーの X/Y/Z 座標（Motive 座標系） | メートル [m] |
 | `L_upperarm_X/Y/Z` | **左上腕**マーカーの X/Y/Z 座標（Motive 座標系） | メートル [m] |
 
-**以降の列（掃引データ）** — チャンネルごと（`leftbody` → `rightbody`）に、掃引周波数ごとの 4 列が **開始周波数から終了周波数まで指定点数分**繰り返されます（列名は `<チャンネル>_<項目>_<MHz>`。例は 12.5–14.5 MHz / 101 点の場合）。
+**以降の列（掃引データ）** — チャンネルごと（`leftbody` → `rightbody`）に、掃引周波数ごとの 4 列が **開始周波数から終了周波数まで指定点数分**繰り返されます（列名は `<チャンネル>_<項目>_<MHz>`。例は既定の 6–20 MHz / 101 点の場合＝刻み 0.14 MHz）。
 
-| カラム名（例: leftbody / 12.5 MHz） | 意味 | 単位 |
+| カラム名（例: leftbody / 6 MHz） | 意味 | 単位 |
 |----------|------|------|
-| `leftbody_S11_Real_12.5` | その周波数の反射係数 S11 の**実部** | 無次元（線形） |
-| `leftbody_S11_Imag_12.5` | その周波数の反射係数 S11 の**虚部** | 無次元（線形） |
-| `leftbody_Z_R_12.5` | `scikit-rf` で換算した複素インピーダンス Z11 の**実部（抵抗 R）** | オーム [Ω] |
-| `leftbody_Z_X_12.5` | `scikit-rf` で換算した複素インピーダンス Z11 の**虚部（リアクタンス X）** | オーム [Ω] |
-| …（次の周波数 `12.52`, `12.54`, … 終了周波数まで） → 続けて `rightbody_S11_Real_12.5` …（rightbody の全点） | | |
+| `leftbody_S11_Real_6` | その周波数の反射係数 S11 の**実部** | 無次元（線形） |
+| `leftbody_S11_Imag_6` | その周波数の反射係数 S11 の**虚部** | 無次元（線形） |
+| `leftbody_Z_R_6` | `scikit-rf` で換算した複素インピーダンス Z11 の**実部（抵抗 R）** | オーム [Ω] |
+| `leftbody_Z_X_6` | `scikit-rf` で換算した複素インピーダンス Z11 の**虚部（リアクタンス X）** | オーム [Ω] |
+| …（次の周波数 `6.14`, `6.28`, … 終了周波数 `20` まで） → 続けて `rightbody_S11_Real_6` …（rightbody の全点） | | |
+
+> 列名の MHz 表記は**小数第 4 位まで（=100 Hz 精度）で末尾ゼロを省いた形**です（`6`, `6.14`, `13.5600` → `13.56` など）。点数を細かくしても列名が重複しないようにするためです。
 
 > 単一周波数（1 点）モードでは MHz サフィックスを省き、`leftbody_S11_Real` / `leftbody_Z_R` … のようになります。
 
@@ -519,7 +565,7 @@ rightbody:  Z = 70.65 + j16.42 Ω   |S11|=0.100   @ 13.5600 MHz
 
 **［計測開始］を押すと、連動して webカメラの録画が始まります。** 動画は OpenCV でこのシステムが直接録画し、計測終了・CSV 保存時に **CSV と同じフォルダへ `WIN_YYYYMMDD_HH_MM_SS_Pro.mp4`** として保存します。あわせて CSV に絶対時刻列 `WallClock` が付き、`meta.json` に録画開始時刻（`video_start_wall`）や動画ファイル名も残ります。
 
-さらに、**計測中は別ウィンドウの「ライブ表示」ダッシュボード**が開き、`view_marker_impedances/viewer_3marker.py` と同じ内容（**3D マーカー＋ボーン／左右の肘角度（数値＋時系列）／左右 body の S11 スミスチャート／webカメラのライブ映像**）をリアルタイムに表示します。
+さらに、**計測中は別ウィンドウの「ライブ表示」ダッシュボード**（`live_dashboard.py`）が開き、**3D マーカー＋ボーン／左右の肘角度（数値＋時系列）／左右 body の S11 スミスチャート／webカメラのライブ映像**をリアルタイムに表示します。
 
 > **【重要】表示は nanoVNA の掃引レートに律速されません。** ライブ表示は専用の高速タイマーで、その瞬間の**最新のマーカー座標・最新のカメラフレーム・各 VNA の最新掃引**を共有状態から直接読み取って描画します。CSV へ 1 行を確定する記録用ループ（全 VNA の新しい掃引が揃うまで待つ）とは独立して動くため、掃引が遅くても **OptiTrack 座標とカメラ映像はとぎれず**に更新されます（掃引が遅い分だけスミスチャートの更新が遅くなるだけです）。
 
@@ -542,7 +588,13 @@ rightbody:  Z = 70.65 + j16.42 Ω   |S11|=0.100   @ 13.5600 MHz
 video_time_sec = （データ行の WallClock） − （動画の録画開始時刻）
 ```
 
-データ行 *i* は、動画の先頭から `video_time_sec[i]` 秒の位置に対応します。動画の録画開始時刻は、ファイル名 `WIN_YYYYMMDD_HH_MM_SS_Pro.mp4`（ローカル時刻・**秒**精度）から読み取ります。より厳密に合わせたい場合は、`meta.json` の `video_start_wall`（ミリ秒精度）を後処理スクリプトの `--video-start` に渡してください。
+データ行 *i* は、動画の先頭から `video_time_sec[i]` 秒の位置に対応します。録画開始時刻の求め方はスクリプトによって異なります。
+
+- **`playback_viewer.py`（再生ビューア）** … CSV と同じ場所に `<csv名>.meta.json` があれば、その `video_start_wall`（**ミリ秒精度**）を**自動で最優先に使います**。手動指定は不要です（§5.5）。
+- **`sync_video_with_dataset.py`（同期 CSV 生成）** … 録画開始時刻は `--video-start` →ファイル名 `WIN_YYYYMMDD_HH_MM_SS_Pro.mp4`（**秒**精度）→ `creation_time` →ファイル作成時刻、の順で決めます（`meta.json` の `video_start_wall` は自動では読みません）。ミリ秒精度で合わせたい場合は、`meta.json` の `video_start_wall` の値を `--video-start` に渡してください。
+- なお `sync_video_with_dataset.py` は、**CSV に `WallClock` 列が無い場合**のフォールバックとして `meta.json` の `first_sample_wall`（無ければ `meas_start_wall`）＋ `Timestamp` から絶対時刻を復元します。
+
+> **まとめ:** `meta.json` は CSV・動画とセットで同じフォルダに置いたままにしておくのが最も確実です（消しても動きますが、同期精度が秒精度に落ちます）。
 
 **後処理（対応付けスクリプト `sync_video_with_dataset.py`）:**
 
@@ -588,7 +640,7 @@ python sync_video_with_dataset.py --csv sync_dataset.csv --video clip.mp4 \
 
 ### 5.5 取得済みデータ + 動画の再生ビューア（`playback_viewer.py`）
 
-取得後の CSV とカメラ動画を**時刻同期して再生**するビューアです（`view_marker_impedances/viewer_3marker.py` を土台に、再生エンジンを作り替えたもの）。Play/Pause・時間スライダー・周波数スライダーで操作できます。
+取得後の CSV とカメラ動画を**時刻同期して再生**するビューアです。Play/Pause・時間スライダー・周波数スライダーで操作できます。実行には `pandas` / `numpy` / `matplotlib`（動画表示にはさらに `opencv-python`）が必要です。
 
 **画面レイアウト:**
 
@@ -607,9 +659,18 @@ python playback_viewer.py sync_dataset_video_synced.csv --video WIN_20260727_15_
 # 生の CSV(WallClock 付き) + 動画（video_time_sec はファイル名 WIN_… から内部計算）
 python playback_viewer.py sync_dataset.csv --video WIN_20260727_15_30_45_Pro.mp4
 
-# 動画なし（マーカー/スミスのみ再生）
-python playback_viewer.py sync_dataset.csv
+# 動画なし（マーカー/スミスのみ再生）。--speed で再生速度を変えられる
+python playback_viewer.py sync_dataset.csv --speed 2.0
 ```
+
+主なオプション:
+
+| 引数 / オプション | 意味 |
+|---|---|
+| `csv`（位置引数・省略可） | CSV ファイルパス。**省略時はスクリプトと同じフォルダの `sync_dataset.csv`** |
+| `--video PATH` | 同期再生する動画ファイル |
+| `--video-start "YYYY-MM-DD HH:MM:SS[.fff]"` | 録画開始時刻の明示指定（`meta.json` より優先） |
+| `--speed N` | **動画なし再生時**の速度倍率（既定 1.0）。動画ありのときは動画のフレームレートで再生します |
 
 **再生時の同期の考え方（重要）:** マーカー座標とスミスチャートは「同じ CSV 行」から描くので常に同期します。動画は VNA（＝ CSV 行）より遥かに高 FPS のため、行ごとに動画をシークすると多数のフレームを飛ばして**とびとび**になります。これを避けるため、本ビューアは**動画フレームを順番に（飛ばさず）連続再生**し、その時刻に対応する CSV 行を `video_time_sec` から求めてマーカー/スミスを更新します。
 
@@ -641,7 +702,31 @@ Motive が配信するフレームには**マーカー名は含まれません**
 3. **サンプルの採否（掃引ごと）**
    VNA の 1 掃引が終わるたびに 7 マーカーの `valid` を確認し、**全て `valid` の場合のみ 1 行として記録**します。1 個でも未認識ならそのサンプルは破棄します。
 
-なお、起動直後の数フレーム（`MARKER_DIAGNOSTIC_FRAMES`）は、受信フレームの構造（マーカーセット、ラベル付きマーカーの `marker_id`／`model_id`／座標、リジッドボディ、名前解決結果）を GUI ログへ出力します。**初回はこのログで `marker_id` と部位の対応を確認し、`EXPECTED_MARKER_NAMES` の並びを実際の配信に合わせてください。**
+なお、起動直後の数フレーム（`MARKER_DIAGNOSTIC_FRAMES`）は、受信フレームの構造（マーカーセット、ラベル付きマーカーの `marker_id`／`model_id`／座標、リジッドボディ、名前解決結果）を GUI ログへ出力します。
+
+### 6.1 Motive 側との整合合わせ（毎回必要になりうる作業）
+
+**`marker_id` は Motive がアセット作成時に自動で振る番号であり、こちらから固定できません。** そのため、**Motive 側でトレーニング済みマーカー（アセット／マーカーセット）を作り直すと `marker_id` と部位の対応が変わりえます**。この変化は本システムからは検出できず、**エラーも警告も出さずに「名前と座標が入れ替わった CSV」が出来上がる**ため、次のタイミングでは必ず対応を確認してください。
+
+**確認が必要になるタイミング:**
+
+- Motive でマーカーのラベリング／トレーニングをやり直したとき
+- アセット（マーカーセット／スケルトン）を作り直した・別のものに差し替えたとき
+- マーカーの貼付位置を変えたとき、マーカーを増減したとき
+- 別の PC・別の Motive プロジェクト・別日のセッションで計測するとき
+
+**手順:**
+
+1. ［計測開始］を押し、GUI ログの **`[診断 n/5] 受信フレームの構造:`** ブロックを見ます。
+2. `- id=262145 (model=4, marker=1) occ=False pos=(-0.239,-0.264,0.801)` のように、`marker=` 番号ごとの座標が出ます。この **`marker=` の番号が `marker_id`** です。
+3. 被験者に既知の姿勢（例: 気をつけ、両腕を水平に広げる）を取ってもらった状態の座標から、各 `marker_id` がどの部位かを判定します。目安は次のとおりです（Motive の座標系設定に依存するので、実際の値で確認してください）。
+   - **左右**: X 座標の符号（正/負のどちらが右かはキャリブレーション時の向きで決まる）
+   - **胸**: X ≈ 0（体の中心線上）
+   - **上腕 / 関節（肘）/ 前腕**: 気をつけの姿勢なら鉛直軸（Y または Z）の値が上→下の順に並ぶ
+4. 判定できたら、`sync_optitrack_nanovna.py` の `EXPECTED_MARKER_NAMES` を **`marker_id` の昇順**（`marker_id=1` の部位が先頭）に並べ替えます。
+5. 再度起動し、診断ログ末尾の **`→ 名前解決できたマーカー: [...]`** に 7 個すべてが出ること、および各部位の座標が妥当であることを確認します。
+
+> **ずれたまま計測してしまった場合:** CSV のヘッダー名と中身の対応が入れ替わっているだけで、値そのものは失われていません。後処理で列名を正しい部位へ付け替えれば救済できます（どの列がどの部位かは、そのときの診断ログか、記録された座標の性質から判断してください）。**計測ログを残しておくと後で復元しやすくなります。**
 
 ---
 
@@ -660,6 +745,8 @@ Motive が配信するフレームには**マーカー名は含まれません**
 - **`NatNetClient.py` / `MoCapData.py` / `DataDescriptions.py` が読み込めるか。** これらが見つからないと import に失敗し、OptiTrack なしで続行されて座標は空欄になります。同梱の `./NatNetSDK/Samples/PythonClient/` か、本体スクリプトと同じフォルダに配置してください。
 
 ### 7.2 マーカー名と座標が入れ替わって記録される場合
+
+**最も多い原因は「Motive 側でトレーニング済みマーカー／アセットを作り直したのに `EXPECTED_MARKER_NAMES` を更新していない」ことです。** 手順は [§6.1 Motive 側との整合合わせ](#61-motive-側との整合合わせ毎回必要になりうる作業) を参照してください。
 
 - **`marker_id` と部位の対応を診断ログで確認。** 名前と座標の対応は `marker_id`（`marker_id=i` → `EXPECTED_MARKER_NAMES[i-1]`）で決まります。起動直後の診断ログで各マーカーの座標を実際の位置と突き合わせ、順序がずれていないか確認してください（例: 左右は X 座標の符号、胸は X≈0 が目印）。
 - **`EXPECTED_MARKER_NAMES` を並べ替える。** ずれていた場合は、`marker_id` の並びに合わせて `EXPECTED_MARKER_NAMES` を書き換えます（CSV の位置列順もこれに追従します）。
@@ -684,7 +771,7 @@ Motive が配信するフレームには**マーカー名は含まれません**
 `S11_Real` がほぼ 1（全反射）になる、共振の落ち込みが見えない場合は、以下を確認してください。
 
 - **掃引範囲が共振点を含んでいるか。** `SWEEP_START_HZ`〜`SWEEP_STOP_HZ`（既定 6–20 MHz）が対象の共振点を含むか確認してください。本バージョンは初期化時に `sweep` コマンドで範囲を固定し、101 点全体を記録します（グラフで共振の落ち込みが範囲内に見えるか確認）。
-- **キャリブレーション（校正）が済んでいるか。** これが S11≈1 の最も多い原因です。**未校正だと S11 はほぼ全反射になります。** 掃引範囲（12.5–14.5 MHz）を含む範囲で PORT1 の反射校正（Open / Short / Load）を実施してください（§3.2(b)）。校正範囲が掃引範囲を含まないと、補間が効かず不正確になります。
+- **キャリブレーション（校正）が済んでいるか。** これが S11≈1 の最も多い原因です。**未校正だと S11 はほぼ全反射になります。** 実際に使う掃引範囲（既定 6–20 MHz）を含む範囲で PORT1 の反射校正（Open / Short / Load）を実施してください（§3.2(b)）。校正範囲が掃引範囲を含まないと、補間が効かず不正確になります。
 - **DUT が正しく PORT1 に接続されているか。** ケーブル断・接触不良・未接続でも全反射になります。
 - **本当に整合が取れているか。** 共振点でも整合が不十分なら反射は大きくなります。NanoVNA 本体の画面（または nanovna-saver）で共振（S11 の落ち込み）が掃引範囲内に見えるか、まず単体で確認すると切り分けが容易です。
 
