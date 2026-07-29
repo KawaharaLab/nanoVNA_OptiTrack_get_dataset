@@ -75,23 +75,59 @@ def _elbow_angle(upper, joint, fore):
     return float(np.degrees(np.arccos(np.clip(cos_a, -1.0, 1.0))))
 
 
-def draw_smith_grid(ax_s):
-    """定抵抗円・定リアクタンス円のグリッドと単位円を描く(viewer と同じ)。
+SMITH_GRID_R = (0.2, 0.5, 1.0, 2.0, 5.0)   # 定抵抗円 r = R/Z0
+SMITH_GRID_X = (0.2, 0.5, 1.0, 2.0, 5.0)   # 定リアクタンス円 x = X/Z0 (±)
+
+
+def smith_r_circle(r, n=181):
+    """
+    定抵抗円(r = const)を Γ 平面上の厳密な円として返す(playback_viewer と同じ式)。
+    z = r + jx を Γ=(z-1)/(z+1) で写すと、中心 (r/(1+r), 0)・半径 1/(1+r) の完全な円になる。
+    """
+    t = np.linspace(0.0, 2.0 * np.pi, n)
+    c = r / (1.0 + r)
+    rad = 1.0 / (1.0 + r)
+    return c + rad * np.cos(t), rad * np.sin(t)
+
+
+def smith_x_arc(x, n=181):
+    """
+    定リアクタンス円(x = const)のうち、単位円の内側にある弧だけを厳密に返す。
+
+    Γ 平面では中心 (1, 1/x)・半径 1/|x| の円になるが、意味があるのは r=0(単位円上) から
+    r=∞(Γ=1) までの弧だけなので、両端の角度を求めて単位円の内側を通る向き(x>0 なら
+    反時計回り、x<0 なら時計回り)に角度を等分する。弧長方向に点が均等に並ぶので、
+    r を線形に振って写像する方式と違い r≈0 付近(単位円の近く)でもカクつかない。
+    """
+    cy = 1.0 / x
+    rad = 1.0 / abs(x)
+    g0 = (1j * x - 1.0) / (1j * x + 1.0)                 # r=0 側の端点(単位円上)
+    th0 = float(np.arctan2(g0.imag - cy, g0.real - 1.0))
+    th1 = float(np.arctan2(-cy, 0.0))                    # r=∞ 側の端点 Γ=1
+    dth = th1 - th0
+    if x > 0:
+        while dth <= 0.0:
+            dth += 2.0 * np.pi
+    else:
+        while dth >= 0.0:
+            dth -= 2.0 * np.pi
+    t = th0 + dth * np.linspace(0.0, 1.0, n)
+    return 1.0 + rad * np.cos(t), cy + rad * np.sin(t)
+
+
+def draw_smith_grid(ax_s, n=181):
+    """定抵抗円・定リアクタンス弧のグリッドと単位円を描く(playback_viewer と同じ)。
     ライブ表示では毎フレーム全体を再描画するため、点数は控えめにして描画負荷を抑える。"""
-    theta = np.linspace(0, 2 * np.pi, 240)
-    ax_s.plot(np.cos(theta), np.sin(theta), color='black', lw=1.2, zorder=1)
-    ax_s.plot([-1, 1], [0, 0], color='gray', lw=0.6, zorder=1)
-    x_sweep = np.linspace(-500, 500, 800)
-    for r in (0.0, 0.2, 0.5, 1.0, 2.0, 5.0):
-        z = r + 1j * x_sweep
-        g = (z - 1) / (z + 1)
-        ax_s.plot(g.real, g.imag, color='gray', lw=0.5, alpha=0.6, zorder=1)
-    r_sweep = np.linspace(0, 500, 800)
-    for x in (0.2, 0.5, 1.0, 2.0, 5.0):
+    theta = np.linspace(0, 2 * np.pi, 241)
+    ax_s.plot(np.cos(theta), np.sin(theta), color='black', lw=1.2, zorder=1)  # r=0 = 単位円
+    ax_s.plot([-1, 1], [0, 0], color='gray', lw=0.6, zorder=1)                # x=0 = 実軸
+    for r in SMITH_GRID_R:
+        gx, gy = smith_r_circle(r, n)
+        ax_s.plot(gx, gy, color='gray', lw=0.5, alpha=0.6, zorder=1)
+    for x in SMITH_GRID_X:
         for sign in (1, -1):
-            z = r_sweep + 1j * sign * x
-            g = (z - 1) / (z + 1)
-            ax_s.plot(g.real, g.imag, color='gray', lw=0.4, alpha=0.5, zorder=1)
+            gx, gy = smith_x_arc(sign * x, n)
+            ax_s.plot(gx, gy, color='gray', lw=0.4, alpha=0.5, zorder=1)
     ax_s.set_xlim(-1.08, 1.08)
     ax_s.set_ylim(-1.08, 1.08)
     ax_s.set_aspect('equal')
