@@ -31,7 +31,11 @@ GUI / スレッド構成:
   - tkinter GUI(メインスレッド): [計測開始]/[計測終了] ボタン。GUI は固まらない。
   - VNA リーダー: 各 nanoVNA を掃引して最新の S11→Z11 を publish する。
       交互モード(既定): 1 本のスレッドが全チャンネルを 1 台ずつ順番に掃引する。
-        → 2 台が同時に送信しないので RF 干渉によるノイズを防ぐ(VNA_ALTERNATE_SWEEP)。
+        → 2 台が同時に「掃引」しないので RF 干渉によるノイズを防ぐ(VNA_ALTERNATE_SWEEP)。
+        ただし NanoVNA は掃引していない間も最後の周波数を出し続けるため、単一周波数
+        (CW)モードでは交互にしても両機が同じ周波数を送信し続けてしまう。そこで
+        scan の終端を退避周波数にして、掃引が終わると発振器が測定周波数から
+        離れるようにする(VNA_PARK_* を参照)。
       並列モード: チャンネルごとに専用スレッドで同時掃引する(高速だが 2 台同時だと干渉)。
   - コンバイナ(バックグラウンド): 全チャンネルの最新掃引と 7 マーカー座標を結合して
     メモリ上(self.rows)へ蓄積する。全マーカーが認識できているサンプルのみ記録する。
@@ -75,8 +79,10 @@ CSV ヘッダー(位置列は EXPECTED_MARKER_NAMES 順、VNA 列は VNA_CHANNEL
    L_forearm_X,  L_forearm_Y,  L_forearm_Z,
    L_joint_X,    L_joint_Y,    L_joint_Z,
    L_upperarm_X, L_upperarm_Y, L_upperarm_Z,
-   leftbody_S11_Real[_MHz],  ..., leftbody_Z_R[_MHz],  leftbody_Z_X[_MHz],
-   rightbody_S11_Real[_MHz], ..., rightbody_Z_R[_MHz], rightbody_Z_X[_MHz]]
+   leftbody_S11_Real_<MHz>,  ..., leftbody_Z_R_<MHz>,  leftbody_Z_X_<MHz>,
+   rightbody_S11_Real_<MHz>, ..., rightbody_Z_R_<MHz>, rightbody_Z_X_<MHz>]
+  (単一周波数(1点)モードでも MHz サフィックスは付く。列名にどの周波数かが残り、
+   再生ビューア等の下流ツールが掃引モードと同じ規則で読めるようにするため)
 
 計測中の GUI 表示: leftbody / rightbody それぞれのスミスチャート(S11=Γ をプロット)と、
 「読み取り周波数」に最も近い掃引点のインピーダンス Z=R+jX の数値表示。
@@ -182,12 +188,65 @@ SCAN_POINTS    = 101           # 掃引点数(GUI 初期値)
 POINTS_MIN = 1                 # 最小点数(1 = 単一周波数ピンポイント測定)
 POINTS_MAX = 100_000           # 上限(実用上の安全上限。実機の制約に応じて調整)
 
-# 単一周波数(1点)モードでデバイスへ実際に投げる scan の点数。
-# 点数 1 の縮退 scan はファームによっては不安定なため、同一周波数を数点掃引して
-# 平均し、論理的には 1 点として扱う(start==stop の極小掃引)。
-SINGLE_DEVICE_POINTS = 2
+# 単一周波数(1点)モードで「退避しない」ときにデバイスへ投げる scan の点数。
+# 点数 1 の縮退 scan はファームによっては不安定なため、同一周波数を数点掃引する
+# (start==stop の極小掃引)。先頭 1 点は整定前のことがあるので捨て、残りを平均して
+# 論理的に 1 点にする。退避するときは「測定点 + 退避点」の 2 点固定になる(下記)。
+SINGLE_DEVICE_POINTS = 3
+# 上記のうち先頭から捨てる点数(整定待ち)。
+SINGLE_DISCARD_POINTS = 1
 
-# 単一周波数モードのリアルタイムグラフ(時系列)で保持する直近サンプル数。
+# --- 単一周波数(CW)モードの相互干渉対策: 待機中の発振器の退避 -------------------
+# 【なぜ必要か】NanoVNA は pause 後も Si5351 が最後に設定された周波数を出力し続ける。
+# 掃引モードでは 2 台が同じ周波数に同時にいる瞬間はほぼ無いので実害が出ないが、
+# 単一周波数モードでは両機が同じ周波数(例 13.56 MHz)に居座るため、交互計測にしても
+# 「送信は常時同時」になる。2 台の基準クロック差 Δf ぶんだけ相手のキャリアが
+# 受信 IF 内で回り、静止した被測定物でも Γ が Δf 周期でゆっくり回転する
+# (左右で逆回りの同一周波数うなりとして観測される)。
+#
+# 【対策】掃引の"終端"を退避周波数にする: `scan {測定周波数} {退避周波数} 2 3`。
+#   点0 = 測定周波数の測定値、点1 = 退避周波数(捨てる)。掃引が終わった時点で
+#   発振器は退避周波数に残るので、追加のコマンドを送らずに退避できる。
+#   → 1 サンプルあたりのシリアル往復は掃引モードと同じ 1 回だけ。往復を増やすと
+#     応答の取りこぼしでコマンドとプロンプトがずれ、「VNA 無応答」で計測が
+#     止まる事故につながるため、ホットパスでは追加コマンドを送らない。
+#   (接続直後と復帰時だけは測定を伴わない `freq {Hz}` で退避する: NanoVNA-D の
+#    cmd_freq は pause_sweep() + set_frequency() を実行するだけの軽いコマンド)
+VNA_PARK_ENABLE = True
+# 退避先 = 測定周波数 × VNA_PARK_RATIO。
+# 【1 より大きくすること】scan は start > stop を "frequency range is invalid" として
+# 拒否するため(NanoVNA-D の cmd_scan)、退避先は必ず測定周波数より上でなければ
+# 「測定 → 退避」の 2 点掃引が成立しない。
+# 黄金比(1.618)は整数比・整数分の 1 のどちらにもならないので、方形波出力の
+# 奇数次高調波(1.618f, 4.854f, …)も、受信側 LO の奇数次高調波(f, 3f, 5f, …)との
+# 差も、測定周波数から十分離れる。
+VNA_PARK_RATIO = 1.618
+VNA_PARK_MAX_HZ = 1_500_000_000  # 退避先の上限[Hz](NanoVNA-H4 の上限周波数)
+VNA_PARK_MIN_MARGIN = 1.05       # 測定周波数のこの倍以上離れていないと退避しない
+
+# IF 帯域(DSP の平均化窓)。None ならデバイスの現在設定のまま触らない。
+# NanoVNA-D の `bandwidth {n}` は帯域 ≒ 1000/(n+1) [Hz]。n を大きくするほど
+# 低ノイズだが 1 点あたりの所要時間が伸びる(=サンプリングレートが下がる)。
+# 単一周波数モードは 1 掃引が軽いので、ノイズが気になるときは 1〜9 を試す。
+VNA_IF_BANDWIDTH = None
+
+
+def park_freq_for(meas_hz):
+    """
+    待機中に発振器を逃がす周波数[Hz]を返す(測定周波数 × VNA_PARK_RATIO)。
+    機体の上限を超える場合は上限に丸め、それでも測定周波数に近すぎる(干渉を
+    避けられない)ときは None を返して退避を諦める。
+    """
+    meas = float(meas_hz)
+    park = min(int(meas * VNA_PARK_RATIO), int(VNA_PARK_MAX_HZ))
+    if park < meas * VNA_PARK_MIN_MARGIN:
+        return None
+    return park
+
+
+# 単一周波数(1点)モードのスミスチャートに軌跡として残す直近サンプル数。
+# 1 点では掃引トレースが引けないので、直近サンプルの Γ を線でつないで
+# 「その周波数の値が時間とともにどう動いたか」を見えるようにする。
 TIME_PLOT_WINDOW = 300
 
 # 掃引周波数グリッド[Hz]を作るヘルパ。CSV ヘッダー・skrf 変換・グラフ横軸の共通基準。
@@ -303,18 +362,23 @@ def _fmt_mhz(hz):
 
 
 def _vna_columns_for(prefix, freq_grid_hz):
-    """1 チャンネルぶんの S パラメータ/インピーダンス列名を返す(先頭に prefix_ を付ける)。"""
+    """
+    1 チャンネルぶんの S パラメータ/インピーダンス列名を返す(先頭に prefix_ を付ける)。
+
+    単一周波数(1点)モードでも MHz サフィックスを必ず付ける。列名を掃引モードと同じ
+    "<ch>_S11_Real_<MHz>" 形式に統一しておくと、
+      ・どの周波数で測ったのかが CSV 自身に残る
+      ・再生ビューア(playback_viewer.py)など下流ツールが列を同じ規則で見つけられる
+    (以前は 1 点のときだけサフィックスを省いていたため、再生ビューアが
+     インピーダンス列を 1 つも認識できずスミスチャートが出なかった)
+    """
     cols = []
-    if len(freq_grid_hz) <= 1:
-        cols += ["{}_S11_Real".format(prefix), "{}_S11_Imag".format(prefix),
-                 "{}_Z_R".format(prefix), "{}_Z_X".format(prefix)]
-    else:
-        for hz in freq_grid_hz:
-            lbl = _fmt_mhz(hz)
-            cols += ["{}_S11_Real_{}".format(prefix, lbl),
-                     "{}_S11_Imag_{}".format(prefix, lbl),
-                     "{}_Z_R_{}".format(prefix, lbl),
-                     "{}_Z_X_{}".format(prefix, lbl)]
+    for hz in freq_grid_hz:
+        lbl = _fmt_mhz(hz)
+        cols += ["{}_S11_Real_{}".format(prefix, lbl),
+                 "{}_S11_Imag_{}".format(prefix, lbl),
+                 "{}_Z_R_{}".format(prefix, lbl),
+                 "{}_Z_X_{}".format(prefix, lbl)]
     return cols
 
 
@@ -324,8 +388,8 @@ def build_csv_header(freq_grid_hz, channel_names=VNA_CHANNEL_NAMES,
     位置情報 + 各 VNA チャンネルの S パラメータ/インピーダンス列を並べた CSV ヘッダーを作る。
     - 位置列(Timestamp [+ WallClock] + 各マーカー XYZ)のあとに、チャンネルごとに 4 列 × 点数を並べる。
     - include_wallclock=True のときのみ絶対時刻列 WallClock を含める(カメラ同期 ON 時)。
-    - 列名は "<チャンネル名>_S11_Real[_<MHz>]" のようにチャンネル名で区別する。
-      (単一周波数のときは MHz サフィックスを省く)
+    - 列名は "<チャンネル名>_S11_Real_<MHz>" のようにチャンネル名と周波数で区別する。
+      (単一周波数(1点)モードでも MHz サフィックスを付ける: _vna_columns_for 参照)
     """
     cols = build_position_header(include_wallclock)
     for name in channel_names:
@@ -681,24 +745,30 @@ VNA_STALL_LOST_FAILS = 8
 
 class NanoVNA:
     """
-    JNCRadio VNA 3G (NanoVNA 互換) のコンソールコマンドを扱う薄いラッパ。
+    NanoVNA-H4 / JNCRadio VNA 3G など NanoVNA 系のコンソールコマンドを扱う薄いラッパ。
 
     本機のシリアルは「コマンド\\r を送ると、エコー → 結果行 → プロンプト 'ch> '」
-    の順で応答する(マニュアル §7)。scan コマンドで毎回フレッシュな掃引を実行する。
+    の順で応答する。scan コマンドで毎回フレッシュな掃引を実行する。
 
+    使用するコマンド(NanoVNA-D ファームウェア):
+        sweep {start(Hz)} {stop(Hz)} [points]   掃引条件の設定
+        sweep cw {freq(Hz)}                     CW(ゼロスパン)= 単一周波数モードの設定
         scan {start(Hz)} {stop(Hz)} [points] [outmask]
-        outmask は出力内容のビット指定: bit0(=1) 周波数, bit1(=2) S11, bit2(=4) S21
-        本クラスは「周波数 + S11」を出力(outmask=3)する。
+            outmask は出力内容のビット指定: bit0(=1) 周波数, bit1(=2) S11, bit2(=4) S21
+            本クラスは「周波数 + S11」を出力(outmask=3)する。校正は適用される。
+        freq {freq(Hz)}                         測定せずに発振器だけを設定(pause 状態)
+        bandwidth {n}                           DSP 平均化窓(IF 帯域 ≒ 1000/(n+1) Hz)
 
     掃引条件(開始/終了周波数・点数)は GUI から渡され、初期化時に sweep コマンドで
-    デバイスへ設定する。
+    デバイスへ設定する。単一周波数モードでは、測定のたびに park() で発振器を
+    測定周波数から離し、複数台が同じ CW 周波数を送信し続けないようにする。
     """
 
     PROMPT = b"ch> "
 
     def __init__(self, port, baud=115200, timeout=1.0,
                  start_hz=SWEEP_START_HZ, stop_hz=SWEEP_STOP_HZ,
-                 points=SCAN_POINTS):
+                 points=SCAN_POINTS, park_hz=None):
         # 計測は S11 固定。scan には周波数ビット(1)を足して "周波数+S11"(=3)を出力させる。
         self.sparam = VNA_SPARAM
         self.scan_outmask = (1 | VNA_OUTMASK)  # 1(周波数) | 2(S11) = 3
@@ -712,6 +782,14 @@ class NanoVNA:
             # 論理点数は 1、周波数は開始値に揃える
             self.points = 1
             self.stop_hz = self.start_hz
+        # 待機中に発振器を逃がす周波数[Hz]。None なら退避しない(1 台だけのときなど)。
+        # 複数台が同じ CW 周波数に居座ると相互干渉でΓが回るため、その対策(定数の説明参照)。
+        self.park_hz = int(park_hz) if park_hz else None
+        # freq コマンドにファームが対応しているか(None=未判定)。park() が最初に判定する。
+        # 計測中の退避は scan の終端で行うので、非対応でも計測結果には影響しない。
+        self.park_supported = None
+        # 直近の scan 応答(失敗時の原因調査用。GUI の警告に一部を載せる)
+        self.last_response = ""
         # 接続情報(再オープン時に使う)。write_timeout を必ず設定する。これが無いと
         # デバイスがハングしたとき write()/flush() が無限にブロックし、停止・保存時にフリーズする。
         self.port = port
@@ -752,6 +830,8 @@ class NanoVNA:
                 self._read_until_prompt()
                 # 掃引範囲・点数をデバイスへ設定(初期化コマンド)
                 self.setup_sweep()
+                # 初回計測の前に発振器を退避しておく(他機の 1 回目から干渉させない)
+                self.park()
                 return  # 成功
             except (serial.SerialTimeoutException, serial.SerialException) as e:
                 last_err = e
@@ -770,21 +850,53 @@ class NanoVNA:
 
     def setup_sweep(self):
         """
-        デバイスの掃引条件(開始/終了周波数・点数)を設定する。
-        NanoVNA 系コンソールの `sweep {start} {stop} {points}` を発行する。
-        単一周波数モードでは縮退(1点)を避け、開始==終了で SINGLE_DEVICE_POINTS 点に設定する。
-        ファームが当該書式に対応していなくても、毎回の scan が範囲を指定するため
-        計測自体は継続できる。
+        デバイスの掃引条件を設定する。
+
+        単一周波数モードでは、NanoVNA-D ファームウェアが持つ正規の CW(ゼロスパン)
+        コマンド `sweep cw {freq}` を使う(内部で start=stop=freq に設定される)。
+        掃引モードでは従来どおり `sweep {start} {stop} {points}` を発行する。
+        いずれもファームが当該書式に対応していなくても、毎回の scan が範囲と点数を
+        指定するため計測自体は継続できる。
+
+        VNA_IF_BANDWIDTH が指定されていれば `bandwidth {n}` も送る(DSP の平均化窓。
+        小さい帯域ほど低ノイズだが 1 点あたりの所要時間が伸びる)。
         """
-        if self.single:
-            dev_stop, dev_points = self.start_hz, SINGLE_DEVICE_POINTS
-        else:
-            dev_stop, dev_points = self.stop_hz, self.points
-        cmd = "sweep {start} {stop} {points}".format(
-            start=self.start_hz, stop=dev_stop, points=dev_points)
         self.ser.reset_input_buffer()
+        if VNA_IF_BANDWIDTH is not None:
+            self._send_raw("bandwidth {}".format(int(VNA_IF_BANDWIDTH)))
+            self._read_until_prompt()
+        if self.single:
+            cmd = "sweep cw {freq}".format(freq=self.start_hz)
+        else:
+            cmd = "sweep {start} {stop} {points}".format(
+                start=self.start_hz, stop=self.stop_hz, points=self.points)
         self._send_raw(cmd)
         self._read_until_prompt()
+
+    def park(self):
+        """
+        発振器を測定周波数から離す(複数台の相互干渉対策)。接続直後と復帰時に使う。
+
+        NanoVNA-D の `freq {Hz}` は pause_sweep() + set_frequency() を行うだけで
+        測定はしないため、キャリアだけを退避できる。
+        ※ 計測中(ホットパス)ではこのコマンドは使わない。1 サンプルあたりのシリアル
+          往復が増えると応答の取りこぼしでコマンドとプロンプトがずれ、「VNA 無応答」で
+          計測が止まる事故につながるため、measure_sweep は scan の終端で退避する。
+        park_hz が None のとき(1 台運用など)は何もしない。
+        失敗しても計測は止めない(次の scan で周波数は上書きされる)。
+        """
+        if not self.park_hz:
+            return
+        try:
+            self._send_raw("freq {}".format(self.park_hz))
+            resp = self._read_until_prompt(max_wait=1.0)
+        except (serial.SerialTimeoutException, serial.SerialException) as e:
+            _dbg("[WARN] park に失敗(無視): {}".format(e))
+            return
+        # 未対応ファームは "freq?" のように返す。接続時の 1 回目だけ判定して記録する
+        # (呼び出し側が park_supported を見て GUI に警告を出せるようにする)。
+        if self.park_supported is None:
+            self.park_supported = ("?" not in resp) and ("usage" not in resp.lower())
 
     def _send_raw(self, cmd):
         """
@@ -835,6 +947,7 @@ class NanoVNA:
             self._send_raw("pause")
             self._read_until_prompt(max_wait=1.0)
             self.setup_sweep()
+            self.park()
         except Exception:
             pass
 
@@ -869,11 +982,19 @@ class NanoVNA:
         掃引全点の複素 S11 を一括取得する。
         戻り値: (freqs_hz[np.ndarray], s11[np.ndarray(complex)]) / 失敗時 None
 
-        単一周波数モードでは start==stop の極小掃引(SINGLE_DEVICE_POINTS 点)を行い、
-        同一周波数の点を平均して論理的に 1 点へ集約する(npts=1 を保証)。
+        単一周波数モードの scan は 2 通り:
+          - 退避あり(park_hz あり): `scan {測定周波数} {退避周波数} 2` の 2 点掃引。
+            周波数列を見て測定周波数の点だけを採用し、掃引の終端で発振器が退避周波数に
+            残ることを利用して、追加コマンドなしで他機への干渉を防ぐ。
+          - 退避なし: `scan {f} {f} {SINGLE_DEVICE_POINTS}` の極小掃引。整定していない
+            先頭点を捨てた残りを平均する。
+        いずれも論理的には 1 点へ集約して返す(npts=1 を保証)。
         """
         if self.single:
-            dev_stop, dev_points = self.start_hz, SINGLE_DEVICE_POINTS
+            if self.park_hz:
+                dev_stop, dev_points = self.park_hz, 2
+            else:
+                dev_stop, dev_points = self.start_hz, SINGLE_DEVICE_POINTS
         else:
             dev_stop, dev_points = self.stop_hz, self.points
         cmd = "scan {start} {stop} {pts} {mask}".format(
@@ -887,13 +1008,24 @@ class NanoVNA:
         # 点数が多いと出力が長いので読み取り待ちを長めにする
         text = self._read_until_prompt(max_wait=8.0)
         triples = self._parse_scan_lines(text)
+        # 失敗時の原因調査用に、直近の応答(先頭のみ)を残す
+        self.last_response = text[:200]
         if not triples:
             return None
 
         if self.single:
-            # 同一周波数の全点を平均し、論理的に 1 点として返す
-            re = float(np.mean([t[1] for t in triples]))
-            im = float(np.mean([t[2] for t in triples]))
+            if self.park_hz:
+                # 測定周波数に最も近い点を採用する(残りは退避用の捨て点)。
+                target = float(self.start_hz)
+                best = min(triples, key=lambda t: abs(t[0] - target))
+                if abs(best[0] - target) > max(1000.0, target * 0.01):
+                    return None   # 測定周波数の点が応答に含まれていない
+                usable = [best]
+            else:
+                # 先頭 SINGLE_DISCARD_POINTS 点は整定していないことがあるので捨てる。
+                usable = triples[SINGLE_DISCARD_POINTS:] or triples
+            re = float(np.mean([t[1] for t in usable]))
+            im = float(np.mean([t[2] for t in usable]))
             return (np.array([float(self.start_hz)], dtype=float),
                     np.array([complex(re, im)], dtype=complex))
 
@@ -1198,6 +1330,29 @@ class MeasurementController:
 
     # ---- ワーカースレッド本体(接続 → リーダー起動 → コンバイナ) ----
     def _worker_loop(self):
+        # 0) 単一周波数(CW)モードで実機が 2 台以上あるときは、待機中の発振器を
+        #    測定周波数から離す(相互干渉で Γ が回るのを防ぐ。VNA_PARK_* の説明参照)。
+        n_real = sum(1 for ch in self.channels if not ch.test_mode)
+        park_hz = None
+        if VNA_PARK_ENABLE and self.points <= 1 and n_real >= 2:
+            park_hz = park_freq_for(self.start_hz)
+            if park_hz is None:
+                self._post("status",
+                           "[警告] 測定周波数が機体の上限に近く、発振器の退避先を確保"
+                           "できません。2 台が同じ周波数を送信し続けるため、Γ が"
+                           "ゆっくり回転する可能性があります。")
+            else:
+                self._post("status",
+                           "単一周波数モードの相互干渉対策: 各 scan を {:.4f} MHz(測定)→"
+                           "{:.4f} MHz(退避)の 2 点掃引にして、待機中は測定周波数を"
+                           "送信しないようにします。".format(
+                               self.start_hz / 1e6, park_hz / 1e6))
+            if park_hz is not None and not VNA_ALTERNATE_SWEEP:
+                self._post("status",
+                           "[警告] 並列掃引モード(VNA_ALTERNATE_SWEEP=False)では 2 台が"
+                           "同時に同じ周波数を送信するため、退避しても干渉は防げません。"
+                           "単一周波数で 2 台使う場合は交互計測を推奨します。")
+
         # 1) 全チャンネルの VNA を接続。1 台でも開けなければ中止する。
         for ch in self.channels:
             if ch.test_mode:
@@ -1208,7 +1363,7 @@ class MeasurementController:
             try:
                 ch.vna = NanoVNA(ch.com_port, NANOVNA_BAUD,
                                  start_hz=self.start_hz, stop_hz=self.stop_hz,
-                                 points=self.points)
+                                 points=self.points, park_hz=park_hz)
             except OSError as e:
                 hint = ""
                 if "timeout" in str(e).lower():
@@ -1231,10 +1386,25 @@ class MeasurementController:
                 self._close_all_vnas()
                 self._post("finished")
                 return
+            if self.points <= 1:
+                if park_hz:
+                    cond = ("CW(単一周波数) {:.4f} MHz / 掃引終端 {:.4f} MHz で"
+                            "発振器を退避".format(self.start_hz / 1e6, park_hz / 1e6))
+                else:
+                    cond = "CW(単一周波数) {:.4f} MHz / 実機 {} 点平均".format(
+                        self.start_hz / 1e6,
+                        SINGLE_DEVICE_POINTS - SINGLE_DISCARD_POINTS)
+            else:
+                cond = "掃引 {:.3f}-{:.3f} MHz {}点".format(
+                    self.start_hz / 1e6, self.stop_hz / 1e6, self.points)
             self._post("status",
-                       "[{}] VNA 接続 OK: {} @ {}bps / 掃引 {:.3f}-{:.3f} MHz {}点 ({})".format(
-                           ch.name, ch.com_port, NANOVNA_BAUD,
-                           self.start_hz / 1e6, self.stop_hz / 1e6, self.points, VNA_SPARAM))
+                       "[{}] VNA 接続 OK: {} @ {}bps / {} ({})".format(
+                           ch.name, ch.com_port, NANOVNA_BAUD, cond, VNA_SPARAM))
+            if park_hz and ch.vna.park_supported is False:
+                # 計測中の退避は scan の終端で行うので、freq 非対応でも実害は無い
+                # (影響するのは 1 回目の測定前だけ)。念のためログに残す。
+                _dbg("[INFO] [{}] freq コマンド未対応(初回測定前の退避のみ省略)。".format(
+                    ch.name))
 
         # 2) NatNet 開始(ブロックしない)。OptiTrack を使わないモードでは丸ごとスキップ。
         if not self.use_optitrack:
@@ -1355,10 +1525,14 @@ class MeasurementController:
                     ch.vna.recover()
                 # 連続失敗が続けば「無応答」として停止・保存へ
                 if st["fails"] >= VNA_STALL_LOST_FAILS:
+                    # 何を受信していたのかを残す(通信ずれ/エラー応答の切り分け用)
+                    raw = getattr(ch.vna, "last_response", "") or ""
+                    raw = raw.replace("\r", " ").replace("\n", " ").strip()
                     self._post("vna_lost",
                                "[{}] VNA が応答しません({}。{} 回連続で失敗)。"
-                               "計測を停止して保存します。".format(
-                                   ch.name, fail_reason, st["fails"]))
+                               "計測を停止して保存します。\n直近の応答: {}".format(
+                                   ch.name, fail_reason, st["fails"],
+                                   repr(raw[:120]) if raw else "(受信なし)"))
                     _stop_event.set()
                     return False
                 # 警告は間引いて出す
@@ -1656,6 +1830,11 @@ class App(tk.Tk):
         # スミスチャート用の周波数グリッド(Hz)。計測条件に合わせて更新され、
         # 「読み取り周波数」に最も近い掃引点を探すのに使う。
         self._plot_freq_hz = np.asarray(FREQ_GRID_HZ, dtype=float)
+        # 単一周波数(1点)モードのスミスチャート用: 直近サンプルの Γ 軌跡(チャンネル別)。
+        # 1 点だけだと「点が 1 個ちらつく」だけで動きが読めないため、直近
+        # TIME_PLOT_WINDOW サンプルを線でつないで時間方向の軌跡として描く。
+        self._smith_trail = [collections.deque(maxlen=TIME_PLOT_WINDOW)
+                             for _ in VNA_CHANNEL_NAMES]
 
         self._build_widgets()
 
@@ -1894,10 +2073,20 @@ class App(tk.Tk):
         """掃引条件の変更にあわせてスミスチャートの周波数グリッドとトレースをリセットする。"""
         self._plot_freq_hz = np.asarray(
             make_freq_grid(start_hz, stop_hz, points), dtype=float)
+        single = (len(self._plot_freq_hz) <= 1)
         for i in range(len(self._trace_lines)):
             self._trace_lines[i].set_data([], [])
             self._marker_lines[i].set_data([], [])
+            self._smith_trail[i].clear()   # 前回計測の軌跡を持ち越さない
             self.readout_vars[i].set("{}:  Z = --".format(VNA_CHANNEL_NAMES[i]))
+        # 単一周波数モードは「掃引の形」ではなく「1 点が時間とともに動く軌跡」を見る表示になる。
+        for ax, name in zip(self._smith_axes, VNA_CHANNEL_NAMES):
+            if single:
+                # 図中の文字は英語(matplotlib の既定フォントに日本語が無いため)
+                ax.set_title("{}  @ {:.4f} MHz (trail)".format(
+                    name, float(self._plot_freq_hz[0]) / 1e6), fontsize=10)
+            else:
+                ax.set_title(name, fontsize=10)
         self.canvas.draw_idle()
 
     def _readout_index(self, npts):
@@ -1922,7 +2111,15 @@ class App(tk.Tk):
             if s11.size == 0:
                 continue
             # スミスチャート上の点 = 反射係数 Γ = S11(Z0=50Ω 基準)
-            self._trace_lines[i].set_data(s11.real, s11.imag)
+            if s11.size == 1:
+                # 単一周波数(1点)モード: 掃引トレースが引けないので、直近サンプルの
+                # 軌跡(時間方向)を線でつなぐ。現在値は下の ★ マーカーで示す。
+                self._smith_trail[i].append(complex(s11[0]))
+                trail = np.fromiter(self._smith_trail[i], dtype=complex,
+                                    count=len(self._smith_trail[i]))
+                self._trace_lines[i].set_data(trail.real, trail.imag)
+            else:
+                self._trace_lines[i].set_data(s11.real, s11.imag)
 
             idx = self._readout_index(len(s11))
             name = VNA_CHANNEL_NAMES[i]

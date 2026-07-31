@@ -12,16 +12,36 @@ view_marker_impedances/viewer_3marker.py を土台に、再生エンジンを作
   - 左右 body の S11 スミスチャート
   - 動画パネル(--video 指定時)
 
+単一周波数(1 点)モードで測った CSV にも対応する。周波数が 1 つしか無いときは
+「掃引の形」を描けないので、次のように表示を切り替える:
+  - スミスチャート … その周波数の Γ の時間方向の軌跡(直近 SMITH_TRAIL_FRAMES 行)
+  - 左右インピーダンス相対誤差 … 横軸を周波数ではなく時間にした全区間のグラフ
+  - 周波数スライダー … 出さない(読み取り対象はその 1 点に固定)
+列名は "leftbody_S11_Real_13.56" のように MHz サフィックス付きが現行形式だが、
+サフィックスの無い旧形式("leftbody_S11_Real")も読める(周波数は --single-freq で指定)。
+
 ★同期の考え方(重要)★
   マーカー座標とスミスチャートは「同じ CSV 行」から描くので常に同期している。
-  一方、動画は VNA(= CSV 行)より遥かに高 FPS。行ごとに動画を video_time_sec へシークすると
-  多数の動画フレームを飛ばして「とびとび」になる。これを避けるため、本ビューアは
-  【動画のフレームを順番に(飛ばさず)連続再生】し、その時刻に対応する CSV 行を
+  動画は連続的に(シークせずに)デコードして再生し、その時刻に対応する CSV 行を
   video_time_sec から求めてマーカー/スミスを更新する。
-    - 動画パネル … 毎フレーム更新(blit で高速描画)。飛ばさないので滑らか。
-    - マーカー/スミス/肘角度 … 対応する CSV 行が変わったときだけ全体を再描画
-      (VNA レートで段階的に切り替わる)。
+    - 動画パネル … 経過した実時間に対応するフレームを表示。描画が間に合わないときは
+      間のフレームを cap.grab() で読み飛ばして実時間再生を保つ(シークはしない)。
+    - マーカー/スミス/肘角度 … 対応する CSV 行が変わったときに更新。ただし更新レートは
+      PANEL_UPDATE_MAX_HZ で頭打ちにする。
   → 「マーカーとスミスは同期・動画はそれに同期しつつ滑らか」を実現する。
+
+★描画の高速化(重要)★
+  単一周波数(1 点)モードでは CSV が動画より速く進む(例 54 Hz > 24 fps)ため、
+  行が変わるたびに図全体を再描画していると 1 フレームあたり数百 ms かかり、再生が
+  まったく追いつかない(映像がとびとびになる)。本ビューアは次のように描画する:
+    - 動くアーティストは animated=True にし、静的な背景(3D の箱・スミス格子・
+      時系列グラフ・目盛)はキャッシュして blit で合成する。
+    - 画面へ転送するのは変化する領域だけ(_blit_regions)。
+    - 動画フレームは表示サイズまで OpenCV で縮小してから interpolation='nearest' で描く
+      (imshow 既定の再サンプルは 1 フレームあたり ~15 ms かかる)。縮小先は元映像の
+      縦横比を保つ(パネルの箱にそのまま合わせると映像が引き伸ばされる)。
+    - ウィジェット(スライダー・フレーム番号)の更新でも図全体の再描画が走らないよう、
+      set_val() ではなく表示アーティストを直接書き換える。
 
 CSV に video_time_sec 列(sync_video_with_dataset.py が付与)があればそれを使う。
 無い場合でも、CSV に WallClock 列があり動画ファイル名が WIN_YYYYMMDD_HH_MM_SS(_Pro).mp4 なら、
@@ -44,6 +64,7 @@ CSV に video_time_sec 列(sync_video_with_dataset.py が付与)があればそ�
 import re
 import sys
 import json
+import time
 import argparse
 import datetime
 from pathlib import Path
@@ -52,6 +73,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button, Slider, TextBox
+from matplotlib.transforms import Bbox, TransformedBbox
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (projection='3d' 登録用)
 
 
@@ -70,6 +92,10 @@ parser.add_argument('--video-start', default=None,
                          '(video_time_sec 列が無く WallClock から計算する場合の明示指定)')
 parser.add_argument('--speed', type=float, default=1.0,
                     help='動画なし再生時の速度倍率(既定 1.0)')
+parser.add_argument('--single-freq', type=float, default=None,
+                    help='単一周波数(1点)モードで測った古い CSV(列名に MHz が付かない '
+                         '"leftbody_S11_Real" 形式)を開くときの周波数[MHz]。'
+                         '表示ラベルにのみ使う(例: --single-freq 13.56)')
 args = parser.parse_args()
 
 CSV_PATH = Path(args.csv)
@@ -90,26 +116,39 @@ MARKERS = [
 # ヘッダーを読み、S11(leftbody/rightbody)列と Z 列、動画同期列を検出
 # ------------------------------------------------------------------ #
 _header_cols = pd.read_csv(CSV_PATH, nrows=0).columns.tolist()
-_s11_re = re.compile(r'^(leftbody|rightbody)_S11_(Real|Imag)_([0-9.]+)$')
+
+# 列名の MHz サフィックスは「無い」場合もある: 単一周波数(1点)モードで測った古い CSV は
+# "leftbody_S11_Real" のようにサフィックスが付かない(現在の計測スクリプトは 1 点でも
+# "leftbody_S11_Real_13.56" と付ける)。どちらの形式でも読めるようにする。
+# サフィックスが無い列の周波数は CSV から判らないので、--single-freq があればそれを、
+# 無ければ「不明」を表す _FREQ_UNKNOWN を周波数キーに使う(表示ラベル用途のみ)。
+_FREQ_UNKNOWN = float('nan')
+_UNLABELED_FREQ = float(args.single_freq) if args.single_freq is not None else _FREQ_UNKNOWN
+# NaN は辞書キーにできない(NaN != NaN)ので、内部のキーには実数の番兵を使う。
+_UNLABELED_KEY = -1.0
+
+_s11_re = re.compile(r'^(leftbody|rightbody)_S11_(Real|Imag)(?:_([0-9.]+))?$')
 _s11_map = {}
 for col in _header_cols:
     m = _s11_re.match(col)
     if not m:
         continue
     side, comp, freq_str = m.groups()
-    _s11_map.setdefault(side, {}).setdefault(float(freq_str), {})[comp] = col
+    key = float(freq_str) if freq_str else _UNLABELED_KEY
+    _s11_map.setdefault(side, {}).setdefault(key, {})[comp] = col
 
 SIDES = [s for s in ('leftbody', 'rightbody') if s in _s11_map]
 HAS_SMITH = len(SIDES) > 0
 
-_z_re = re.compile(r'^(leftbody|rightbody)_Z_(R|X)_([0-9.]+)$')
+_z_re = re.compile(r'^(leftbody|rightbody)_Z_(R|X)(?:_([0-9.]+))?$')
 _z_map = {}
 for col in _header_cols:
     m = _z_re.match(col)
     if not m:
         continue
     side, comp, freq_str = m.groups()
-    _z_map.setdefault(side, {}).setdefault(float(freq_str), {})[comp] = col
+    key = float(freq_str) if freq_str else _UNLABELED_KEY
+    _z_map.setdefault(side, {}).setdefault(key, {})[comp] = col
 
 freqs = {}
 _real_cols = {}
@@ -119,7 +158,9 @@ _zx_cols = {}
 s11_usecols = []
 for side in SIDES:
     freq_list = sorted(f for f, d in _s11_map[side].items() if 'Real' in d and 'Imag' in d)
-    freqs[side] = np.array(freq_list)
+    # サフィックス無し(=周波数不明)のキーは、表示用の周波数に読み替える
+    freqs[side] = np.array([_UNLABELED_FREQ if f == _UNLABELED_KEY else f
+                            for f in freq_list], dtype=float)
     _real_cols[side] = [_s11_map[side][f]['Real'] for f in freq_list]
     _imag_cols[side] = [_s11_map[side][f]['Imag'] for f in freq_list]
     s11_usecols += _real_cols[side] + _imag_cols[side]
@@ -128,6 +169,20 @@ for side in SIDES:
     _zx_cols[side] = [z_entry.get(f, {}).get('X') for f in freq_list]
     s11_usecols += [c for c in _zr_cols[side] if c is not None]
     s11_usecols += [c for c in _zx_cols[side] if c is not None]
+
+# 単一周波数(1点)モードの判定: どの side も周波数が 1 つだけ。
+# このとき「掃引の形」は描けないので、表示を次のように切り替える:
+#   スミスチャート  … その 1 点の Γ が時間とともに動く軌跡(直近 SMITH_TRAIL_FRAMES 行)
+#   左右インピーダンス相対誤差 … 周波数軸ではなく時間軸のグラフ
+#   周波数スライダー … 選ぶ余地が無いので出さない
+SINGLE_FREQ = HAS_SMITH and all(len(freqs[s]) == 1 for s in SIDES)
+SMITH_TRAIL_FRAMES = 300   # 単一周波数モードでスミスチャートに残す軌跡の長さ[行数]
+
+
+def fmt_freq_mhz(f, prec=2):
+    """周波数[MHz]の表示。列名にサフィックスが無い古い CSV では不明(?)になる。"""
+    return '?' if not np.isfinite(f) else '{:.{p}f}'.format(f, p=prec)
+
 
 VIDEO_TIME_COL = 'video_time_sec'
 VIDEO_INRANGE_COL = 'in_video'
@@ -226,6 +281,7 @@ video_cap = None
 video_time_sec = None
 video_in_range = None
 video_fps = 30.0
+VIDEO_SIZE = (640, 480)   # 映像の (幅, 高さ)。開いたあと実際の値で上書きする
 if args.video:
     video_path = Path(args.video)
     if not video_path.exists():
@@ -271,7 +327,14 @@ if args.video:
     fps = video_cap.get(cv2.CAP_PROP_FPS)
     if fps and 1 < fps <= 240:
         video_fps = float(fps)
-    print(f'[Info] video_time_sec のソース: {src} / 動画FPS: {video_fps:.1f}')
+    # 映像の縦横比。動画パネルの初期プレースホルダをこの比で作らないと、
+    # 正方形のダミー画像に合わせて軸の箱が正方形に固定され、映像が縦に伸びる。
+    _vw = int(video_cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    _vh = int(video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    if _vw > 0 and _vh > 0:
+        VIDEO_SIZE = (_vw, _vh)
+    print(f'[Info] video_time_sec のソース: {src} / 動画FPS: {video_fps:.1f} / '
+          f'サイズ: {VIDEO_SIZE[0]}x{VIDEO_SIZE[1]}')
 HAS_VIDEO = video_cap is not None
 
 # 動画同期の対象となる行(in_range かつ video_time_sec が有限)の範囲
@@ -356,9 +419,18 @@ fig.suptitle('Dataset + Video Playback Viewer', fontsize=14, fontweight='bold')
 if HAS_VIDEO:
     ax_video = fig.add_axes([0.015, 0.30, 0.26, 0.60])
     ax_video.axis('off')
-    video_img = ax_video.imshow(np.zeros((10, 10, 3), dtype=np.uint8), animated=True)
+    # プレースホルダは必ず映像と同じ縦横比で作る。imshow は aspect='equal' なので
+    # 軸の箱がこの画像の比に合わせて縮められる。正方形のダミーだと箱が正方形に決まり、
+    # 以後そこへ映像を流し込むと縦に引き伸ばされて見える。
+    # interpolation='nearest': 既定の 'antialiased' は縮小のたびに重い再サンプルが
+    # 走る(実測 ~15 ms/フレーム)。表示サイズへの縮小は _set_video_image が OpenCV で
+    # 済ませるので、ここは等倍描画で足りる。
+    video_img = ax_video.imshow(
+        np.zeros((VIDEO_SIZE[1], VIDEO_SIZE[0], 3), dtype=np.uint8),
+        animated=True, interpolation='nearest')
     video_title = ax_video.text(0.5, 1.02, '', transform=ax_video.transAxes,
-                                ha='center', va='bottom', fontsize=10, fontweight='bold')
+                                ha='center', va='bottom', fontsize=10, fontweight='bold',
+                                animated=True)
 else:
     ax_video = None
 
@@ -378,7 +450,7 @@ if np.any(np.isfinite(all_angles)):
 ax_ang.tick_params(labelsize=7)
 ax_ang.grid(True, lw=0.4, alpha=0.5)
 ax_ang.legend(loc='upper right', fontsize=7, ncol=2)
-vline = ax_ang.axvline(timestamps[0], color='black', lw=1.2, alpha=0.7)
+vline = ax_ang.axvline(timestamps[0], color='black', lw=1.2, alpha=0.7, animated=True)
 
 # --- 3D 軸設定 ---
 all_pts = np.vstack(list(pos.values()))
@@ -412,11 +484,13 @@ for name, _ in MARKERS:
     st = MARKER_STYLE[name]
     ax.plot(*pos[name].T, color=st['trail'], alpha=0.35, lw=0.8, zorder=1)
 
+# 毎フレーム動かすアーティストは animated=True にして blit で描く(_blit_all を参照)。
+# 静的な軌跡・格子・目盛は背景としてキャッシュされ、再描画されない。
 pts = {}
 for name, _ in MARKERS:
     st = MARKER_STYLE[name]
     pt, = ax.plot([], [], [], linestyle='None', marker=st['marker'], color=st['color'],
-                  ms=9, label=st['label'], zorder=5)
+                  ms=9, label=st['label'], zorder=5, animated=True)
     pts[name] = pt
 
 BONES = [
@@ -427,16 +501,17 @@ BONES = [
     ('L_upperarm', 'L_joint',    'blue'),
     ('L_joint',    'L_forearm',  'blue'),
 ]
-bone_lines = [ax.plot([], [], [], '-', color=c, lw=2.2, zorder=4)[0] for _, _, c in BONES]
+bone_lines = [ax.plot([], [], [], '-', color=c, lw=2.2, zorder=4, animated=True)[0]
+              for _, _, c in BONES]
 
 # マーカー凡例は右端に縦 1 列でまとめ、左上の肘角度テキストと重ならないようにする。
 ax.legend(loc='upper right', fontsize=6.5, ncol=1, labelspacing=0.25,
           handletextpad=0.3, borderaxespad=0.1, framealpha=0.6)
-time_txt    = ax.text2D(0.02, 0.97, '', transform=ax.transAxes, fontsize=9)
+time_txt    = ax.text2D(0.02, 0.97, '', transform=ax.transAxes, fontsize=9, animated=True)
 angle_txt_r = ax.text2D(0.02, 0.91, '', transform=ax.transAxes, fontsize=11,
-                        color='crimson', fontweight='bold')
+                        color='crimson', fontweight='bold', animated=True)
 angle_txt_l = ax.text2D(0.02, 0.85, '', transform=ax.transAxes, fontsize=11,
-                        color='royalblue', fontweight='bold')
+                        color='royalblue', fontweight='bold', animated=True)
 
 # ------------------------------------------------------------------ #
 # スミスチャート(右上: 左右並び 2 つ)
@@ -523,15 +598,25 @@ if HAS_SMITH:
         axs = fig.add_axes(blk['rect'])
         draw_smith_grid(axs)
         fmin, fmax, npts = freqs[side].min(), freqs[side].max(), len(freqs[side])
-        fig.text(blk['cx'], blk['title_y'],
-                 f'{st["label"]} S11\n{fmin:.1f}-{fmax:.1f} MHz ({npts}pt)',
+        if SINGLE_FREQ:
+            # 1 点しか無いので掃引範囲ではなく「その周波数」と、軌跡表示であることを出す
+            # (matplotlib の既定フォントは日本語を持たないので図中の文字は英語にする)
+            title = (f'{st["label"]} S11\n@ {fmt_freq_mhz(fmin)} MHz '
+                     f'(1pt: trail of last {SMITH_TRAIL_FRAMES} rows)')
+        else:
+            title = (f'{st["label"]} S11\n'
+                     f'{fmt_freq_mhz(fmin, 1)}-{fmt_freq_mhz(fmax, 1)} MHz ({npts}pt)')
+        fig.text(blk['cx'], blk['title_y'], title,
                  fontsize=9, fontweight='bold', color=st['color'], ha='center', va='top')
-        line, = axs.plot([], [], '-', color=st['color'], lw=1.3, zorder=3)
-        start_pt, = axs.plot([], [], marker='o', color=st['color'], ms=5, zorder=4)
+        line, = axs.plot([], [], '-', color=st['color'], lw=1.3, zorder=3, animated=True)
+        start_pt, = axs.plot([], [], marker='o', color=st['color'], ms=5, zorder=4,
+                             animated=True)
         marker_pt, = axs.plot([], [], marker='*', color='gold', ms=16,
-                              markeredgecolor=st['color'], markeredgewidth=1.3, zorder=6)
+                              markeredgecolor=st['color'], markeredgewidth=1.3, zorder=6,
+                              animated=True)
         txt = fig.text(blk['cx'], blk['ztext_y'], '', fontsize=8.5,
-                       ha='center', va='top', color=st['color'], fontweight='bold')
+                       ha='center', va='top', color=st['color'], fontweight='bold',
+                       animated=True)
         smith_lines[side] = line
         smith_start_pts[side] = start_pt
         freq_marker_pts[side] = marker_pt
@@ -544,6 +629,7 @@ if HAS_SMITH:
 # ------------------------------------------------------------------ #
 HAS_ERR = HAS_SMITH and ('leftbody' in SIDES) and ('rightbody' in SIDES)
 err_line = None
+err_vline = None
 if HAS_ERR:
     _nerr = min(len(freqs['leftbody']), len(freqs['rightbody']))
     err_freqs = np.asarray(freqs['leftbody'][:_nerr], dtype=float)
@@ -553,20 +639,39 @@ if HAS_ERR:
     _rel_all = np.abs(_zl_all - _zr_all) / (np.abs(_zr_all) + 1e-12) * 100.0
     _emax = np.nanpercentile(_rel_all, 99) if np.any(np.isfinite(_rel_all)) else 100.0
     ax_err = fig.add_axes([0.635, 0.335, 0.35, 0.155])
-    (err_line,) = ax_err.plot([], [], color='purple', lw=1.4)
-    ax_err.set_xlim(float(err_freqs.min()), float(err_freqs.max()))
     ax_err.set_ylim(0, max(float(_emax) * 1.1, 1.0))
-    ax_err.set_xlabel('Frequency (MHz)', fontsize=8)
     ax_err.set_ylabel('|Z_L - Z_R| / |Z_R|  [%]', fontsize=8)
-    ax_err.set_title('L vs R impedance relative error (ref: Right)',
-                     fontsize=9, fontweight='bold')
     ax_err.tick_params(labelsize=7)
     ax_err.grid(True, lw=0.4, alpha=0.5)
+    if SINGLE_FREQ:
+        # 周波数軸が 1 点しか無い(=線が引けない)ので、全フレームの推移を時間軸で描き、
+        # 現在フレームを縦線で示す。
+        _rel_series = _rel_all[:, 0]
+        ax_err.plot(timestamps, _rel_series, color='purple', lw=1.0, alpha=0.9)
+        err_vline = ax_err.axvline(timestamps[0], color='black', lw=1.2, alpha=0.7,
+                                   animated=True)
+        ax_err.set_xlim(float(timestamps[0]), float(timestamps[-1]))
+        ax_err.set_xlabel('Time (s)', fontsize=8)
+        ax_err.set_title('L vs R impedance relative error (ref: Right) @ {} MHz'.format(
+            fmt_freq_mhz(err_freqs[0])), fontsize=9, fontweight='bold')
+    else:
+        (err_line,) = ax_err.plot([], [], color='purple', lw=1.4, animated=True)
+        ax_err.set_xlim(float(err_freqs.min()), float(err_freqs.max()))
+        ax_err.set_xlabel('Frequency (MHz)', fontsize=8)
+        ax_err.set_title('L vs R impedance relative error (ref: Right)',
+                         fontsize=9, fontweight='bold')
 
 
 def update_err_display(idx):
-    """現在フレームの左右インピーダンス相対誤差(右基準)を周波数ごとにプロットする。"""
+    """
+    左右インピーダンスの相対誤差(右基準)を更新する。
+    掃引モード: 現在フレームの誤差を周波数ごとにプロットする。
+    単一周波数モード: 全フレームの時系列は固定表示なので、現在位置の縦線だけ動かす。
+    """
     if not HAS_ERR:
+        return
+    if SINGLE_FREQ:
+        err_vline.set_xdata([timestamps[idx], timestamps[idx]])
         return
     zl = z_real['leftbody'][idx, :_nerr] + 1j * z_react['leftbody'][idx, :_nerr]
     zr = z_real['rightbody'][idx, :_nerr] + 1j * z_react['rightbody'][idx, :_nerr]
@@ -582,19 +687,44 @@ def update_err_display(idx):
 ax_slider = fig.add_axes([0.10, 0.115, 0.84, 0.025])
 slider = Slider(ax_slider, 'Time', 0, n_frames - 1,
                 valinit=0, valstep=1, color='steelblue')
+# set_val のたびに canvas.draw_idle()(図全体の再描画)が走らないようにする。
+# スライダーの表示は _blit_all() が animated アーティストとして描き直す。
+slider.drawon = False
+slider.poly.set_animated(True)
+slider._handle.set_animated(True)
+slider.valtext.set_animated(True)
 
 ax_btn = fig.add_axes([0.06, 0.035, 0.10, 0.05])
 btn_play = Button(ax_btn, 'Play', color='0.85', hovercolor='0.70')
+btn_play.label.set_animated(True)
 
 ax_time_box = fig.add_axes([0.27, 0.04, 0.10, 0.035])
 time_box = TextBox(ax_time_box, f'Frame(0-{n_frames - 1}) ', initial='0')
+time_box.text_disp.set_animated(True)
 
 state = {'playing': False, 'frame': 0, 'updating': False, 'freq': None,
-         'bg': None, 'vframe': 0}
+         'bg': None, 'vframe': 0, 'vshape': None,
+         'last_panel': 0.0,      # 3D/スミス等を最後に更新した時刻(間引き用)
+         # 実時間再生の基準(再生開始時刻と、そのときの動画フレーム番号 / CSV 行)
+         'play_t0': 0.0, 'play_vf0': 0, 'play_row0': 0,
+         'regions': None}   # blit する領域(初回に算出してキャッシュ)
+
+# 動画あり再生で「動画以外のパネル(3D・スミス・角度・スライダー)」を更新する上限レート。
+# 動画は実時間どおり更新するが、全パネルの描き直しは 1 回 40〜50 ms かかるため、
+# 毎フレーム行うと動画のフレーム間隔(24 fps なら 41.7 ms)を使い切ってしまい、
+# フレームを落として映像がカクつく。実測では 10 Hz で映像 21.6/24 fps(取りこぼし 9%)、
+# 15 Hz では 15〜17 fps(同 28〜38%)。下げると映像が滑らかに、上げるとパネルが
+# 動画によく追従する(単一周波数モードでも CSV の全行が描かれるわけではない)。
+PANEL_UPDATE_MAX_HZ = 10
+PANEL_MIN_INTERVAL = 1.0 / PANEL_UPDATE_MAX_HZ
 
 DEFAULT_FREQ_MHZ = 13.56
 freq_slider = None
-if HAS_SMITH:
+if SINGLE_FREQ:
+    # 周波数が 1 つしか無いので選ぶ余地が無い(スライダーは出さない)。
+    # 読み取り対象はその 1 点に固定する。
+    state['freq'] = float(freqs[SIDES[0]][0])
+elif HAS_SMITH:
     _all_freqs = np.concatenate([freqs[side] for side in SIDES])
     _fmin, _fmax = float(_all_freqs.min()), float(_all_freqs.max())
     _fstep = float(np.min([np.diff(freqs[side]).min() for side in SIDES if len(freqs[side]) > 1] or [0.01]))
@@ -611,7 +741,8 @@ def update_freq_display():
     idx = state['frame']
     target = state['freq']
     for side in SIDES:
-        fi = nearest_freq_idx(side, target)
+        # 単一周波数モードでは選択肢が 1 つだけ(周波数が不明な古い CSV でも 0 に固定)
+        fi = 0 if SINGLE_FREQ else nearest_freq_idx(side, target)
         actual_f = freqs[side][fi]
         gr = gamma_real[side][idx, fi]
         gi = gamma_imag[side][idx, fi]
@@ -621,11 +752,12 @@ def update_freq_display():
             freq_marker_pts[side].set_data(np.array([gr]), np.array([gi]))
         else:
             freq_marker_pts[side].set_data(np.array([]), np.array([]))
+        f_lbl = fmt_freq_mhz(actual_f)
         if np.isfinite(zr) and np.isfinite(zx):
             sign = '+' if zx >= 0 else '-'
-            freq_txt[side].set_text(f'@{actual_f:.2f} MHz: Z = {zr:.1f} {sign} j{abs(zx):.1f} Ω')
+            freq_txt[side].set_text(f'@{f_lbl} MHz: Z = {zr:.1f} {sign} j{abs(zx):.1f} Ω')
         else:
-            freq_txt[side].set_text(f'@{actual_f:.2f} MHz: Z = N/A')
+            freq_txt[side].set_text(f'@{f_lbl} MHz: Z = N/A')
 
 
 # ------------------------------------------------------------------ #
@@ -647,15 +779,31 @@ def draw_markers_smith(idx):
     angle_txt_r.set_text(f'R Elbow: {fmt_angle(angles["R"][idx])}')
     angle_txt_l.set_text(f'L Elbow: {fmt_angle(angles["L"][idx])}')
     vline.set_xdata([timestamps[idx], timestamps[idx]])
-    if not state['updating']:
-        state['updating'] = True
-        slider.set_val(idx)
+    # ---- ウィジェットの表示更新 ----
+    # TextBox.set_val() は 'submit' オブザーバまで発火するため、そのまま呼ぶと
+    # on_time_submit → seek_to_row に再入し、行が変わるたびに動画を再シークして
+    # しまう(mp4 のシークはキーフレーム単位なので映像がとびとびになる)。さらに
+    # TextBox._rendercursor() は canvas.draw() を同期実行するため、行が変わるたびに
+    # 図全体が再描画されて再生が追いつかなくなる。
+    # → 表示テキストだけを直接書き換える(オブザーバも再描画も起こさない)。
+    state['updating'] = True
+    try:
+        slider.set_val(idx)          # drawon=False なので再描画は起きない
+        time_box.text_disp.set_text(str(idx))
+    finally:
         state['updating'] = False
-    time_box.set_val(str(idx))
     if HAS_SMITH:
         for side in SIDES:
-            re_vals = gamma_real[side][idx]
-            im_vals = gamma_imag[side][idx]
+            if SINGLE_FREQ:
+                # 1 点しか無いので掃引トレースは引けない。代わりに、その周波数の Γ が
+                # 時間とともにどう動いたか(直近 SMITH_TRAIL_FRAMES 行の軌跡)を描き、
+                # 軌跡の始点を ○ で、現在値を ★(update_freq_display)で示す。
+                lo = max(0, idx - SMITH_TRAIL_FRAMES + 1)
+                re_vals = gamma_real[side][lo:idx + 1, 0]
+                im_vals = gamma_imag[side][lo:idx + 1, 0]
+            else:
+                re_vals = gamma_real[side][idx]
+                im_vals = gamma_imag[side][idx]
             mask = np.isfinite(re_vals) & np.isfinite(im_vals)
             smith_lines[side].set_data(re_vals[mask], im_vals[mask])
             if mask.any():
@@ -666,22 +814,160 @@ def draw_markers_smith(idx):
         update_err_display(idx)
 
 
-def full_redraw(idx):
-    """マーカー/スミス/角度を更新して全体を再描画し、動画 blit 用の背景を取り直す。"""
-    draw_markers_smith(idx)
-    fig.canvas.draw()
+# ------------------------------------------------------------------ #
+# 描画(blit)
+#   毎フレーム図全体を再描画すると、肘角度・相対誤差の時系列(数千点)や 3D の箱・
+#   スミス格子まで描き直すことになり 1 回あたり数百 ms かかる。単一周波数モードでは
+#   CSV の行が動画フレームより速く進む(例 54 Hz > 24 fps)ため、行が変わるたびに
+#   全体再描画していると再生が追いつかず、映像がとびとびになる。
+#   → 静的な部分は背景としてキャッシュし、動くアーティストだけ描き直して blit する。
+# ------------------------------------------------------------------ #
+# 毎フレーム描き直すアーティスト(描画順=下→上)
+_ANIM = list(pts.values()) + list(bone_lines) + [time_txt, angle_txt_r, angle_txt_l, vline]
+if HAS_SMITH:
+    for _side in SIDES:
+        _ANIM += [smith_lines[_side], smith_start_pts[_side],
+                  freq_marker_pts[_side], freq_txt[_side]]
+if HAS_ERR:
+    _ANIM.append(err_vline if SINGLE_FREQ else err_line)
+# 動画パネルは毎フレーム更新する(他のパネルは PANEL_UPDATE_MAX_HZ で間引く)。
+# 時刻テキスト(video_title)は軸の外にあり動画領域の blit に含まれないので、毎フレーム
+# 描いても画面には出ない。テキスト描画は 1〜2 ms かかるためここには入れない。
+_ANIM_VIDEO = [video_img] if HAS_VIDEO else []
+if HAS_VIDEO:
+    _ANIM += [video_img, video_title]
+_ANIM += [slider.poly, slider._handle, slider.valtext, time_box.text_disp,
+          btn_play.label]   # Play/Pause の表示も blit で更新する
+
+
+# blit の結果を画面へ反映する方法。Tk バックエンドでは flush_events() が
+# canvas.update()(= 入力イベントも含む全イベント処理)を呼ぶため 1 回あたり数十 ms
+# かかることがある。再描画だけを処理する update_idletasks() で十分かつ大幅に軽い。
+_tk_widget = None
+if hasattr(fig.canvas, 'get_tk_widget'):
+    try:
+        _tk_widget = fig.canvas.get_tk_widget()
+    except Exception:
+        _tk_widget = None
+
+
+def _flush():
+    if _tk_widget is not None:
+        _tk_widget.update_idletasks()
+    else:
+        fig.canvas.flush_events()
+
+
+def _draw_animated():
+    """動くアーティストだけを現在のレンダラで描く(図全体の再描画はしない)。"""
+    for art in _ANIM:
+        try:
+            # fig.text() で作ったアーティストは axes を持たないので figure に描かせる
+            (art.axes or fig).draw_artist(art)
+        except Exception:
+            pass               # 一時的な描画例外で再生を止めない
+
+
+def _on_draw(_event=None):
+    """
+    図全体が描かれたとき(初回/リサイズ/3D 回転)に静的背景をキャッシュし直す。
+    全体描画では animated アーティストは描かれないので、ここで描いて画面へ出す。
+    """
+    try:
+        state['bg'] = fig.canvas.copy_from_bbox(fig.bbox)
+    except Exception:
+        state['bg'] = None
+        return
+    state['regions'] = None      # リサイズ等で軸の位置が変わっている可能性
+    _draw_animated()
+    fig.canvas.blit(fig.bbox)
+
+
+fig.canvas.mpl_connect('draw_event', _on_draw)
+
+
+def _blit_regions():
+    """
+    画面へ転送する領域(= 動くアーティストがある軸 + 図直下のテキスト周辺)を返す。
+
+    図全体を blit すると余白まで毎回転送することになり、この図(1600x900)では
+    1 回あたり 25〜30 ms かかる。必要な領域だけに絞ると半分以下で済む。
+    """
+    regs = []
+    seen = []
+    for art in _ANIM:
+        a = art.axes
+        if a is not None and a not in seen:
+            seen.append(a)
+            regs.append(a.bbox)
+    # fig.text() で置いた Z 読み出しはどの軸にも属さないので、スミス 2 枚と
+    # その下のテキストをまとめて覆う矩形(図座標)を 1 つ足す。
+    if HAS_SMITH:
+        x0 = min(SMITH_BLOCK[s]['rect'][0] for s in SIDES) - 0.01
+        x1 = max(SMITH_BLOCK[s]['rect'][0] + SMITH_BLOCK[s]['rect'][2] for s in SIDES) + 0.01
+        y0 = min(SMITH_BLOCK[s]['ztext_y'] for s in SIDES) - 0.04
+        y1 = max(SMITH_BLOCK[s]['rect'][1] + SMITH_BLOCK[s]['rect'][3] for s in SIDES) + 0.01
+        regs.append(TransformedBbox(Bbox([[x0, y0], [x1, y1]]), fig.transFigure))
+    # 動画パネルのタイトル(軸の上)も入るよう、動画軸だけ少し上へ広げる
     if HAS_VIDEO:
-        state['bg'] = fig.canvas.copy_from_bbox(ax_video.bbox)
+        bb = ax_video.bbox
+        regs.append(Bbox([[bb.x0, bb.y0], [bb.x1, bb.y1 + 0.04 * fig.bbox.height]]))
+    return regs
 
 
-def blit_video():
-    """動画パネルだけを高速に更新(全体再描画しない)。"""
+def _blit_all():
+    """背景を復元し、動くアーティストだけ描き直して画面へ反映する。"""
     if state['bg'] is None:
+        fig.canvas.draw()      # -> draw_event -> _on_draw が背景の保存まで行う
         return
     fig.canvas.restore_region(state['bg'])
-    ax_video.draw_artist(video_img)
+    _draw_animated()
+    if state['regions'] is None:
+        state['regions'] = _blit_regions()
+    for reg in state['regions']:
+        fig.canvas.blit(reg)
+    _flush()
+
+
+def _blit_video_only():
+    """
+    動画パネルだけを更新する(動画領域だけ blit するので全面 blit よりずっと安価)。
+    背景の復元は全面に効くが、画面へ転送するのは動画領域だけなので、他のパネルは
+    前回 blit した内容がそのまま残る。
+    """
+    if state['bg'] is None:
+        fig.canvas.draw()
+        return
+    fig.canvas.restore_region(state['bg'])
+    for art in _ANIM_VIDEO:
+        ax_video.draw_artist(art)
     fig.canvas.blit(ax_video.bbox)
-    fig.canvas.flush_events()
+    _flush()
+
+
+def full_redraw(idx):
+    """マーカー/スミス/角度/動画を更新して画面へ反映する。"""
+    draw_markers_smith(idx)
+    _blit_all()
+
+
+# ツールバーの保存ボタン(fig.savefig)は通常の描画を行うため、animated アーティスト
+# (マーカー・スミス・動画)が入らない。保存の間だけ animated を外して描かせる。
+_orig_savefig = fig.savefig
+
+
+def _savefig_with_animated(*a, **kw):
+    for art in _ANIM:
+        art.set_animated(False)
+    try:
+        return _orig_savefig(*a, **kw)
+    finally:
+        for art in _ANIM:
+            art.set_animated(True)
+        state['bg'] = None      # 背景を取り直す(保存時の描画で汚れているため)
+
+
+fig.savefig = _savefig_with_animated
 
 
 # ------------------------------------------------------------------ #
@@ -695,9 +981,34 @@ if HAS_VIDEO:
 
 
 def _set_video_image(frame_bgr, t_sec):
-    rgb = frame_bgr[:, :, ::-1]
+    """
+    動画フレームを表示用アーティストへ流し込む。
+
+    速度のための工夫(ここが再生の重さの大半を占めるため):
+      - 表示サイズへの縮小は OpenCV で行う。matplotlib の imshow は既定の補間
+        ('antialiased')で描画のたびに重い再サンプルを行うため(実測 ~15 ms)、
+        あらかじめ表示ピクセル数まで落として補間 'nearest' で描く(~3.5 ms)。
+      - BGR→RGB は cvtColor で連続配列にする(逆順スライスのビューは後段が遅い)。
+      - extent は映像サイズが変わったときだけ更新する(毎回呼ぶと軸の再計算が入る)。
+
+    ★縦横比★ 縮小先は「軸の箱にそのまま合わせる」のではなく、元映像の縦横比を保った
+    まま箱に収まる最大サイズにする。箱の縦横比は映像と一致しているとは限らないため、
+    箱にそのまま合わせると映像が引き伸ばされてしまう。
+    """
+    h, w = frame_bgr.shape[:2]
+    bb = ax_video.bbox
+    scale = min(bb.width / max(w, 1), bb.height / max(h, 1), 1.0)  # 拡大はしない
+    tw, th = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+    if (tw, th) != (w, h):
+        frame_bgr = cv2.resize(frame_bgr, (tw, th), interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     video_img.set_data(rgb)
-    video_img.set_extent((0, rgb.shape[1], rgb.shape[0], 0))
+    if state.get('vshape') != rgb.shape:
+        # extent が変わると軸の箱が縦横比に合わせて再配置されるので、背景を取り直す
+        video_img.set_extent((0, rgb.shape[1], rgb.shape[0], 0))
+        state['vshape'] = rgb.shape
+        state['bg'] = None
+        state['regions'] = None
     video_title.set_text(f'Video t = {t_sec:.2f} s')
 
 
@@ -727,18 +1038,45 @@ def seek_to_row(idx):
 # ------------------------------------------------------------------ #
 # 再生タイマー
 # ------------------------------------------------------------------ #
+# タイマーは「描くべきものがあるか」を細かく確認するためのもので、1 ティック＝1 フレーム
+# ではない(何を描くかは経過した実時間から決める)。matplotlib のタイマーはコールバックが
+# 終わってから次を予約するため、間隔を動画のフレーム間隔(41.7 ms)にすると
+# 「間隔 + 描画時間」が実周期になり、そのぶん再生が遅れてしまう。細かく回して調整する。
 if HAS_VIDEO:
-    _interval_ms = max(5, int(1000.0 / video_fps))
+    # フレーム間隔(41.7 ms @24fps)より十分細かく回す。matplotlib のタイマーは
+    # 「間隔 + コールバックの所要時間」が実周期になるため、間隔が大きいと重い
+    # ティックのたびにフレームを落とすことになる。
+    _interval_ms = 5
 else:
-    _interval_ms = max(5, int(dt_ms / max(args.speed, 1e-6)))
+    # CSV が高レート(単一周波数モードでは数十 Hz)でも描画は 30 fps 程度で足りる。
+    _interval_ms = max(20, min(33, int(dt_ms / max(args.speed, 1e-6))))
 
 timer = fig.canvas.new_timer(interval=_interval_ms)
 
 
 def _tick_video():
+    """
+    再生タイマー本体。表示すべき動画フレームを「実時間」から決める。
+
+    タイマーは 1 ティックごとに 1 枚描くのではなく、経過した実時間に対応する
+    フレーム番号まで進める。描画が間に合わないときは途中のフレームを cap.grab() で
+    読み飛ばす(デコード位置は連続のままなのでシークは発生しない)。
+    こうしないと、1 ティック 1 枚固定では描画時間ぶんだけ再生が遅れ続け、
+    映像と実時間がずれてカクついて見える。
+    """
     if not state['playing']:
         return
-    ret, frame = video_cap.read()          # 次のフレームを 1 枚だけ読む(飛ばさない)
+    # いま表示すべきフレーム番号(録画は実時間で一定 FPS なので単純比例)
+    target_vf = state['play_vf0'] + int(
+        (time.perf_counter() - state['play_t0']) * video_fps)
+    if target_vf <= state['vframe']:
+        return                              # 次のフレームの時刻にまだ達していない
+    # 間に合っていないぶんは grab() で読み飛ばす(retrieve しないので安価)
+    while state['vframe'] + 1 < target_vf:
+        if not video_cap.grab():
+            _stop_play(); return
+        state['vframe'] += 1
+    ret, frame = video_cap.read()
     if not ret or frame is None:
         _stop_play(); return
     state['vframe'] += 1
@@ -747,19 +1085,33 @@ def _tick_video():
         _stop_play(); return
     _set_video_image(frame, t_vid)
     idx = row_for_video_time(t_vid)         # その時刻に対応する CSV 行
-    if idx != state['frame'] or state['bg'] is None:
-        full_redraw(idx)                    # 行が変わった: マーカー/スミス更新 + 背景取り直し
+    now = time.perf_counter()
+    # 単一周波数モードでは CSV が動画より速く進む(例 54 Hz > 24 fps)ため、行が変わる
+    # たびに全パネルを描き直すと 1 フレームの予算(1/動画FPS)を超えて再生が追いつかない。
+    # → 動画は毎フレーム更新し、他のパネルは PANEL_UPDATE_MAX_HZ までに間引く。
+    if state['bg'] is None or (idx != state['frame']
+                               and now - state['last_panel'] >= PANEL_MIN_INTERVAL):
+        state['last_panel'] = now
+        full_redraw(idx)                    # マーカー/スミス/動画をまとめて更新
     else:
-        blit_video()                        # 同じ行: 動画だけ高速更新
+        _blit_video_only()                  # 動画パネルだけ更新(安価)
 
 
 def _tick_novideo():
     if not state['playing']:
         return
-    nxt = state['frame'] + 1
-    if nxt >= n_frames:
+    # 経過した実時間に対応する行へ進める(描画が間に合わないときは行を飛ばして
+    # 実時間再生を保つ)。1 ティック 1 行だと、CSV が高レートのとき描画が間に合わず
+    # スローモーション再生になってしまう。
+    now = time.perf_counter()
+    elapsed = (now - state['play_t0']) * max(args.speed, 1e-6)
+    t_target = timestamps[state['play_row0']] + elapsed
+    if t_target > timestamps[-1]:
         _stop_play(); return
-    full_redraw(nxt)
+    nxt = int(np.searchsorted(timestamps, t_target, side='right') - 1)
+    nxt = int(np.clip(nxt, 0, n_frames - 1))
+    if nxt != state['frame'] or state['bg'] is None:
+        full_redraw(nxt)
 
 
 def _start_play():
@@ -767,6 +1119,11 @@ def _start_play():
     btn_play.label.set_text('Pause')
     if HAS_VIDEO:
         seek_to_row(state['frame'])         # 現在行の位置へ動画を合わせてから連続再生
+    # 実時間再生の基準(この時刻・このフレーム/行から、経過した実時間ぶん進める)
+    state['play_t0'] = time.perf_counter()
+    state['play_vf0'] = state['vframe']
+    state['play_row0'] = state['frame']
+    state['last_panel'] = 0.0
     timer.start()
 
 
@@ -774,6 +1131,7 @@ def _stop_play():
     state['playing'] = False
     btn_play.label.set_text('Play')
     timer.stop()
+    _blit_all()      # 停止後は再生ループが回らないのでここで表示を更新する
 
 
 def on_btn(_event):

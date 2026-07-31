@@ -78,6 +78,11 @@ def _elbow_angle(upper, joint, fore):
 SMITH_GRID_R = (0.2, 0.5, 1.0, 2.0, 5.0)   # 定抵抗円 r = R/Z0
 SMITH_GRID_X = (0.2, 0.5, 1.0, 2.0, 5.0)   # 定リアクタンス円 x = X/Z0 (±)
 
+# 単一周波数(1点)モードでスミスチャートに残す軌跡の長さ[サンプル数]。
+# 1 点だけだと点が 1 個ちらつくだけで動きが読めないため、直近サンプルを線でつないで
+# 「その周波数の Γ が時間とともにどう動いたか」を見えるようにする。
+SINGLE_FREQ_TRAIL = 300
+
 
 def smith_r_circle(r, n=181):
     """
@@ -151,6 +156,10 @@ class LiveDashboard:
         self.parent = parent
         self.channel_names = list(channel_names)
         self.freq_grid_hz = np.asarray(freq_grid_hz, dtype=float)
+        # 単一周波数(1点)モードか。掃引トレースが引けないので、スミスチャートは
+        # 「直近サンプルの軌跡 + 現在値」を描く表示に切り替える。
+        self.single_freq = (self.freq_grid_hz.size <= 1)
+        self._trail = {}   # {ch_index: deque[(re, im)]}(単一周波数モードのみ使用)
         self.get_positions = get_positions
         self.get_sweep = get_sweep
         self.get_frame = get_frame
@@ -266,13 +275,20 @@ class LiveDashboard:
             bottom = 0.06 + (n - 1 - i) * h
             axs = self.fig.add_axes([0.66, bottom + 0.06, 0.30, h - 0.10])
             draw_smith_grid(axs)
-            axs.set_title('{}  S11 Smith  ({:.2f}-{:.2f} MHz)'.format(st['label'], fmin, fmax),
-                          fontsize=9, color=st['color'], fontweight='bold')
+            if self.single_freq:
+                # 単一周波数: 掃引範囲ではなく「その 1 点の周波数」と軌跡表示であることを示す
+                # 図中の文字は英語(matplotlib の既定フォントに日本語が無いため)
+                title = '{}  S11 @ {:.4f} MHz  (trail)'.format(st['label'], fmin)
+            else:
+                title = '{}  S11 Smith  ({:.2f}-{:.2f} MHz)'.format(st['label'], fmin, fmax)
+            axs.set_title(title, fontsize=9, color=st['color'], fontweight='bold')
             line, = axs.plot([], [], '-', color=st['color'], lw=1.3, zorder=3, animated=True)
+            # 掃引モードでは掃引の開始点、単一周波数モードでは「現在値」を示すマーカー。
             start_pt, = axs.plot([], [], marker='o', color=st['color'], ms=5, zorder=4,
                                  animated=True)
             self._smith_lines[i] = line
             self._smith_start[i] = start_pt
+            self._trail[i] = collections.deque(maxlen=SINGLE_FREQ_TRAIL)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.win)
         self._tkwidget = self.canvas.get_tk_widget()
@@ -435,6 +451,23 @@ class LiveDashboard:
             re = s11.real
             im = s11.imag
             mask = np.isfinite(re) & np.isfinite(im)
+            if self.single_freq:
+                # 単一周波数: 1 点しか無いので線が引けない。直近サンプルの軌跡を線で描き、
+                # 現在値を ○ で示す。描画タイマー(~30fps)は掃引レートより速く回るため、
+                # 前回と同じ値(=まだ新しい掃引が来ていない)は軌跡に追加しない。
+                trail = self._trail[i]
+                if mask.any():
+                    pt = (float(re[mask][0]), float(im[mask][0]))
+                    if not trail or trail[-1] != pt:
+                        trail.append(pt)
+                if trail:
+                    arr = np.asarray(trail, dtype=float)
+                    line.set_data(arr[:, 0], arr[:, 1])
+                    self._smith_start[i].set_data([arr[-1, 0]], [arr[-1, 1]])
+                else:
+                    line.set_data([], [])
+                    self._smith_start[i].set_data([], [])
+                continue
             line.set_data(re[mask], im[mask])
             if mask.any():
                 self._smith_start[i].set_data([re[mask][0]], [im[mask][0]])
