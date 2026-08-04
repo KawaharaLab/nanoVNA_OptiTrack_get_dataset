@@ -82,6 +82,7 @@ import matplotlib.pyplot as plt
 from matplotlib.widgets import Button, Slider, TextBox
 from matplotlib.ticker import MaxNLocator
 from matplotlib.transforms import Bbox, TransformedBbox
+from matplotlib.patches import Rectangle
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (projection='3d' 登録用)
 
 
@@ -373,14 +374,45 @@ if args.video:
     fps = video_cap.get(cv2.CAP_PROP_FPS)
     if fps and 1 < fps <= 240:
         video_fps = float(fps)
+
+    # --- 実効 FPS の測り直し ---
+    # 本ビューアは「表示すべきフレーム番号 = 経過した実時間 × video_fps」で再生する。
+    # そのため video_fps(= CAP_PROP_FPS の宣言値)が実際とずれていると再生速度がずれる:
+    # 宣言値が実効値より低いとスロー再生、高いと早送りになる。GoPro/スマホ/Windows カメラ
+    # の mp4 は、可変フレームレート(VFR)やメタデータの取りこぼしで CAP_PROP_FPS が実効値と
+    # 食い違うことがある。そこで先頭を少しデコードし、各フレームの実時刻(POS_MSEC)から
+    # 実効 FPS を測り直す。宣言値と 2% 以上ずれていれば実測値を採用する
+    # (POS_MSEC が取れない/不正な環境では宣言値のまま)。測り終えたら先頭へ巻き戻す。
+    _fps_src = 'CAP_PROP_FPS(宣言値)'
+    try:
+        _ms_list = []
+        for _ in range(90):
+            if not video_cap.grab():
+                break
+            _ms = video_cap.get(cv2.CAP_PROP_POS_MSEC)
+            if _ms is not None and _ms > 0:
+                _ms_list.append(float(_ms))
+        if len(_ms_list) >= 10 and _ms_list[-1] > _ms_list[0]:
+            _meas_fps = (len(_ms_list) - 1) * 1000.0 / (_ms_list[-1] - _ms_list[0])
+            if 1.0 < _meas_fps <= 240.0 and abs(_meas_fps - video_fps) / video_fps > 0.02:
+                video_fps = _meas_fps
+                _fps_src = 'POS_MSEC 実測(宣言値とズレのため補正)'
+    except Exception:
+        pass
+    finally:
+        try:
+            video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        except Exception:
+            pass
+
     # 映像の縦横比。動画パネルの初期プレースホルダをこの比で作らないと、
     # 正方形のダミー画像に合わせて軸の箱が正方形に固定され、映像が縦に伸びる。
     _vw = int(video_cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     _vh = int(video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     if _vw > 0 and _vh > 0:
         VIDEO_SIZE = (_vw, _vh)
-    print(f'[Info] video_time_sec のソース: {src} / 動画FPS: {video_fps:.1f} / '
-          f'サイズ: {VIDEO_SIZE[0]}x{VIDEO_SIZE[1]}')
+    print(f'[Info] video_time_sec のソース: {src} / 動画FPS: {video_fps:.3f} '
+          f'({_fps_src}) / サイズ: {VIDEO_SIZE[0]}x{VIDEO_SIZE[1]}')
 HAS_VIDEO = video_cap is not None
 
 # 動画同期の対象となる行(in_range かつ video_time_sec が有限)の範囲
@@ -459,6 +491,11 @@ def fmt_angle(v):
 # ------------------------------------------------------------------ #
 FONT_SCALE = 2.0
 plt.rcParams['font.size'] = 10.0 * FONT_SCALE
+# フォントは Helvetica(regular)。Helvetica が無い環境では、字幅がほぼ同じ Arial に、
+# それも無ければ DejaVu Sans にフォールバックする(Windows は Arial があるので実質同じ見た目)。
+plt.rcParams['font.family'] = 'sans-serif'
+plt.rcParams['font.sans-serif'] = ['Helvetica', 'Arial', 'DejaVu Sans']
+plt.rcParams['font.weight'] = 'normal'
 
 
 def fs(size):
@@ -468,18 +505,82 @@ def fs(size):
 
 # ------------------------------------------------------------------ #
 # レイアウト
-#   左 : 動画パネル
-#   中央 : 3D マーカービュー(肘角度は数値をこのビュー内に表示)
-#   右上 : スミスチャート(掃引は 2 つ左右並び / 1 点は 1 つに統合)
-#   右中 : 左右インピーダンスの相対誤差(右基準) / その下 : 周波数スライダー
-#   下部(全幅): 時間(フレーム)スライダー ＋ Play / フレーム番号入力
+#   画面を大きく左右 2 分割する。それぞれの塊の背景に薄いカードを敷き、塊の間に隙間を
+#   空けることで「どの表示が関連しているか」を一目で判断できるようにする。
+#     ・左カラム … 上に動画 / 下に 3D マーカービュー(縦積み)。
+#                  動画なしのときは 3D が左カラム全体を使う。
+#     ・右カラム … スミスチャート + 左右インピーダンスの相対誤差(従来どおり)。
+#     ・最下段  … 操作系(Play / 時間スライダー / フレーム番号)。
+#   各カラム/サブ領域の x・y 範囲をここで一元的に決め、カードも中身もこれを基準に置く。
 # ------------------------------------------------------------------ #
 fig = plt.figure(figsize=(16, 9))
-fig.suptitle('Dataset + Video Playback Viewer', fontsize=fs(14), fontweight='bold', y=0.985)
+fig.suptitle('Dataset + Video Playback Viewer', fontsize=fs(14), fontweight='bold', y=0.965)
+
+# 上段カードの縦範囲
+_TOP_Y0, _TOP_Y1 = 0.130, 0.915
+
+# 左右カラムの x 範囲(画面をほぼ半分ずつ)
+_L_x0, _L_x1 = 0.010, 0.492               # 左カラム(動画 + 3D を 1 枠にまとめる)
+_R_x0, _R_x1 = 0.506, 0.990               # 右カラム(スミス + 誤差)
+_C_x0, _C_x1 = _R_x0, _R_x1               # 右カラムの別名(スミス/誤差コードが参照)
+
+# 左カラムは「動画 + 3D」を 1 つの枠(カード)にまとめる。枠の中を上から
+#   [動画] / [時刻・肘角度の 1 行] / [3D の箱] / [マーカー凡例]
+# の順に置く。3D をできるだけ大きくするため、ラベル類は箱の外の細い 1 行・帯に収め、
+# 3D の箱には残りを目いっぱい使わせる(以前は箱の上にヘッダー 2 行ぶんを空けていた)。
+_B_x0, _B_x1 = _L_x0, _L_x1
+if HAS_VIDEO:
+    _A_x0, _A_x1, _A_y0, _A_y1 = _L_x0, _L_x1, 0.590, _TOP_Y1   # 動画サブ領域(上)
+    _HDR_Y = 0.562                                              # 時刻・肘角度(1 行)
+    _ax3d_top = 0.548                                           # 3D の箱の上端
+else:
+    _A_x0 = _A_x1 = None                                        # 動画なし
+    _HDR_Y = _TOP_Y1 - 0.028                                    # 3D が左全体を使う
+    _ax3d_top = _TOP_Y1 - 0.056
+
+# 塊を示す背景カードは、いちばん背面(zorder 最小)の全面 axes に描く。
+# 静的なので blit の背景ビットマップに一度だけ取り込まれ、以後は描き直されない。
+CARD_FILL, CARD_EDGE = '#f4f5f7', '#ccd0d6'
+_bg_ax = fig.add_axes([0.0, 0.0, 1.0, 1.0], zorder=-100)
+_bg_ax.set_xlim(0, 1)
+_bg_ax.set_ylim(0, 1)
+_bg_ax.axis('off')
+_bg_ax.set_facecolor('none')
+
+
+def _add_card(x0, x1, y0, y1):
+    _bg_ax.add_patch(Rectangle(
+        (x0, y0), x1 - x0, y1 - y0, transform=_bg_ax.transAxes,
+        facecolor=CARD_FILL, edgecolor=CARD_EDGE, linewidth=1.3, zorder=-100))
+
+
+_add_card(_L_x0, _L_x1, _TOP_Y0, _TOP_Y1)      # 左カード(動画 + 3D を 1 枠に)
+if HAS_SMITH:
+    _add_card(_C_x0, _C_x1, _TOP_Y0, _TOP_Y1)  # スミス+誤差カード(右)
+_BOT_CARD = (0.010, 0.014, 0.990, 0.108)       # 操作系カード (x0, y0, x1, y1)
+_add_card(*_BOT_CARD)
 
 # --- 左: 動画パネル ---
 if HAS_VIDEO:
-    ax_video = fig.add_axes([0.015, 0.30, 0.26, 0.60])
+    # 動画パネルは左カラムの使える矩形の中に、映像の縦横比を保った最大サイズで中央配置する。
+    # 箱を固定比で置くと、16:9 の映像では上下に大きな余白ができて間延びし、縦長(スマホ)の
+    # 映像では左右が余る。実際の映像比 (VIDEO_SIZE) に合わせて箱そのものを作れば、映像が
+    # 箱いっぱいに描かれ、余白は左カラムの周囲だけ(中央寄せで左右対称)になる。
+    # 動画カード(左・上)の内側(余白を少し取る)を使える矩形にする。
+    # 上端側は動画タイトル("Video t = ...")のぶんを空ける。
+    _LC = (_A_x0 + 0.016, _A_y0 + 0.020, (_A_x1 - _A_x0) - 0.032,
+           (_A_y1 - _A_y0) - 0.075)
+    _fig_w_in, _fig_h_in = fig.get_size_inches()
+    _av_w_in, _av_h_in = _LC[2] * _fig_w_in, _LC[3] * _fig_h_in
+    _vasp = VIDEO_SIZE[0] / max(VIDEO_SIZE[1], 1)      # 映像の 幅/高さ
+    if _av_w_in / _vasp <= _av_h_in:                   # 幅で決まる(横長の映像)
+        _bw_in, _bh_in = _av_w_in, _av_w_in / _vasp
+    else:                                              # 高さで決まる(縦長の映像)
+        _bh_in, _bw_in = _av_h_in, _av_h_in * _vasp
+    _bw, _bh = _bw_in / _fig_w_in, _bh_in / _fig_h_in
+    _bx = _LC[0] + (_LC[2] - _bw) / 2.0
+    _by = _LC[1] + (_LC[3] - _bh) / 2.0
+    ax_video = fig.add_axes([_bx, _by, _bw, _bh])
     ax_video.axis('off')
     # プレースホルダは必ず映像と同じ縦横比で作る。imshow は aspect='equal' なので
     # 軸の箱がこの画像の比に合わせて縮められる。正方形のダミーだと箱が正方形に決まり、
@@ -496,10 +597,19 @@ if HAS_VIDEO:
 else:
     ax_video = None
 
-# --- 中央: 3D マーカービュー ---
-# 肘角度の時系列グラフは廃止したので、その領域まで使って 3D ビューを大きく取る
-# (肘角度は 3D ビュー内に数値で出している)。
-ax = fig.add_axes([0.285, 0.28, 0.29, 0.62], projection='3d')
+# --- 左下: 3D マーカービュー ---
+# 3D の箱をできるだけ大きくするため、時刻・肘角度は箱の“外・上”の 1 行(_HDR_Y)に、
+# マーカー凡例は箱の下の細い帯に置き、箱そのものは残りを目いっぱい使う(上端=_ax3d_top)。
+# 時刻・肘角度は axes の外なので、そのままだと blit 領域(axes の bbox)から外れて更新
+# されない。_blit_regions にこの 1 行を覆う矩形(_HDR_REGION)を足して転送対象に含める。
+_ax3d_x = _B_x0 + 0.040
+_ax3d_w = (_B_x1 - _B_x0) - 0.080
+_ax3d_y = _TOP_Y0 + 0.062                       # 下: 凡例(2 段)のぶんを空ける
+_ax3d_h = _ax3d_top - _ax3d_y                   # 上: 時刻・肘角度の 1 行のぶんを空ける
+_AX3D_RECT = [_ax3d_x, _ax3d_y, _ax3d_w, _ax3d_h]
+# 時刻・肘角度の 1 行を覆う blit 転送矩形(図座標)。
+_HDR_REGION = (_B_x0, _HDR_Y - 0.020, _B_x1, _HDR_Y + 0.020)
+ax = fig.add_axes(_AX3D_RECT, projection='3d')
 
 # --- 3D 軸設定 ---
 all_pts = np.vstack(list(pos.values()))
@@ -518,11 +628,19 @@ def _axis_limits(arr):
 ax.set_xlim(*_axis_limits(all_pts[:, 0]))
 ax.set_ylim(*_axis_limits(all_pts[:, 1]))
 ax.set_zlim(*_axis_limits(all_pts[:, 2]))
-ax.set_xlabel('X', labelpad=fs(9)); ax.set_ylabel('Y', labelpad=fs(9))
-ax.set_zlabel('Z', labelpad=fs(9))
-# 文字を大きくしたぶん、既定の目盛数だと数字どうしが重なるので間引く
+# 座標まわりはすっきりさせる: 数値(目盛ラベル)も軸名(X/Y/Z)も表示しない。
+# マーカーとボーンで体の向きは読めるので、軸の文字は情報が薄いわりに、凡例や箱の縁と
+# ぶつかって“ごちゃつき”の原因になっていた。奥行きの手掛かりとして目盛線(グリッド)は残す。
+ax.set_xlabel(''); ax.set_ylabel(''); ax.set_zlabel('')
 for _axis in (ax.xaxis, ax.yaxis, ax.zaxis):
     _axis.set_major_locator(MaxNLocator(4))
+ax.set_xticklabels([]); ax.set_yticklabels([]); ax.set_zticklabels([])
+# 軸名を消したぶん、箱の中の立方体をさらに大きく見せる(既定は周囲の余白が多い)。
+# 古い matplotlib は zoom 引数が無いので無視する。
+try:
+    ax.set_box_aspect(None, zoom=1.3)
+except TypeError:
+    pass
 
 MARKER_STYLE = {
     'R_upperarm': dict(marker='o', color='red',         trail='salmon',     label='R UpperArm'),
@@ -557,17 +675,21 @@ BONES = [
 bone_lines = [ax.plot([], [], [], '-', color=c, lw=2.2, zorder=4, animated=True)[0]
               for _, _, c in BONES]
 
-# マーカー凡例は 3D ビューの下に横並びで置く(軸の中だと時刻・肘角度テキストや
-# マーカーそのものと重なる)。
-ax.legend(loc='upper center', bbox_to_anchor=(0.45, -0.02), ncol=3,
-          fontsize=fs(6.5), columnspacing=1.0, labelspacing=0.3,
-          handletextpad=0.3, framealpha=0.6)
-time_txt    = ax.text2D(0.02, 0.99, '', transform=ax.transAxes, fontsize=fs(9),
-                        va='top', animated=True)
-angle_txt_r = ax.text2D(0.02, 0.93, '', transform=ax.transAxes, fontsize=fs(11),
-                        va='top', color='crimson', fontweight='bold', animated=True)
-angle_txt_l = ax.text2D(0.02, 0.86, '', transform=ax.transAxes, fontsize=fs(11),
-                        va='top', color='royalblue', fontweight='bold', animated=True)
+# マーカー凡例は 3D ビューの下(3D カードの下端)に横並びで置く。枠(囲み)は付けず、
+# 薄めの文字にして“ごちゃつき”を抑える。左カラムは横に広いので 4 列に収める。
+ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.02), ncol=4,
+          fontsize=fs(6.0), columnspacing=1.2, labelspacing=0.4,
+          handletextpad=0.3, frameon=False)
+# 時刻・肘角度は 3D の箱の外(上)の 1 行に置く(箱の中だとマーカーと重なり、上に 2 行
+# 取ると箱が小さくなるため)。時刻は控えめなグレー、肘角度は左右の色でそれぞれ示す。
+# フレーム数や角度が大きい実データでも枠(左カード)に収まるよう、regular(細字)で
+# 少し小さめにし、L 肘の右端がカード右端(_L_x1)を越えないよう位置を決める。
+time_txt    = fig.text(_B_x0 + 0.016, _HDR_Y, '', fontsize=fs(6.5), va='center',
+                       color='0.35', animated=True)
+angle_txt_r = fig.text(_B_x0 + 0.180, _HDR_Y, '', fontsize=fs(7.5), va='center',
+                       color='crimson', animated=True)
+angle_txt_l = fig.text(_B_x0 + 0.320, _HDR_Y, '', fontsize=fs(7.5), va='center',
+                       color='royalblue', animated=True)
 
 # ------------------------------------------------------------------ #
 # スミスチャート(右上)
@@ -588,19 +710,23 @@ if SMITH_MERGED:
     # チャート周りは文字が込み合いやすいので、行数を増やさないことを優先する:
     #   タイトルは 1 行(--trail 時のみ 2 行目)、凡例の箱は作らず Z の行頭に ★ を付けて
     #   兼ねさせ、周波数はタイトルにだけ書く(Z の行や相対誤差グラフでは繰り返さない)。
-    _MERGED_RECT = [0.665, 0.565, 0.26, 0.29]
-    _MERGED_CX = 0.795
+    # 右カラムを上下 2 段(スミス上・相対誤差下)でしっかり埋めるため、スミスは
+    # 大きめに取る。aspect='equal' なので実際の円径は箱の短辺で決まる(ここでは高さ)。
+    # title_y(円の上)/ ztext_y(円の下 2 行)は箱に合わせた値にする。
+    _MERGED_RECT = [0.598, 0.45, 0.300, 0.40]
+    _MERGED_CX = 0.748
     SMITH_BLOCK = {
-        'leftbody':  dict(rect=_MERGED_RECT, cx=_MERGED_CX, title_y=0.905, ztext_y=0.548),
-        'rightbody': dict(rect=_MERGED_RECT, cx=_MERGED_CX, title_y=0.905, ztext_y=0.515),
+        'leftbody':  dict(rect=_MERGED_RECT, cx=_MERGED_CX, title_y=0.892, ztext_y=0.435),
+        'rightbody': dict(rect=_MERGED_RECT, cx=_MERGED_CX, title_y=0.892, ztext_y=0.398),
     }
 else:
-    # 右上に 2 つ左右並び。各ブロックに中心 x(cx)を持たせ、タイトルは上・Z 読み出しは下。
+    # 右カラム(カード C)に 2 つ左右並び。各ブロックに中心 x(cx)を持たせ、
+    # タイトルは上・Z 読み出しは下。カード上端に収まるようタイトルを少し下げる。
     SMITH_BLOCK = {
-        'leftbody':  dict(rect=[0.605, 0.60, 0.175, 0.24], cx=0.6925,
-                          title_y=0.915, ztext_y=0.585),
-        'rightbody': dict(rect=[0.805, 0.60, 0.175, 0.24], cx=0.8925,
-                          title_y=0.915, ztext_y=0.585),
+        'leftbody':  dict(rect=[0.537, 0.585, 0.185, 0.235], cx=0.6295,
+                          title_y=0.892, ztext_y=0.568),
+        'rightbody': dict(rect=[0.772, 0.585, 0.185, 0.235], cx=0.8645,
+                          title_y=0.892, ztext_y=0.568),
     }
 
 
@@ -732,9 +858,15 @@ if HAS_ERR:
     _zr_all = z_real['rightbody'][:, :_nerr] + 1j * z_react['rightbody'][:, :_nerr]
     _rel_all = np.abs(_zl_all - _zr_all) / (np.abs(_zr_all) + 1e-12) * 100.0
     _emax = np.nanpercentile(_rel_all, 99) if np.any(np.isfinite(_rel_all)) else 100.0
-    ax_err = fig.add_axes([0.645, 0.285, 0.325, 0.15])
+    # 相対誤差グラフはスミスの下(カード C の下部)に置く。掃引モードはスミス 2 枚ぶんの
+    # 幅を使うので、単一周波数モード(1 枚)より横に広げてカードいっぱいに描く。
+    if SINGLE_FREQ:
+        ax_err = fig.add_axes([0.575, 0.180, 0.350, 0.150])
+    else:
+        ax_err = fig.add_axes([0.545, 0.180, 0.400, 0.150])
     ax_err.set_ylim(0, max(float(_emax) * 1.1, 1.0))
-    ax_err.set_ylabel('Rel. error [%]', fontsize=fs(8))
+    # 縦軸ラベル(回転文字)は枠の外・左隣のカードへ張り出しやすいので置かず、
+    # 単位 [%] はタイトルに入れる。縦軸は目盛の数字だけで足りる。
     ax_err.tick_params(labelsize=fs(7))
     # 文字が大きいので目盛の数字は少なめにする(重なり防止)
     ax_err.yaxis.set_major_locator(MaxNLocator(3))
@@ -751,14 +883,14 @@ if HAS_ERR:
         ax_err.set_xlabel('Time (s)', fontsize=fs(8))
         # 周波数はスミスチャートのタイトルに出ているので、ここでは繰り返さない
         # (スミスの下は文字が込み合うため)。
-        ax_err.set_title('L vs R impedance rel. error (ref: Right)',
-                         fontsize=fs(9), fontweight='bold')
+        ax_err.set_title('L vs R impedance rel. error [%] (ref: Right)',
+                         fontsize=fs(8.5), fontweight='bold')
     else:
         (err_line,) = ax_err.plot([], [], color='purple', lw=1.4, animated=True)
         ax_err.set_xlim(float(err_freqs.min()), float(err_freqs.max()))
         ax_err.set_xlabel('Frequency (MHz)', fontsize=fs(8))
-        ax_err.set_title('L vs R impedance rel. error (ref: Right)',
-                         fontsize=fs(9), fontweight='bold')
+        ax_err.set_title('L vs R impedance rel. error [%] (ref: Right)',
+                         fontsize=fs(8.5), fontweight='bold')
 
 
 def update_err_display(idx):
@@ -780,10 +912,13 @@ def update_err_display(idx):
 
 # ------------------------------------------------------------------ #
 # ウィジェット
-#   時間(フレーム)スライダー: 下部に全幅で配置(動画・3D・スミスの下)
-#   周波数スライダー: スミスチャート 2 つの下(右側)に配置
+#   Play ボタン / 時間(フレーム)スライダー / フレーム番号入力: 画面最下部に横 1 列で並べる。
+#     以前は「全幅スライダー」の下にボタンとフレーム入力を別の段で置いており、下部が
+#     2 段ぶんの高さを占めていた。1 行にまとめて縦を節約し、そのぶん上のパネル(動画・
+#     3D・相対誤差グラフ)を下へ広げて大きく表示する。3 つは縦中心(y≈0.063)を揃える。
+#   周波数スライダー: スミスチャートの下(右側)に配置(掃引モードのみ)
 # ------------------------------------------------------------------ #
-ax_slider = fig.add_axes([0.10, 0.115, 0.84, 0.025])
+ax_slider = fig.add_axes([0.165, 0.054, 0.49, 0.028])
 slider = Slider(ax_slider, 'Time', 0, n_frames - 1,
                 valinit=0, valstep=1, color='steelblue')
 # set_val のたびに canvas.draw_idle()(図全体の再描画)が走らないようにする。
@@ -793,12 +928,14 @@ slider.poly.set_animated(True)
 slider._handle.set_animated(True)
 slider.valtext.set_animated(True)
 
-ax_btn = fig.add_axes([0.05, 0.028, 0.10, 0.055])
+ax_btn = fig.add_axes([0.022, 0.042, 0.072, 0.052])
 btn_play = Button(ax_btn, 'Play', color='0.85', hovercolor='0.70')
 btn_play.label.set_animated(True)
 
-ax_time_box = fig.add_axes([0.33, 0.03, 0.10, 0.05])
-time_box = TextBox(ax_time_box, f'Frame(0-{n_frames - 1}) ', initial='0')
+# ラベルは短く 'Frame ' にする(2 倍サイズの文字だと 'Frame(0-N)' が左へ伸びて
+# 時間スライダーやその値表示と重なるため。有効範囲はスライダーで判る)。
+ax_time_box = fig.add_axes([0.905, 0.046, 0.055, 0.045])
+time_box = TextBox(ax_time_box, 'Frame ', initial='0')
 time_box.text_disp.set_animated(True)
 
 state = {'playing': False, 'frame': 0, 'updating': False, 'freq': None,
@@ -828,7 +965,9 @@ elif HAS_SMITH:
     _fmin, _fmax = float(_all_freqs.min()), float(_all_freqs.max())
     _fstep = float(np.min([np.diff(freqs[side]).min() for side in SIDES if len(freqs[side]) > 1] or [0.01]))
     _finit = float(np.clip(DEFAULT_FREQ_MHZ, _fmin, _fmax))
-    ax_freq = fig.add_axes([0.72, 0.165, 0.20, 0.022])
+    # スミスチャート(上)と相対誤差グラフ(下)の間の余白に置く。読み取り対象の周波数を
+    # 選ぶスライダーなので、スミスの ★ / Z 読み出しの近くにあるほうが対応が判りやすい。
+    ax_freq = fig.add_axes([0.635, 0.455, 0.230, 0.022])
     freq_slider = Slider(ax_freq, 'Freq (MHz)', _fmin, _fmax,
                          valinit=_finit, valstep=_fstep, color='seagreen', valfmt='%.2f')
     state['freq'] = _finit
@@ -854,10 +993,13 @@ def update_freq_display():
         # 統合表示は 1 枚に左右が重なっているので、どちらの Z かを行頭で示す。
         # 行頭の ★ はチャート上のマーカーと同色なので、これが凡例を兼ねる
         # (周波数はチャートのタイトルに出ているので繰り返さない)。
+        # ★ は mathtext($\bigstar$)で描く。Helvetica/Arial には ★(U+2605)が無く、
+        # そのまま文字として置くと豆腐(□)になるため。mathtext なら本文フォントに依らず
+        # 描け、色も本文と同じ(= body の色)になる。
         # 掃引モードは 2 枚のチャートが近接しており、1 行に収めると隣の読み出しと
         # ぶつかるので周波数と Z を 2 行に分ける。
         if SMITH_MERGED:
-            head, sep = '★ ' + SMITH_STYLE[side]['label'], ': '
+            head, sep = r'$\bigstar$ ' + SMITH_STYLE[side]['label'], ': '
         else:
             head, sep = f'@{fmt_freq_mhz(actual_f)} MHz', '\n'
         if np.isfinite(zr) and np.isfinite(zx):
@@ -1021,6 +1163,10 @@ def _blit_regions():
         y0 = min(SMITH_BLOCK[s]['ztext_y'] for s in SIDES) - 0.04
         y1 = max(SMITH_BLOCK[s]['rect'][1] + SMITH_BLOCK[s]['rect'][3] for s in SIDES) + 0.01
         regs.append(TransformedBbox(Bbox([[x0, y0], [x1, y1]]), fig.transFigure))
+    # 3D の時刻・肘角度は箱の外(上)のヘッダー帯に fig.text で置いているので、
+    # その帯を覆う矩形(図座標)を足して blit の転送対象に含める。
+    hx0, hy0, hx1, hy1 = _HDR_REGION
+    regs.append(TransformedBbox(Bbox([[hx0, hy0], [hx1, hy1]]), fig.transFigure))
     # 動画パネルのタイトル(軸の上)も入るよう、動画軸だけ少し上へ広げる
     if HAS_VIDEO:
         bb = ax_video.bbox
