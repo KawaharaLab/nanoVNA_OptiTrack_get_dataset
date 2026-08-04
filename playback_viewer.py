@@ -8,17 +8,24 @@ sync_optitrack_nanovna.py で取得した CSV(7 マーカー座標 + leftbody/ri
 view_marker_impedances/viewer_3marker.py を土台に、再生エンジンを作り替えている。
 
 表示内容:
-  - 3D マーカー散布 + ボーン(右腕/左腕/体幹) + 左右の肘角度(数値 + 時系列)
-  - 左右 body の S11 スミスチャート
+  - 3D マーカー散布 + ボーン(右腕/左腕/体幹) + 左右の肘角度(数値。3D ビュー内に表示)
+  - 左右 body のスミスチャート(見出しは Impedance。点の座標は Γ = S11 だが、
+    スミスチャートはそれをインピーダンス Z = R + jX(Z0 = 50Ω 基準)として読む図)
   - 動画パネル(--video 指定時)
 
 単一周波数(1 点)モードで測った CSV にも対応する。周波数が 1 つしか無いときは
 「掃引の形」を描けないので、次のように表示を切り替える:
-  - スミスチャート … その周波数の Γ の時間方向の軌跡(直近 SMITH_TRAIL_FRAMES 行)
+  - スミスチャート … 左右で 1 枚にまとめ、その上に左右の Γ(インピーダンス)を重ねて
+    描く(掃引モードのように軌跡が重なって判別できなくなる心配が無いため)。点は
+    現在フレームの ★ 1 つずつで、色で左右を区別する。Z の数値はチャート下に 2 行で
+    並べ、行頭の ★(マーカーと同色)を凡例代わりにする。時間変化を軌跡として見たい
+    ときは --trail N(直近 N 行を線でつなぐ)を付ける
   - 左右インピーダンス相対誤差 … 横軸を周波数ではなく時間にした全区間のグラフ
   - 周波数スライダー … 出さない(読み取り対象はその 1 点に固定)
 列名は "leftbody_S11_Real_13.56" のように MHz サフィックス付きが現行形式だが、
 サフィックスの無い旧形式("leftbody_S11_Real")も読める(周波数は --single-freq で指定)。
+起動時に、検出した S11 列の周波数(何点あるか)を標準出力へ出す。1 点のつもりなのに
+スミスチャートに多数の点が並ぶときは、まずこのログで CSV 側の点数を確認すること。
 
 ★同期の考え方(重要)★
   マーカー座標とスミスチャートは「同じ CSV 行」から描くので常に同期している。
@@ -73,6 +80,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button, Slider, TextBox
+from matplotlib.ticker import MaxNLocator
 from matplotlib.transforms import Bbox, TransformedBbox
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (projection='3d' 登録用)
 
@@ -96,6 +104,10 @@ parser.add_argument('--single-freq', type=float, default=None,
                     help='単一周波数(1点)モードで測った古い CSV(列名に MHz が付かない '
                          '"leftbody_S11_Real" 形式)を開くときの周波数[MHz]。'
                          '表示ラベルにのみ使う(例: --single-freq 13.56)')
+parser.add_argument('--trail', type=int, default=0, metavar='N',
+                    help='単一周波数(1点)モードのスミスチャートに、その周波数の Γ が'
+                         '時間とともに動いた軌跡を直近 N 行ぶん描く(既定 0 = 描かない'
+                         '=現在フレームの 1 点だけを表示)。例: --trail 300')
 args = parser.parse_args()
 
 CSV_PATH = Path(args.csv)
@@ -172,16 +184,50 @@ for side in SIDES:
 
 # 単一周波数(1点)モードの判定: どの side も周波数が 1 つだけ。
 # このとき「掃引の形」は描けないので、表示を次のように切り替える:
-#   スミスチャート  … その 1 点の Γ が時間とともに動く軌跡(直近 SMITH_TRAIL_FRAMES 行)
+#   スミスチャート  … その 1 点の Γ(現在フレームの値)だけを ★ で示す
+#                     (--trail N を付けたときだけ直近 N 行の時間軌跡も描く)
 #   左右インピーダンス相対誤差 … 周波数軸ではなく時間軸のグラフ
 #   周波数スライダー … 選ぶ余地が無いので出さない
 SINGLE_FREQ = HAS_SMITH and all(len(freqs[s]) == 1 for s in SIDES)
-SMITH_TRAIL_FRAMES = 300   # 単一周波数モードでスミスチャートに残す軌跡の長さ[行数]
+# 単一周波数モードでスミスチャートに残す時間軌跡の長さ[行数]。0 = 軌跡を描かない。
+# 既定を 0 にしてあるのは、1 点しか測っていないのにスミスチャート上へ多数の点が
+# 並ぶと「複数の周波数を測ったトレース」と紛らわしいため。時間変化を見たいときは
+# --trail 300 のように明示する。
+SMITH_TRAIL_FRAMES = max(0, int(args.trail))
 
 
 def fmt_freq_mhz(f, prec=2):
     """周波数[MHz]の表示。列名にサフィックスが無い古い CSV では不明(?)になる。"""
     return '?' if not np.isfinite(f) else '{:.{p}f}'.format(f, p=prec)
+
+
+# ------------------------------------------------------------------ #
+# 検出した S11 列の周波数を起動時に報告する。
+#   「1 点しか測っていないはずなのにスミスチャートに複数の点が出る」ときの切り分け用。
+#   ここで 2 点以上と出るなら、原因は表示側ではなく CSV に複数の周波数列があること。
+# ------------------------------------------------------------------ #
+if HAS_SMITH:
+    for _side in SIDES:
+        _fs = freqs[_side]
+        if len(_fs) == 1:
+            _desc = '1 点 ({} MHz)'.format(fmt_freq_mhz(_fs[0]))
+        else:
+            _desc = '{} 点 ({} … {} MHz)'.format(
+                len(_fs), fmt_freq_mhz(_fs[0]), fmt_freq_mhz(_fs[-1]))
+        print('[Info] {} の S11 列: {}'.format(_side, _desc))
+    print('[Info] 表示モード: {}'.format(
+        '単一周波数(1点)' if SINGLE_FREQ else '掃引'))
+    if SINGLE_FREQ:
+        print('[Info] スミスチャートは 1 枚にまとめ、左右のインピーダンス(Γ)を'
+              '重ねて表示します(青=Left / 赤=Right)。')
+    if SINGLE_FREQ and SMITH_TRAIL_FRAMES > 0:
+        print('[Info] スミスチャートに直近 {} 行の時間軌跡を描きます'
+              '(--trail 0 で現在値の 1 点だけになります)'.format(SMITH_TRAIL_FRAMES))
+    elif not SINGLE_FREQ:
+        print('[Info] スミスチャートには上記の全周波数を結んだ掃引トレースを描きます。'
+              '1 点だけ測ったつもりなら CSV の列名を確認してください。')
+else:
+    print('[Info] S11 列が見つかりませんでした(スミスチャートは表示しません)。')
 
 
 VIDEO_TIME_COL = 'video_time_sec'
@@ -405,15 +451,31 @@ def fmt_angle(v):
 
 
 # ------------------------------------------------------------------ #
+# 図中の文字サイズ
+#   離れた位置から見たり資料に貼ったりするため、図中の文字は既定の 2 倍で描く。
+#   個々の fontsize は fs() を通し、目盛や凡例など明示していない文字は rcParams の
+#   基準サイズ(既定 10 pt)を上げることでまとめて追従させる。倍率を変えたいときは
+#   FONT_SCALE だけを書き換えればよい。
+# ------------------------------------------------------------------ #
+FONT_SCALE = 2.0
+plt.rcParams['font.size'] = 10.0 * FONT_SCALE
+
+
+def fs(size):
+    """図中の文字サイズ[pt](FONT_SCALE 倍して返す)。"""
+    return size * FONT_SCALE
+
+
+# ------------------------------------------------------------------ #
 # レイアウト
 #   左 : 動画パネル
-#   中央上 : 3D マーカービュー / 中央下 : 肘角度の時系列
-#   右上 : スミスチャート 2 つ(左右並び) / 右中 : 左右インピーダンスの相対誤差(右基準)
-#          / その下 : 周波数スライダー
+#   中央 : 3D マーカービュー(肘角度は数値をこのビュー内に表示)
+#   右上 : スミスチャート(掃引は 2 つ左右並び / 1 点は 1 つに統合)
+#   右中 : 左右インピーダンスの相対誤差(右基準) / その下 : 周波数スライダー
 #   下部(全幅): 時間(フレーム)スライダー ＋ Play / フレーム番号入力
 # ------------------------------------------------------------------ #
 fig = plt.figure(figsize=(16, 9))
-fig.suptitle('Dataset + Video Playback Viewer', fontsize=14, fontweight='bold')
+fig.suptitle('Dataset + Video Playback Viewer', fontsize=fs(14), fontweight='bold', y=0.985)
 
 # --- 左: 動画パネル ---
 if HAS_VIDEO:
@@ -429,28 +491,15 @@ if HAS_VIDEO:
         np.zeros((VIDEO_SIZE[1], VIDEO_SIZE[0], 3), dtype=np.uint8),
         animated=True, interpolation='nearest')
     video_title = ax_video.text(0.5, 1.02, '', transform=ax_video.transAxes,
-                                ha='center', va='bottom', fontsize=10, fontweight='bold',
+                                ha='center', va='bottom', fontsize=fs(10), fontweight='bold',
                                 animated=True)
 else:
     ax_video = None
 
-# --- 中央上: 3D マーカービュー ---
-ax = fig.add_axes([0.30, 0.50, 0.26, 0.44], projection='3d')
-
-# --- 中央下: 肘角度の時系列(3D の真下) ---
-ax_ang = fig.add_axes([0.31, 0.29, 0.24, 0.16])
-ax_ang.plot(timestamps, angles['R'], color='crimson',   lw=1.2, alpha=0.85, label='R elbow')
-ax_ang.plot(timestamps, angles['L'], color='royalblue', lw=1.2, alpha=0.85, label='L elbow')
-ax_ang.set_ylabel('Elbow (°)', fontsize=8)
-ax_ang.set_xlabel('Time (s)', fontsize=8)
-ax_ang.set_xlim(timestamps[0], timestamps[-1])
-all_angles = np.concatenate([angles['R'], angles['L']])
-if np.any(np.isfinite(all_angles)):
-    ax_ang.set_ylim(max(0, np.nanmin(all_angles) - 5), min(180, np.nanmax(all_angles) + 5))
-ax_ang.tick_params(labelsize=7)
-ax_ang.grid(True, lw=0.4, alpha=0.5)
-ax_ang.legend(loc='upper right', fontsize=7, ncol=2)
-vline = ax_ang.axvline(timestamps[0], color='black', lw=1.2, alpha=0.7, animated=True)
+# --- 中央: 3D マーカービュー ---
+# 肘角度の時系列グラフは廃止したので、その領域まで使って 3D ビューを大きく取る
+# (肘角度は 3D ビュー内に数値で出している)。
+ax = fig.add_axes([0.285, 0.28, 0.29, 0.62], projection='3d')
 
 # --- 3D 軸設定 ---
 all_pts = np.vstack(list(pos.values()))
@@ -469,7 +518,11 @@ def _axis_limits(arr):
 ax.set_xlim(*_axis_limits(all_pts[:, 0]))
 ax.set_ylim(*_axis_limits(all_pts[:, 1]))
 ax.set_zlim(*_axis_limits(all_pts[:, 2]))
-ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
+ax.set_xlabel('X', labelpad=fs(9)); ax.set_ylabel('Y', labelpad=fs(9))
+ax.set_zlabel('Z', labelpad=fs(9))
+# 文字を大きくしたぶん、既定の目盛数だと数字どうしが重なるので間引く
+for _axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+    _axis.set_major_locator(MaxNLocator(4))
 
 MARKER_STYLE = {
     'R_upperarm': dict(marker='o', color='red',         trail='salmon',     label='R UpperArm'),
@@ -504,27 +557,51 @@ BONES = [
 bone_lines = [ax.plot([], [], [], '-', color=c, lw=2.2, zorder=4, animated=True)[0]
               for _, _, c in BONES]
 
-# マーカー凡例は右端に縦 1 列でまとめ、左上の肘角度テキストと重ならないようにする。
-ax.legend(loc='upper right', fontsize=6.5, ncol=1, labelspacing=0.25,
-          handletextpad=0.3, borderaxespad=0.1, framealpha=0.6)
-time_txt    = ax.text2D(0.02, 0.97, '', transform=ax.transAxes, fontsize=9, animated=True)
-angle_txt_r = ax.text2D(0.02, 0.91, '', transform=ax.transAxes, fontsize=11,
-                        color='crimson', fontweight='bold', animated=True)
-angle_txt_l = ax.text2D(0.02, 0.85, '', transform=ax.transAxes, fontsize=11,
-                        color='royalblue', fontweight='bold', animated=True)
+# マーカー凡例は 3D ビューの下に横並びで置く(軸の中だと時刻・肘角度テキストや
+# マーカーそのものと重なる)。
+ax.legend(loc='upper center', bbox_to_anchor=(0.45, -0.02), ncol=3,
+          fontsize=fs(6.5), columnspacing=1.0, labelspacing=0.3,
+          handletextpad=0.3, framealpha=0.6)
+time_txt    = ax.text2D(0.02, 0.99, '', transform=ax.transAxes, fontsize=fs(9),
+                        va='top', animated=True)
+angle_txt_r = ax.text2D(0.02, 0.93, '', transform=ax.transAxes, fontsize=fs(11),
+                        va='top', color='crimson', fontweight='bold', animated=True)
+angle_txt_l = ax.text2D(0.02, 0.86, '', transform=ax.transAxes, fontsize=fs(11),
+                        va='top', color='royalblue', fontweight='bold', animated=True)
 
 # ------------------------------------------------------------------ #
-# スミスチャート(右上: 左右並び 2 つ)
+# スミスチャート(右上)
+#   掃引モード       … 左右 body で 1 枚ずつ、横に 2 つ並べる(掃引トレースが重なると
+#                      どちらの軌跡か判らなくなるため)
+#   単一周波数モード … 各 body の点は 1 つだけで重なる心配が無いので、1 枚にまとめて
+#                      左右のインピーダンス(Γ)を同じチャート上に重ねて表示する
 # ------------------------------------------------------------------ #
 SMITH_STYLE = {
     'leftbody':  dict(color='royalblue', label='Left Body'),
     'rightbody': dict(color='crimson',   label='Right Body'),
 }
-# 右上に 2 つ左右並び。各ブロックに中心 x(cx)を持たせ、タイトルは上・Z 読み出しは下に置く。
-SMITH_BLOCK = {
-    'leftbody':  dict(rect=[0.605, 0.61, 0.175, 0.255], cx=0.6925, title_y=0.945, ztext_y=0.596),
-    'rightbody': dict(rect=[0.805, 0.61, 0.175, 0.255], cx=0.8925, title_y=0.945, ztext_y=0.596),
-}
+SMITH_MERGED = SINGLE_FREQ
+
+if SMITH_MERGED:
+    # 1 枚に統合。2 枚ぶんの領域を使えるのでチャートを大きく取り、Z 読み出しは
+    # チャート下に左右 2 行で並べる(cx / rect は左右で同じものを指す)。
+    # チャート周りは文字が込み合いやすいので、行数を増やさないことを優先する:
+    #   タイトルは 1 行(--trail 時のみ 2 行目)、凡例の箱は作らず Z の行頭に ★ を付けて
+    #   兼ねさせ、周波数はタイトルにだけ書く(Z の行や相対誤差グラフでは繰り返さない)。
+    _MERGED_RECT = [0.665, 0.565, 0.26, 0.29]
+    _MERGED_CX = 0.795
+    SMITH_BLOCK = {
+        'leftbody':  dict(rect=_MERGED_RECT, cx=_MERGED_CX, title_y=0.905, ztext_y=0.548),
+        'rightbody': dict(rect=_MERGED_RECT, cx=_MERGED_CX, title_y=0.905, ztext_y=0.515),
+    }
+else:
+    # 右上に 2 つ左右並び。各ブロックに中心 x(cx)を持たせ、タイトルは上・Z 読み出しは下。
+    SMITH_BLOCK = {
+        'leftbody':  dict(rect=[0.605, 0.60, 0.175, 0.24], cx=0.6925,
+                          title_y=0.915, ztext_y=0.585),
+        'rightbody': dict(rect=[0.805, 0.60, 0.175, 0.24], cx=0.8925,
+                          title_y=0.915, ztext_y=0.585),
+    }
 
 
 SMITH_GRID_R = (0.2, 0.5, 1.0, 2.0, 5.0)   # 定抵抗円 r = R/Z0
@@ -592,29 +669,46 @@ smith_start_pts = {}
 freq_marker_pts = {}
 freq_txt = {}
 if HAS_SMITH:
+    # 統合表示では格子を 1 回だけ描き、その軸を左右で共有する。
+    merged_ax = None
+    if SMITH_MERGED:
+        merged_ax = fig.add_axes(SMITH_BLOCK[SIDES[0]]['rect'])
+        draw_smith_grid(merged_ax)
+        # (matplotlib の既定フォントは日本語を持たないので図中の文字は英語にする)
+        # 見出しは「インピーダンス」にする: 点の座標は Γ = S11 だが、スミスチャートは
+        # その Γ をインピーダンス(Z = 50Ω 基準)として読む図であり、下に出している
+        # 数値も Z なので、S11 と書くと読み取る量と食い違って見える。
+        # 既定(--trail 0)は 1 行だけにし、軌跡を描くときだけ断り書きを 2 行目に足す。
+        title = f'Impedance @ {fmt_freq_mhz(freqs[SIDES[0]][0])} MHz (1 pt)'
+        if SMITH_TRAIL_FRAMES > 0:
+            title += f'\ntrail: last {SMITH_TRAIL_FRAMES} rows'
+        fig.text(SMITH_BLOCK[SIDES[0]]['cx'], SMITH_BLOCK[SIDES[0]]['title_y'], title,
+                 fontsize=fs(9.5), fontweight='bold', color='black', ha='center', va='top')
     for side in SIDES:
         st = SMITH_STYLE[side]
         blk = SMITH_BLOCK[side]
-        axs = fig.add_axes(blk['rect'])
-        draw_smith_grid(axs)
-        fmin, fmax, npts = freqs[side].min(), freqs[side].max(), len(freqs[side])
-        if SINGLE_FREQ:
-            # 1 点しか無いので掃引範囲ではなく「その周波数」と、軌跡表示であることを出す
-            # (matplotlib の既定フォントは日本語を持たないので図中の文字は英語にする)
-            title = (f'{st["label"]} S11\n@ {fmt_freq_mhz(fmin)} MHz '
-                     f'(1pt: trail of last {SMITH_TRAIL_FRAMES} rows)')
+        if merged_ax is not None:
+            axs = merged_ax
         else:
-            title = (f'{st["label"]} S11\n'
+            axs = fig.add_axes(blk['rect'])
+            draw_smith_grid(axs)
+            fmin, fmax, npts = freqs[side].min(), freqs[side].max(), len(freqs[side])
+            title = (f'{st["label"]} Impedance\n'
                      f'{fmt_freq_mhz(fmin, 1)}-{fmt_freq_mhz(fmax, 1)} MHz ({npts}pt)')
-        fig.text(blk['cx'], blk['title_y'], title,
-                 fontsize=9, fontweight='bold', color=st['color'], ha='center', va='top')
+            fig.text(blk['cx'], blk['title_y'], title, fontsize=fs(9), fontweight='bold',
+                     color=st['color'], ha='center', va='top')
         line, = axs.plot([], [], '-', color=st['color'], lw=1.3, zorder=3, animated=True)
         start_pt, = axs.plot([], [], marker='o', color=st['color'], ms=5, zorder=4,
                              animated=True)
-        marker_pt, = axs.plot([], [], marker='*', color='gold', ms=16,
-                              markeredgecolor=st['color'], markeredgewidth=1.3, zorder=6,
-                              animated=True)
-        txt = fig.text(blk['cx'], blk['ztext_y'], '', fontsize=8.5,
+        # 統合表示では左右を色で見分ける必要があるので、★ の塗りを body の色にする
+        # (別チャートなら塗りは金色固定でよく、縁の色で body を示している)。
+        mk_style = (dict(color=st['color'], ms=17, markeredgecolor='black',
+                         markeredgewidth=0.8)
+                    if merged_ax is not None else
+                    dict(color='gold', ms=16, markeredgecolor=st['color'],
+                         markeredgewidth=1.3))
+        marker_pt, = axs.plot([], [], marker='*', zorder=6, animated=True, **mk_style)
+        txt = fig.text(blk['cx'], blk['ztext_y'], '', fontsize=fs(9),
                        ha='center', va='top', color=st['color'], fontweight='bold',
                        animated=True)
         smith_lines[side] = line
@@ -638,10 +732,13 @@ if HAS_ERR:
     _zr_all = z_real['rightbody'][:, :_nerr] + 1j * z_react['rightbody'][:, :_nerr]
     _rel_all = np.abs(_zl_all - _zr_all) / (np.abs(_zr_all) + 1e-12) * 100.0
     _emax = np.nanpercentile(_rel_all, 99) if np.any(np.isfinite(_rel_all)) else 100.0
-    ax_err = fig.add_axes([0.635, 0.335, 0.35, 0.155])
+    ax_err = fig.add_axes([0.645, 0.285, 0.325, 0.15])
     ax_err.set_ylim(0, max(float(_emax) * 1.1, 1.0))
-    ax_err.set_ylabel('|Z_L - Z_R| / |Z_R|  [%]', fontsize=8)
-    ax_err.tick_params(labelsize=7)
+    ax_err.set_ylabel('Rel. error [%]', fontsize=fs(8))
+    ax_err.tick_params(labelsize=fs(7))
+    # 文字が大きいので目盛の数字は少なめにする(重なり防止)
+    ax_err.yaxis.set_major_locator(MaxNLocator(3))
+    ax_err.xaxis.set_major_locator(MaxNLocator(6))
     ax_err.grid(True, lw=0.4, alpha=0.5)
     if SINGLE_FREQ:
         # 周波数軸が 1 点しか無い(=線が引けない)ので、全フレームの推移を時間軸で描き、
@@ -651,15 +748,17 @@ if HAS_ERR:
         err_vline = ax_err.axvline(timestamps[0], color='black', lw=1.2, alpha=0.7,
                                    animated=True)
         ax_err.set_xlim(float(timestamps[0]), float(timestamps[-1]))
-        ax_err.set_xlabel('Time (s)', fontsize=8)
-        ax_err.set_title('L vs R impedance relative error (ref: Right) @ {} MHz'.format(
-            fmt_freq_mhz(err_freqs[0])), fontsize=9, fontweight='bold')
+        ax_err.set_xlabel('Time (s)', fontsize=fs(8))
+        # 周波数はスミスチャートのタイトルに出ているので、ここでは繰り返さない
+        # (スミスの下は文字が込み合うため)。
+        ax_err.set_title('L vs R impedance rel. error (ref: Right)',
+                         fontsize=fs(9), fontweight='bold')
     else:
         (err_line,) = ax_err.plot([], [], color='purple', lw=1.4, animated=True)
         ax_err.set_xlim(float(err_freqs.min()), float(err_freqs.max()))
-        ax_err.set_xlabel('Frequency (MHz)', fontsize=8)
-        ax_err.set_title('L vs R impedance relative error (ref: Right)',
-                         fontsize=9, fontweight='bold')
+        ax_err.set_xlabel('Frequency (MHz)', fontsize=fs(8))
+        ax_err.set_title('L vs R impedance rel. error (ref: Right)',
+                         fontsize=fs(9), fontweight='bold')
 
 
 def update_err_display(idx):
@@ -694,11 +793,11 @@ slider.poly.set_animated(True)
 slider._handle.set_animated(True)
 slider.valtext.set_animated(True)
 
-ax_btn = fig.add_axes([0.06, 0.035, 0.10, 0.05])
+ax_btn = fig.add_axes([0.05, 0.028, 0.10, 0.055])
 btn_play = Button(ax_btn, 'Play', color='0.85', hovercolor='0.70')
 btn_play.label.set_animated(True)
 
-ax_time_box = fig.add_axes([0.27, 0.04, 0.10, 0.035])
+ax_time_box = fig.add_axes([0.33, 0.03, 0.10, 0.05])
 time_box = TextBox(ax_time_box, f'Frame(0-{n_frames - 1}) ', initial='0')
 time_box.text_disp.set_animated(True)
 
@@ -729,7 +828,7 @@ elif HAS_SMITH:
     _fmin, _fmax = float(_all_freqs.min()), float(_all_freqs.max())
     _fstep = float(np.min([np.diff(freqs[side]).min() for side in SIDES if len(freqs[side]) > 1] or [0.01]))
     _finit = float(np.clip(DEFAULT_FREQ_MHZ, _fmin, _fmax))
-    ax_freq = fig.add_axes([0.68, 0.265, 0.28, 0.02])
+    ax_freq = fig.add_axes([0.72, 0.165, 0.20, 0.022])
     freq_slider = Slider(ax_freq, 'Freq (MHz)', _fmin, _fmax,
                          valinit=_finit, valstep=_fstep, color='seagreen', valfmt='%.2f')
     state['freq'] = _finit
@@ -752,12 +851,20 @@ def update_freq_display():
             freq_marker_pts[side].set_data(np.array([gr]), np.array([gi]))
         else:
             freq_marker_pts[side].set_data(np.array([]), np.array([]))
-        f_lbl = fmt_freq_mhz(actual_f)
+        # 統合表示は 1 枚に左右が重なっているので、どちらの Z かを行頭で示す。
+        # 行頭の ★ はチャート上のマーカーと同色なので、これが凡例を兼ねる
+        # (周波数はチャートのタイトルに出ているので繰り返さない)。
+        # 掃引モードは 2 枚のチャートが近接しており、1 行に収めると隣の読み出しと
+        # ぶつかるので周波数と Z を 2 行に分ける。
+        if SMITH_MERGED:
+            head, sep = '★ ' + SMITH_STYLE[side]['label'], ': '
+        else:
+            head, sep = f'@{fmt_freq_mhz(actual_f)} MHz', '\n'
         if np.isfinite(zr) and np.isfinite(zx):
             sign = '+' if zx >= 0 else '-'
-            freq_txt[side].set_text(f'@{f_lbl} MHz: Z = {zr:.1f} {sign} j{abs(zx):.1f} Ω')
+            freq_txt[side].set_text(f'{head}{sep}Z = {zr:.1f} {sign} j{abs(zx):.1f} Ω')
         else:
-            freq_txt[side].set_text(f'@{f_lbl} MHz: Z = N/A')
+            freq_txt[side].set_text(f'{head}{sep}Z = N/A')
 
 
 # ------------------------------------------------------------------ #
@@ -778,7 +885,6 @@ def draw_markers_smith(idx):
     time_txt.set_text(f'Time: {timestamps[idx]:.3f} s   [{idx + 1} / {n_frames}]')
     angle_txt_r.set_text(f'R Elbow: {fmt_angle(angles["R"][idx])}')
     angle_txt_l.set_text(f'L Elbow: {fmt_angle(angles["L"][idx])}')
-    vline.set_xdata([timestamps[idx], timestamps[idx]])
     # ---- ウィジェットの表示更新 ----
     # TextBox.set_val() は 'submit' オブザーバまで発火するため、そのまま呼ぶと
     # on_time_submit → seek_to_row に再入し、行が変わるたびに動画を再シークして
@@ -794,9 +900,16 @@ def draw_markers_smith(idx):
         state['updating'] = False
     if HAS_SMITH:
         for side in SIDES:
+            if SINGLE_FREQ and SMITH_TRAIL_FRAMES <= 0:
+                # 1 点しか測っていないので、チャートに出す点も 1 つだけにする。
+                # 現在フレームの値は ★(update_freq_display)が描くので、ここでは
+                # 掃引トレースも軌跡の始点 ○ も描かない。
+                smith_lines[side].set_data([], [])
+                smith_start_pts[side].set_data([], [])
+                continue
             if SINGLE_FREQ:
-                # 1 点しか無いので掃引トレースは引けない。代わりに、その周波数の Γ が
-                # 時間とともにどう動いたか(直近 SMITH_TRAIL_FRAMES 行の軌跡)を描き、
+                # --trail N 指定時のみ。掃引トレースは引けないので、代わりにその周波数の
+                # Γ が時間とともにどう動いたか(直近 SMITH_TRAIL_FRAMES 行の軌跡)を描き、
                 # 軌跡の始点を ○ で、現在値を ★(update_freq_display)で示す。
                 lo = max(0, idx - SMITH_TRAIL_FRAMES + 1)
                 re_vals = gamma_real[side][lo:idx + 1, 0]
@@ -816,14 +929,14 @@ def draw_markers_smith(idx):
 
 # ------------------------------------------------------------------ #
 # 描画(blit)
-#   毎フレーム図全体を再描画すると、肘角度・相対誤差の時系列(数千点)や 3D の箱・
+#   毎フレーム図全体を再描画すると、相対誤差の時系列(数千点)や 3D の箱・
 #   スミス格子まで描き直すことになり 1 回あたり数百 ms かかる。単一周波数モードでは
 #   CSV の行が動画フレームより速く進む(例 54 Hz > 24 fps)ため、行が変わるたびに
 #   全体再描画していると再生が追いつかず、映像がとびとびになる。
 #   → 静的な部分は背景としてキャッシュし、動くアーティストだけ描き直して blit する。
 # ------------------------------------------------------------------ #
 # 毎フレーム描き直すアーティスト(描画順=下→上)
-_ANIM = list(pts.values()) + list(bone_lines) + [time_txt, angle_txt_r, angle_txt_l, vline]
+_ANIM = list(pts.values()) + list(bone_lines) + [time_txt, angle_txt_r, angle_txt_l]
 if HAS_SMITH:
     for _side in SIDES:
         _ANIM += [smith_lines[_side], smith_start_pts[_side],
