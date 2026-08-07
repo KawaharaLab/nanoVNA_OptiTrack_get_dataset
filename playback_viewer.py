@@ -7,8 +7,13 @@ sync_optitrack_nanovna.py で取得した CSV(7 マーカー座標 + leftbody/ri
 連動録画した動画(WIN_YYYYMMDD_HH_MM_SS_Pro.mp4)を、時刻同期して再生する GUI。
 view_marker_impedances/viewer_3marker.py を土台に、再生エンジンを作り替えている。
 
+上半身・下半身のどちらで計測した CSV かは位置列の名前から自動判定する(BODY_LAYOUTS):
+  上半身: chest / R,L_upperarm / R,L_joint / R,L_forearm → 角度は左右の肘
+  下半身: waist / R,L_thigh    / R,L_knee  / R,L_shin    → 角度は左右の膝
+判定に失敗するときだけ --body upper / --body lower で明示指定する。
+
 表示内容:
-  - 3D マーカー散布 + ボーン(右腕/左腕/体幹) + 左右の肘角度(数値。3D ビュー内に表示)
+  - 3D マーカー散布 + ボーン + 左右の関節角度(肘 or 膝。数値。3D ビュー内に表示)
   - 左右 body のスミスチャート(見出しは Impedance。点の座標は Γ = S11 だが、
     スミスチャートはそれをインピーダンス Z = R + jX(Z0 = 50Ω 基準)として読む図)
   - 動画パネル(--video 指定時)
@@ -33,7 +38,7 @@ view_marker_impedances/viewer_3marker.py を土台に、再生エンジンを作
   video_time_sec から求めてマーカー/スミスを更新する。
     - 動画パネル … 経過した実時間に対応するフレームを表示。描画が間に合わないときは
       間のフレームを cap.grab() で読み飛ばして実時間再生を保つ(シークはしない)。
-    - マーカー/スミス/肘角度 … 対応する CSV 行が変わったときに更新。ただし更新レートは
+    - マーカー/スミス/関節角度 … 対応する CSV 行が変わったときに更新。ただし更新レートは
       PANEL_UPDATE_MAX_HZ で頭打ちにする。
   → 「マーカーとスミスは同期・動画はそれに同期しつつ滑らか」を実現する。
 
@@ -109,26 +114,112 @@ parser.add_argument('--trail', type=int, default=0, metavar='N',
                     help='単一周波数(1点)モードのスミスチャートに、その周波数の Γ が'
                          '時間とともに動いた軌跡を直近 N 行ぶん描く(既定 0 = 描かない'
                          '=現在フレームの 1 点だけを表示)。例: --trail 300')
+parser.add_argument('--body', choices=['auto', 'upper', 'lower'], default='auto',
+                    help='計測部位(上半身/下半身)。既定 auto は CSV の位置列名から自動判定する'
+                         '(upper: chest/R_upperarm/... , lower: waist/R_thigh/...)。'
+                         '自動判定に失敗するときだけ明示指定する')
 args = parser.parse_args()
 
 CSV_PATH = Path(args.csv)
 if not CSV_PATH.exists():
     sys.exit(f'[Error] CSV not found: {CSV_PATH}')
 
-MARKERS = [
-    ('R_upperarm', 'R_upperarm'),
-    ('R_joint',    'R_joint'),
-    ('R_forearm',  'R_forearm'),
-    ('chest',      'chest'),
-    ('L_upperarm', 'L_upperarm'),
-    ('L_joint',    'L_joint'),
-    ('L_forearm',  'L_forearm'),
-]
-
 # ------------------------------------------------------------------ #
-# ヘッダーを読み、S11(leftbody/rightbody)列と Z 列、動画同期列を検出
+# ヘッダーを読み、計測部位(上半身/下半身)・S11(leftbody/rightbody)列と Z 列・
+# 動画同期列を検出
 # ------------------------------------------------------------------ #
 _header_cols = pd.read_csv(CSV_PATH, nrows=0).columns.tolist()
+
+# ------------------------------------------------------------------ #
+# 計測部位(上半身 / 下半身)ごとの表示レイアウト
+#   sync_optitrack_nanovna.py の MARKER_GROUPS と同じ 7 点構成に対応する。
+#   どちらで測った CSV かは位置列の名前(chest_X があるか waist_X があるか)で判る
+#   ため、既定では列名から自動判定する(--body で明示指定も可)。
+#   order  : 3D ビューに描くマーカー(凡例の並び)
+#   bones  : つなぐ線 (a, b, 色)
+#   angles : 3 点のなす角として表示する関節 (ラベル, (端, 関節, 端))
+# ------------------------------------------------------------------ #
+BODY_LAYOUTS = {
+    'upper': dict(
+        label='Upper Body',
+        order=['R_upperarm', 'R_joint', 'R_forearm', 'chest',
+               'L_upperarm', 'L_joint', 'L_forearm'],
+        bones=[
+            ('chest',      'R_upperarm', 'gray'),
+            ('R_upperarm', 'R_joint',    'red'),
+            ('R_joint',    'R_forearm',  'red'),
+            ('chest',      'L_upperarm', 'gray'),
+            ('L_upperarm', 'L_joint',    'blue'),
+            ('L_joint',    'L_forearm',  'blue'),
+        ],
+        angles=[
+            ('R Elbow', ('R_upperarm', 'R_joint', 'R_forearm')),
+            ('L Elbow', ('L_upperarm', 'L_joint', 'L_forearm')),
+        ],
+    ),
+    'lower': dict(
+        label='Lower Body',
+        order=['R_thigh', 'R_knee', 'R_shin', 'waist',
+               'L_thigh', 'L_knee', 'L_shin'],
+        bones=[
+            ('waist',   'R_thigh', 'gray'),
+            ('R_thigh', 'R_knee',  'red'),
+            ('R_knee',  'R_shin',  'red'),
+            ('waist',   'L_thigh', 'gray'),
+            ('L_thigh', 'L_knee',  'blue'),
+            ('L_knee',  'L_shin',  'blue'),
+        ],
+        angles=[
+            ('R Knee', ('R_thigh', 'R_knee', 'R_shin')),
+            ('L Knee', ('L_thigh', 'L_knee', 'L_shin')),
+        ],
+    ),
+}
+
+
+def _missing_marker_cols(part, cols):
+    """その部位のマーカーのうち、CSV に X/Y/Z 列が揃っていないものを返す。"""
+    have = set(cols)
+    return [nm for nm in BODY_LAYOUTS[part]['order']
+            if not all(f'{nm}_{ax}' in have for ax in ('X', 'Y', 'Z'))]
+
+
+def _detect_body_part(cols):
+    """
+    CSV の位置列名から計測部位を判定する。
+    上半身(chest/R_upperarm/...)と下半身(waist/R_thigh/...)は列名が重ならないため、
+    7 点すべての X/Y/Z が揃っている方を採用する。
+    """
+    complete = [p for p in BODY_LAYOUTS if not _missing_marker_cols(p, cols)]
+    if len(complete) == 1:
+        return complete[0]
+    if len(complete) > 1:      # 両方揃う CSV は想定外だが、その場合は上半身を優先
+        return 'upper'
+    return None
+
+
+if args.body == 'auto':
+    BODY_PART = _detect_body_part(_header_cols)
+    if BODY_PART is None:
+        detail = '; '.join(
+            '{}: 不足 {}'.format(BODY_LAYOUTS[p]['label'],
+                                 ', '.join(_missing_marker_cols(p, _header_cols)))
+            for p in BODY_LAYOUTS)
+        sys.exit('[Error] CSV の位置列から計測部位を判定できませんでした。'
+                 '--body upper / --body lower で明示指定してください。\n'
+                 f'        ({detail})')
+else:
+    BODY_PART = args.body
+    missing = _missing_marker_cols(BODY_PART, _header_cols)
+    if missing:
+        sys.exit(f'[Error] --body {BODY_PART} を指定しましたが、CSV に次のマーカー列が'
+                 f'ありません: {", ".join(missing)}')
+
+LAYOUT = BODY_LAYOUTS[BODY_PART]
+# (表示名, CSV の列名プレフィックス)。本ビューアでは両者は同じ。
+MARKERS = [(nm, nm) for nm in LAYOUT['order']]
+print(f'[Info] 計測部位: {LAYOUT["label"]} ({BODY_PART}) '
+      f'/ マーカー: {", ".join(LAYOUT["order"])}')
 
 # 列名の MHz サフィックスは「無い」場合もある: 単一周波数(1点)モードで測った古い CSV は
 # "leftbody_S11_Real" のようにサフィックスが付かない(現在の計測スクリプトは 1 点でも
@@ -462,19 +553,23 @@ def nearest_freq_idx(side, target_freq):
 
 
 # ------------------------------------------------------------------ #
-# 肘角度を事前計算
+# 関節角度(上半身=肘 / 下半身=膝)を事前計算
 # ------------------------------------------------------------------ #
-def elbow_angles(upper, joint, fore):
-    v1 = upper - joint
-    v2 = fore - joint
+def joint_angles(prox, joint, dist):
+    """3 点のなす角[deg]を全フレームぶん返す(関節 joint が頂点)。"""
+    v1 = prox - joint
+    v2 = dist - joint
     cos_a = np.einsum('ij,ij->i', v1, v2) / (
         np.linalg.norm(v1, axis=1) * np.linalg.norm(v2, axis=1) + 1e-12)
     return np.degrees(np.arccos(np.clip(cos_a, -1.0, 1.0)))
 
 
+# 右(index 0) / 左(index 1) の順。ラベルは部位に応じて "R Elbow" / "R Knee" など。
+ANGLE_LABEL_R, _r_names = LAYOUT['angles'][0]
+ANGLE_LABEL_L, _l_names = LAYOUT['angles'][1]
 angles = {
-    'R': elbow_angles(pos['R_upperarm'], pos['R_joint'], pos['R_forearm']),
-    'L': elbow_angles(pos['L_upperarm'], pos['L_joint'], pos['L_forearm']),
+    'R': joint_angles(*(pos[n] for n in _r_names)),
+    'L': joint_angles(*(pos[n] for n in _l_names)),
 }
 
 
@@ -514,7 +609,8 @@ def fs(size):
 #   各カラム/サブ領域の x・y 範囲をここで一元的に決め、カードも中身もこれを基準に置く。
 # ------------------------------------------------------------------ #
 fig = plt.figure(figsize=(16, 9))
-fig.suptitle('Dataset + Video Playback Viewer', fontsize=fs(14), fontweight='bold', y=0.965)
+fig.suptitle(f'Dataset + Video Playback Viewer  ({LAYOUT["label"]})',
+             fontsize=fs(14), fontweight='bold', y=0.965)
 
 # 上段カードの縦範囲
 _TOP_Y0, _TOP_Y1 = 0.130, 0.915
@@ -525,13 +621,13 @@ _R_x0, _R_x1 = 0.506, 0.990               # 右カラム(スミス + 誤差)
 _C_x0, _C_x1 = _R_x0, _R_x1               # 右カラムの別名(スミス/誤差コードが参照)
 
 # 左カラムは「動画 + 3D」を 1 つの枠(カード)にまとめる。枠の中を上から
-#   [動画] / [時刻・肘角度の 1 行] / [3D の箱] / [マーカー凡例]
+#   [動画] / [時刻・関節角度の 1 行] / [3D の箱] / [マーカー凡例]
 # の順に置く。3D をできるだけ大きくするため、ラベル類は箱の外の細い 1 行・帯に収め、
 # 3D の箱には残りを目いっぱい使わせる(以前は箱の上にヘッダー 2 行ぶんを空けていた)。
 _B_x0, _B_x1 = _L_x0, _L_x1
 if HAS_VIDEO:
     _A_x0, _A_x1, _A_y0, _A_y1 = _L_x0, _L_x1, 0.590, _TOP_Y1   # 動画サブ領域(上)
-    _HDR_Y = 0.562                                              # 時刻・肘角度(1 行)
+    _HDR_Y = 0.562                                              # 時刻・関節角度(1 行)
     _ax3d_top = 0.548                                           # 3D の箱の上端
 else:
     _A_x0 = _A_x1 = None                                        # 動画なし
@@ -598,16 +694,16 @@ else:
     ax_video = None
 
 # --- 左下: 3D マーカービュー ---
-# 3D の箱をできるだけ大きくするため、時刻・肘角度は箱の“外・上”の 1 行(_HDR_Y)に、
+# 3D の箱をできるだけ大きくするため、時刻・関節角度は箱の“外・上”の 1 行(_HDR_Y)に、
 # マーカー凡例は箱の下の細い帯に置き、箱そのものは残りを目いっぱい使う(上端=_ax3d_top)。
-# 時刻・肘角度は axes の外なので、そのままだと blit 領域(axes の bbox)から外れて更新
+# 時刻・関節角度は axes の外なので、そのままだと blit 領域(axes の bbox)から外れて更新
 # されない。_blit_regions にこの 1 行を覆う矩形(_HDR_REGION)を足して転送対象に含める。
 _ax3d_x = _B_x0 + 0.040
 _ax3d_w = (_B_x1 - _B_x0) - 0.080
 _ax3d_y = _TOP_Y0 + 0.062                       # 下: 凡例(2 段)のぶんを空ける
-_ax3d_h = _ax3d_top - _ax3d_y                   # 上: 時刻・肘角度の 1 行のぶんを空ける
+_ax3d_h = _ax3d_top - _ax3d_y                   # 上: 時刻・関節角度の 1 行のぶんを空ける
 _AX3D_RECT = [_ax3d_x, _ax3d_y, _ax3d_w, _ax3d_h]
-# 時刻・肘角度の 1 行を覆う blit 転送矩形(図座標)。
+# 時刻・関節角度の 1 行を覆う blit 転送矩形(図座標)。
 _HDR_REGION = (_B_x0, _HDR_Y - 0.020, _B_x1, _HDR_Y + 0.020)
 ax = fig.add_axes(_AX3D_RECT, projection='3d')
 
@@ -643,6 +739,7 @@ except TypeError:
     pass
 
 MARKER_STYLE = {
+    # --- 上半身 ---
     'R_upperarm': dict(marker='o', color='red',         trail='salmon',     label='R UpperArm'),
     'R_joint':    dict(marker='s', color='darkorange',  trail='moccasin',   label='R Joint'),
     'R_forearm':  dict(marker='^', color='firebrick',   trail='lightcoral', label='R Forearm'),
@@ -650,6 +747,14 @@ MARKER_STYLE = {
     'L_upperarm': dict(marker='o', color='blue',        trail='skyblue',    label='L UpperArm'),
     'L_joint':    dict(marker='s', color='deepskyblue', trail='powderblue', label='L Joint'),
     'L_forearm':  dict(marker='^', color='navy',        trail='lightsteelblue', label='L Forearm'),
+    # --- 下半身(上半身と同じ配色ルール: 右=赤系 / 左=青系 / 中心=灰) ---
+    'R_thigh':    dict(marker='o', color='red',         trail='salmon',     label='R Thigh'),
+    'R_knee':     dict(marker='s', color='darkorange',  trail='moccasin',   label='R Knee'),
+    'R_shin':     dict(marker='^', color='firebrick',   trail='lightcoral', label='R Shin'),
+    'waist':      dict(marker='D', color='dimgray',     trail='lightgray',  label='Waist'),
+    'L_thigh':    dict(marker='o', color='blue',        trail='skyblue',    label='L Thigh'),
+    'L_knee':     dict(marker='s', color='deepskyblue', trail='powderblue', label='L Knee'),
+    'L_shin':     dict(marker='^', color='navy',        trail='lightsteelblue', label='L Shin'),
 }
 for name, _ in MARKERS:
     st = MARKER_STYLE[name]
@@ -664,14 +769,7 @@ for name, _ in MARKERS:
                   ms=9, label=st['label'], zorder=5, animated=True)
     pts[name] = pt
 
-BONES = [
-    ('chest',      'R_upperarm', 'gray'),
-    ('R_upperarm', 'R_joint',    'red'),
-    ('R_joint',    'R_forearm',  'red'),
-    ('chest',      'L_upperarm', 'gray'),
-    ('L_upperarm', 'L_joint',    'blue'),
-    ('L_joint',    'L_forearm',  'blue'),
-]
+BONES = LAYOUT['bones']
 bone_lines = [ax.plot([], [], [], '-', color=c, lw=2.2, zorder=4, animated=True)[0]
               for _, _, c in BONES]
 
@@ -680,10 +778,11 @@ bone_lines = [ax.plot([], [], [], '-', color=c, lw=2.2, zorder=4, animated=True)
 ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.02), ncol=4,
           fontsize=fs(6.0), columnspacing=1.2, labelspacing=0.4,
           handletextpad=0.3, frameon=False)
-# 時刻・肘角度は 3D の箱の外(上)の 1 行に置く(箱の中だとマーカーと重なり、上に 2 行
-# 取ると箱が小さくなるため)。時刻は控えめなグレー、肘角度は左右の色でそれぞれ示す。
-# フレーム数や角度が大きい実データでも枠(左カード)に収まるよう、regular(細字)で
-# 少し小さめにし、L 肘の右端がカード右端(_L_x1)を越えないよう位置を決める。
+# 時刻・関節角度(上半身=肘 / 下半身=膝)は 3D の箱の外(上)の 1 行に置く(箱の中だと
+# マーカーと重なり、上に 2 行取ると箱が小さくなるため)。時刻は控えめなグレー、
+# 関節角度は左右の色でそれぞれ示す。フレーム数や角度が大きい実データでも枠(左カード)に
+# 収まるよう、regular(細字)で少し小さめにし、左側の角度の右端がカード右端(_L_x1)を
+# 越えないよう位置を決める。
 time_txt    = fig.text(_B_x0 + 0.016, _HDR_Y, '', fontsize=fs(6.5), va='center',
                        color='0.35', animated=True)
 angle_txt_r = fig.text(_B_x0 + 0.180, _HDR_Y, '', fontsize=fs(7.5), va='center',
@@ -1025,8 +1124,8 @@ def draw_markers_smith(idx):
         line.set_data(np.array([pa[0], pb[0]]), np.array([pa[1], pb[1]]))
         line.set_3d_properties(np.array([pa[2], pb[2]]))
     time_txt.set_text(f'Time: {timestamps[idx]:.3f} s   [{idx + 1} / {n_frames}]')
-    angle_txt_r.set_text(f'R Elbow: {fmt_angle(angles["R"][idx])}')
-    angle_txt_l.set_text(f'L Elbow: {fmt_angle(angles["L"][idx])}')
+    angle_txt_r.set_text(f'{ANGLE_LABEL_R}: {fmt_angle(angles["R"][idx])}')
+    angle_txt_l.set_text(f'{ANGLE_LABEL_L}: {fmt_angle(angles["L"][idx])}')
     # ---- ウィジェットの表示更新 ----
     # TextBox.set_val() は 'submit' オブザーバまで発火するため、そのまま呼ぶと
     # on_time_submit → seek_to_row に再入し、行が変わるたびに動画を再シークして
@@ -1163,7 +1262,7 @@ def _blit_regions():
         y0 = min(SMITH_BLOCK[s]['ztext_y'] for s in SIDES) - 0.04
         y1 = max(SMITH_BLOCK[s]['rect'][1] + SMITH_BLOCK[s]['rect'][3] for s in SIDES) + 0.01
         regs.append(TransformedBbox(Bbox([[x0, y0], [x1, y1]]), fig.transFigure))
-    # 3D の時刻・肘角度は箱の外(上)のヘッダー帯に fig.text で置いているので、
+    # 3D の時刻・関節角度は箱の外(上)のヘッダー帯に fig.text で置いているので、
     # その帯を覆う矩形(図座標)を足して blit の転送対象に含める。
     hx0, hy0, hx1, hy1 = _HDR_REGION
     regs.append(TransformedBbox(Bbox([[hx0, hy0], [hx1, hy1]]), fig.transFigure))

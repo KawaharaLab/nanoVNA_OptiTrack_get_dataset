@@ -4,9 +4,13 @@
 ================================================================================
 
 view_marker_impedances/viewer_3marker.py のレイアウトを「計測中のライブ表示」に対応させたもの:
-  - 3D マーカー散布 + ボーン(右腕・左腕・体幹) + 左右の肘角度(テキスト + 時系列)
+  - 3D マーカー散布 + ボーン + 左右の関節角度(テキスト + 時系列)
   - 左右 body の S11 スミスチャート
   - webカメラのライブ映像パネル(カメラ使用時のみ)
+
+計測部位(body_part)で表示内容が切り替わる(BODY_LAYOUTS):
+  "upper"(上半身): chest / R,L_upperarm / R,L_joint / R,L_forearm、角度は左右の肘
+  "lower"(下半身): waist / R,L_thigh / R,L_knee / R,L_shin、角度は左右の膝
 
 【最大の狙い】表示を nanoVNA の掃引レートに律速させない。
 本ダッシュボードは専用の高速タイマー(interval_ms ごと)で、共有状態から
@@ -34,6 +38,7 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (projection='3d' 登録の
 
 # viewer_3marker.py と同じマーカー定義・表示スタイル・ボーン
 MARKER_STYLE = {
+    # --- 上半身 ---
     'R_upperarm': dict(marker='o', color='red',         label='R UpperArm'),
     'R_joint':    dict(marker='s', color='darkorange',  label='R Joint'),
     'R_forearm':  dict(marker='^', color='firebrick',   label='R Forearm'),
@@ -41,17 +46,69 @@ MARKER_STYLE = {
     'L_upperarm': dict(marker='o', color='blue',        label='L UpperArm'),
     'L_joint':    dict(marker='s', color='deepskyblue', label='L Joint'),
     'L_forearm':  dict(marker='^', color='navy',        label='L Forearm'),
+    # --- 下半身(上半身と同じ配色ルール: 右=赤系 / 左=青系 / 中心=灰) ---
+    'R_thigh':    dict(marker='o', color='red',         label='R Thigh'),
+    'R_knee':     dict(marker='s', color='darkorange',  label='R Knee'),
+    'R_shin':     dict(marker='^', color='firebrick',   label='R Shin'),
+    'waist':      dict(marker='D', color='dimgray',     label='Waist'),
+    'L_thigh':    dict(marker='o', color='blue',        label='L Thigh'),
+    'L_knee':     dict(marker='s', color='deepskyblue', label='L Knee'),
+    'L_shin':     dict(marker='^', color='navy',        label='L Shin'),
 }
-MARKER_ORDER = ['R_upperarm', 'R_joint', 'R_forearm', 'chest',
-                'L_upperarm', 'L_joint', 'L_forearm']
-BONES = [
-    ('chest',      'R_upperarm', 'gray'),
-    ('R_upperarm', 'R_joint',    'red'),
-    ('R_joint',    'R_forearm',  'red'),
-    ('chest',      'L_upperarm', 'gray'),
-    ('L_upperarm', 'L_joint',    'blue'),
-    ('L_joint',    'L_forearm',  'blue'),
-]
+
+# 計測部位ごとの表示レイアウト。sync_optitrack_nanovna.py の MARKER_GROUPS と同じキー
+# ("upper"/"lower")で引く。
+#   order  : 3D ビューに描くマーカー(凡例の並び)
+#   bones  : つなぐ線 (a, b, 色)
+#   angles : 3 点のなす角として表示する関節 (ラベル, (端, 関節, 端), 色)
+#   title  : 図のタイトルに入れる部位名
+BODY_LAYOUTS = {
+    'upper': dict(
+        title='Upper Body',
+        title_ja='上半身',
+        angle_label_ja='肘角度',
+        angle_axis_label='Elbow (deg)',
+        order=['R_upperarm', 'R_joint', 'R_forearm', 'chest',
+               'L_upperarm', 'L_joint', 'L_forearm'],
+        bones=[
+            ('chest',      'R_upperarm', 'gray'),
+            ('R_upperarm', 'R_joint',    'red'),
+            ('R_joint',    'R_forearm',  'red'),
+            ('chest',      'L_upperarm', 'gray'),
+            ('L_upperarm', 'L_joint',    'blue'),
+            ('L_joint',    'L_forearm',  'blue'),
+        ],
+        angles=[
+            ('R Elbow', ('R_upperarm', 'R_joint', 'R_forearm'), 'crimson'),
+            ('L Elbow', ('L_upperarm', 'L_joint', 'L_forearm'), 'royalblue'),
+        ],
+    ),
+    'lower': dict(
+        title='Lower Body',
+        title_ja='下半身',
+        angle_label_ja='膝角度',
+        angle_axis_label='Knee (deg)',
+        order=['R_thigh', 'R_knee', 'R_shin', 'waist',
+               'L_thigh', 'L_knee', 'L_shin'],
+        bones=[
+            ('waist',   'R_thigh', 'gray'),
+            ('R_thigh', 'R_knee',  'red'),
+            ('R_knee',  'R_shin',  'red'),
+            ('waist',   'L_thigh', 'gray'),
+            ('L_thigh', 'L_knee',  'blue'),
+            ('L_knee',  'L_shin',  'blue'),
+        ],
+        angles=[
+            ('R Knee', ('R_thigh', 'R_knee', 'R_shin'), 'crimson'),
+            ('L Knee', ('L_thigh', 'L_knee', 'L_shin'), 'royalblue'),
+        ],
+    ),
+}
+DEFAULT_BODY_PART = 'upper'
+
+# 既定(上半身)のレイアウト。外部から参照する場合の後方互換用。
+MARKER_ORDER = BODY_LAYOUTS[DEFAULT_BODY_PART]['order']
+BONES = BODY_LAYOUTS[DEFAULT_BODY_PART]['bones']
 
 # スミスチャートのサイド別スタイル(既知の名前は色を固定、未知はパレットから)
 SMITH_STYLE = {
@@ -61,12 +118,15 @@ SMITH_STYLE = {
 _FALLBACK_COLORS = ['seagreen', 'darkorange', 'purple', 'teal', 'brown']
 
 
-def _elbow_angle(upper, joint, fore):
-    """UpperArm→Joint と Forearm→Joint のなす角[deg]。座標が無効なら NaN。"""
-    if upper is None or joint is None or fore is None:
+def _joint_angle(prox, joint, dist):
+    """
+    3 点のなす角[deg](関節 joint を頂点とする角度)。座標が無効なら NaN。
+    上半身では肘(UpperArm-Joint-Forearm)、下半身では膝(Thigh-Knee-Shin)に使う。
+    """
+    if prox is None or joint is None or dist is None:
         return float('nan')
-    v1 = np.asarray(upper, float) - np.asarray(joint, float)
-    v2 = np.asarray(fore, float) - np.asarray(joint, float)
+    v1 = np.asarray(prox, float) - np.asarray(joint, float)
+    v2 = np.asarray(dist, float) - np.asarray(joint, float)
     n1 = np.linalg.norm(v1)
     n2 = np.linalg.norm(v2)
     if n1 < 1e-9 or n2 < 1e-9:
@@ -152,9 +212,14 @@ class LiveDashboard:
     def __init__(self, parent, channel_names, freq_grid_hz,
                  get_positions, get_sweep, get_frame=None,
                  has_video=False, interval_ms=50, history_sec=30.0,
-                 on_close=None):
+                 on_close=None, body_part=DEFAULT_BODY_PART):
         self.parent = parent
         self.channel_names = list(channel_names)
+        # 計測部位("upper"=上半身 / "lower"=下半身)。描くマーカー・ボーン・関節角度を決める。
+        self.layout = BODY_LAYOUTS.get(body_part, BODY_LAYOUTS[DEFAULT_BODY_PART])
+        self.marker_order = self.layout['order']
+        self.bones = self.layout['bones']
+        self.angle_specs = self.layout['angles']
         self.freq_grid_hz = np.asarray(freq_grid_hz, dtype=float)
         # 単一周波数(1点)モードか。掃引トレースが引けないので、スミスチャートは
         # 「直近サンプルの軌跡 + 現在値」を描く表示に切り替える。
@@ -171,7 +236,7 @@ class LiveDashboard:
         self._closed = False
         self._after_id = None
         self._t0 = time.perf_counter()
-        # 肘角度の時系列履歴(t, R, L)
+        # 関節角度(上半身=肘 / 下半身=膝)の時系列履歴(t, 右, 左)
         self._hist_t = collections.deque()
         self._hist_r = collections.deque()
         self._hist_l = collections.deque()
@@ -188,7 +253,8 @@ class LiveDashboard:
         self._video_shape = None        # 直近フレーム形状(extent 再設定の判定用)
 
         self.win = tk.Toplevel(parent)
-        self.win.title("ライブ表示（3Dマーカー / 肘角度 / スミス / カメラ）")
+        self.win.title("ライブ表示（{}：3Dマーカー / {} / スミス / カメラ）".format(
+            self.layout['title_ja'], self.layout['angle_label_ja']))
         self.win.geometry("1360x820")
         self.win.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -200,8 +266,9 @@ class LiveDashboard:
     # ------------------------------------------------------------------ #
     def _build_figure(self):
         self.fig = Figure(figsize=(13.6, 8.2), dpi=100)
-        self.fig.suptitle("Live: 7 Marker Motion + Impedance Smith Chart",
-                          fontsize=13, fontweight='bold')
+        self.fig.suptitle("Live: {} {} Marker Motion + Impedance Smith Chart".format(
+            self.layout['title'], len(self.marker_order)),
+            fontsize=13, fontweight='bold')
 
         # --- 3D ビュー ---
         if self.has_video:
@@ -222,7 +289,7 @@ class LiveDashboard:
 
         # 現在フレームのマーカー点(animated=True: blit で毎ティック描画する)
         self._pts = {}
-        for name in MARKER_ORDER:
+        for name in self.marker_order:
             st = MARKER_STYLE[name]
             pt, = self.ax3d.plot([], [], [], linestyle='None', marker=st['marker'],
                                  color=st['color'], ms=9, label=st['label'], zorder=5,
@@ -231,26 +298,28 @@ class LiveDashboard:
         # ボーン
         self._bone_lines = [
             self.ax3d.plot([], [], [], '-', color=c, lw=2.2, zorder=4, animated=True)[0]
-            for _, _, c in BONES]
+            for _, _, c in self.bones]
         self.ax3d.legend(loc='upper right', fontsize=7, ncol=2)
         self._time_txt = self.ax3d.text2D(0.02, 0.96, '', transform=self.ax3d.transAxes,
                                           fontsize=10, animated=True)
+        (r_label, _r_pts, r_color) = self.angle_specs[0]
+        (l_label, _l_pts, l_color) = self.angle_specs[1]
         self._angle_txt_r = self.ax3d.text2D(0.02, 0.90, '', transform=self.ax3d.transAxes,
-                                             fontsize=12, color='crimson', fontweight='bold',
+                                             fontsize=12, color=r_color, fontweight='bold',
                                              animated=True)
         self._angle_txt_l = self.ax3d.text2D(0.02, 0.84, '', transform=self.ax3d.transAxes,
-                                             fontsize=12, color='royalblue', fontweight='bold',
+                                             fontsize=12, color=l_color, fontweight='bold',
                                              animated=True)
 
-        # --- 肘角度の時系列 ---
+        # --- 関節角度(上半身=肘 / 下半身=膝)の時系列 ---
         # x 軸は「現在からの相対秒(-history_sec〜0)」で固定する。データ側を (t-now) で流すことで
         # 軸スクロールによる全体再描画を避け、線だけ animated=True で blit する。
         self.ax_ang = self.fig.add_axes([0.05, 0.06, 0.55, 0.20])
-        (self._ang_line_r,) = self.ax_ang.plot([], [], color='crimson', lw=1.2,
-                                               label='R elbow', animated=True)
-        (self._ang_line_l,) = self.ax_ang.plot([], [], color='royalblue', lw=1.2,
-                                               label='L elbow', animated=True)
-        self.ax_ang.set_ylabel('Elbow (deg)', fontsize=8)
+        (self._ang_line_r,) = self.ax_ang.plot([], [], color=r_color, lw=1.2,
+                                               label=r_label, animated=True)
+        (self._ang_line_l,) = self.ax_ang.plot([], [], color=l_color, lw=1.2,
+                                               label=l_label, animated=True)
+        self.ax_ang.set_ylabel(self.layout['angle_axis_label'], fontsize=8)
         self.ax_ang.set_xlabel('Time (s, now=0)', fontsize=8)
         self.ax_ang.set_ylim(0, 180)
         self.ax_ang.set_xlim(-self.history_sec, 0)
@@ -398,7 +467,7 @@ class LiveDashboard:
         snap = self.get_positions() if self.get_positions else {}
         cur = {}
         seen = []
-        for name in MARKER_ORDER:
+        for name in self.marker_order:
             v = snap.get(name)
             if v is not None and len(v) >= 4 and v[3] and all(np.isfinite(v[:3])):
                 cur[name] = (float(v[0]), float(v[1]), float(v[2]))
@@ -414,7 +483,7 @@ class LiveDashboard:
             else:
                 pt.set_data(np.array([p[0]]), np.array([p[1]]))
                 pt.set_3d_properties(np.array([p[2]]))
-        for line, (a, b, _c) in zip(self._bone_lines, BONES):
+        for line, (a, b, _c) in zip(self._bone_lines, self.bones):
             pa, pb = cur.get(a), cur.get(b)
             if pa is None or pb is None:
                 line.set_data(np.array([]), np.array([]))
@@ -424,13 +493,15 @@ class LiveDashboard:
                 line.set_3d_properties(np.array([pa[2], pb[2]]))
         grew = self._grow_limits(seen)
 
-        # --- 肘角度(テキスト + 相対時系列) ---
-        ang_r = _elbow_angle(cur.get('R_upperarm'), cur.get('R_joint'), cur.get('R_forearm'))
-        ang_l = _elbow_angle(cur.get('L_upperarm'), cur.get('L_joint'), cur.get('L_forearm'))
+        # --- 関節角度(上半身=肘 / 下半身=膝。テキスト + 相対時系列) ---
+        (r_label, (r_a, r_b, r_c), _rc) = self.angle_specs[0]
+        (l_label, (l_a, l_b, l_c), _lc) = self.angle_specs[1]
+        ang_r = _joint_angle(cur.get(r_a), cur.get(r_b), cur.get(r_c))
+        ang_l = _joint_angle(cur.get(l_a), cur.get(l_b), cur.get(l_c))
         self._time_txt.set_text('Time: {:.2f} s'.format(now))
-        self._angle_txt_r.set_text('R Elbow: {}'.format(
+        self._angle_txt_r.set_text('{}: {}'.format(r_label,
             '{:.1f}°'.format(ang_r) if np.isfinite(ang_r) else 'N/A'))
-        self._angle_txt_l.set_text('L Elbow: {}'.format(
+        self._angle_txt_l.set_text('{}: {}'.format(l_label,
             '{:.1f}°'.format(ang_l) if np.isfinite(ang_l) else 'N/A'))
         self._hist_t.append(now)
         self._hist_r.append(ang_r)

@@ -7,15 +7,20 @@ OptiTrack (Motive 3.1 / NatNet) + JNCRadio VNA 3G 同期計測スクリプト
 受信しつつ、USB シリアル接続された JNCRadio VNA 3G から特定単一周波数の S11 を
 連続取得し、両者を同期して CSV に保存する。
 
-計測対象は身体に取り付けた 7 個のラベル付きマーカー:
-  R_forearm, R_joint, R_upperarm, chest, L_forearm, L_joint, L_upperarm
+計測対象は身体に取り付けた 7 個のラベル付きマーカー。上半身・下半身のどちらを計測するかは
+GUI の「計測部位」で計測開始前に選ぶ(MARKER_GROUPS):
+  上半身: chest, R_upperarm, R_joint, R_forearm, L_upperarm, L_joint, L_forearm
+  下半身: waist, R_thigh,    R_knee,  R_shin,    L_thigh,    L_knee,  L_shin
 各マーカーの [X, Y, Z] 座標を同時に取得し、S11 / インピーダンスと紐付けて 1 行に記録する。
+CSV の位置列・ライブ表示・マーカー欠損判定は、選んだ部位の 7 点だけを対象にする。
 
 ★マーカーの識別(ラベル認識)★
   Motive 側で各マーカーにラベル(名前)を付け、マーカーセットとして配信する。本スクリプトは
-  マーカーセット内の「並び順」を EXPECTED_MARKER_NAMES に対応付けて各マーカーの座標を取得する
-  (高さによる自動判別は廃止)。実際にどの順序・形式で配信されているかは、起動直後に出力される
-  診断ログ(MARKER_DIAGNOSTIC_FRAMES)で確認できる。
+  マーカーセット内の「並び順」を、選択中の部位のマーカー名リスト(MARKER_NAMES)に対応付けて
+  各マーカーの座標を取得する(高さによる自動判別は廃止)。実際にどの順序・形式で配信されて
+  いるかは、起動直後に出力される診断ログ(MARKER_DIAGNOSTIC_FRAMES)で確認できる。
+  並び順は Motive 側のアセット定義に依存するため、部位ごとに MARKER_GROUPS の "names" を
+  実際の配信順へ合わせておくこと。
 
 ★マーカー消失時の扱い★
   いずれかのマーカーが認識できない(オクルージョン/未検出)フレームでは、そのとき取得した
@@ -70,7 +75,8 @@ VNA 接続(COM ポート):
   スミスチャート/カメラ映像を表示する。この表示は nanoVNA の掃引レートに律速されず、専用の
   高速タイマーで最新のマーカー座標・カメラフレーム・各 VNA の最新掃引を直接読んで更新する。
 
-CSV ヘッダー(位置列は EXPECTED_MARKER_NAMES 順、VNA 列は VNA_CHANNEL_NAMES 順に自動生成):
+CSV ヘッダー(位置列は選択中の部位のマーカー順、VNA 列は VNA_CHANNEL_NAMES 順に自動生成。
+下記は上半身を選んだ場合の例。下半身なら waist / R_thigh / R_knee / R_shin / ... になる):
   [Timestamp, WallClock,
    R_forearm_X,  R_forearm_Y,  R_forearm_Z,
    R_joint_X,    R_joint_Y,    R_joint_Z,
@@ -285,31 +291,59 @@ NATNET_USE_MULTICAST = False    # 同一PCループバックは Unicast 推奨
 
 # --- マーカーの識別(ラベル認識)方式 ---
 # Motive 側で 7 個のマーカーにラベル(名前)を付けて配信する。フレームデータにマーカー名は
-# 含まれないため、本スクリプトは「マーカーの並び(marker_id または セット内 index)」を下記の
-# EXPECTED_MARKER_NAMES に順番どおり対応付けて座標を取得する(高さによる自動判別は廃止)。
+# 含まれないため、本スクリプトは「マーカーの並び(marker_id または セット内 index)」を
+# 選択中の部位のマーカー名リストに順番どおり対応付けて座標を取得する(高さによる自動判別は廃止)。
 #
-# 【重要】EXPECTED_MARKER_NAMES の並び順が、実際の配信順と一致している必要がある。
+# 【重要】各部位の "names" の並び順が、実際の配信順と一致している必要がある。
 # 実際の並びは起動直後の診断ログ(MARKER_DIAGNOSTIC_FRAMES)で確認し、必要ならここを並べ替える。
+# 上半身と下半身では Motive のアセットが別なので、配信順もそれぞれ確認すること。
 # CSV の位置列もこの順序で生成される。
 
-#EXPECTED_MARKER_NAMES = ["R_joint",  "R_forearm","chest","L_forearm", "L_joint","L_upperarm","R_upperarm",]
+# --- 計測部位(上半身 / 下半身)の定義 ---
+# どちらを計測するかは GUI の「計測部位」で計測開始前に選ぶ。選んだ側の 7 点だけを
+# 記録し、CSV 列・ライブ表示・マーカー欠損判定もその 7 点で行う。
+# label      : GUI/ログの表示名
+# names      : Motive の配信順に並べたマーカー名(= CSV の位置列の順序)
+# 下半身の並びは上半身と同じ規則(中心 → 左右の付け根 → 関節 → 末端)で初期値を置いてある。
+# 実際の配信順は Motive のアセット定義次第なので、診断ログを見て必ず確認・修正すること。
+MARKER_GROUPS = {
+    "upper": {
+        "label": "上半身",
+        "names": ["chest", "R_upperarm", "L_upperarm",
+                  "R_joint", "R_forearm", "L_forearm", "L_joint"],
+    },
+    "lower": {
+        "label": "下半身",
+        "names": ["waist", "L_shin", "L_thigh",
+                  "R_thigh", "L_knee", "R_knee", "R_shin"],
+    },
+}
+# 起動時に選ばれている部位(GUI のラジオボタン初期値)
+DEFAULT_MARKER_GROUP = "upper"
 
-EXPECTED_MARKER_NAMES = ["chest","R_upperarm","L_upperarm","R_joint","R_forearm","L_forearm","L_joint",]
+# 現在選択中の部位キー。GUI の[計測開始]時に set_marker_group() で更新される。
+MARKER_GROUP = DEFAULT_MARKER_GROUP
+
+# 旧設定名の互換: 選択中の部位のマーカー名(配信順)。set_marker_group() で切り替わる。
+EXPECTED_MARKER_NAMES = list(MARKER_GROUPS[DEFAULT_MARKER_GROUP]["names"])
 
 # 座標取得のソース:
-#   "labeled_marker" : ラベル付きマーカーを marker_id(1..N)で EXPECTED_MARKER_NAMES に対応付ける。
-#                      → marker_id=i のマーカー を EXPECTED_MARKER_NAMES[i-1] に割り当てる。
+#   "labeled_marker" : ラベル付きマーカーを marker_id(1..N)で MARKER_NAMES に対応付ける。
+#                      → marker_id=i のマーカー を MARKER_NAMES[i-1] に割り当てる。
 #   "marker_set"     : マーカーセット内の「並び順(index)」で対応付ける。
 # Motive で個別マーカーにラベルを付けてアセット配信している場合は "labeled_marker"。
 MARKER_SOURCE = "labeled_marker"
 
 # labeled_marker のとき、対象アセットの model_id(id_num の上位16bit)。
-# None なら model_id を問わず marker_id が 1..len(EXPECTED_MARKER_NAMES) の範囲のものを使う。
+# None なら model_id を問わず marker_id が 1..len(MARKER_NAMES) の範囲のものを使う。
 # 余計なラベル付きマーカー(別アセット/点群)が混じる場合は、診断ログの model= の値を指定する。
+# 上半身・下半身のアセットを同時に配信している場合は、ここを部位ごとに指定しないと
+# 相手側のマーカーを拾ってしまうので注意(その場合は MARKER_GROUPS に model_id を持たせて
+# set_marker_group() で切り替えるとよい)。
 MARKER_MODEL_ID = None
 
 # marker_set のとき、位置取得に使うマーカーセット名。
-# 空文字 "" のときは、マーカー数が len(EXPECTED_MARKER_NAMES) と一致するセットを
+# 空文字 "" のときは、マーカー数が len(MARKER_NAMES) と一致するセットを
 # 自動採用する(全点をまとめた "all" セットは除外)。
 MARKER_SET_NAME = ""
 
@@ -330,8 +364,9 @@ STREAM_STALE_SEC = 2.0
 # --- 出力 ---
 OUTPUT_CSV = "sync_dataset.csv"
 
-# 計測対象マーカー名(EXPECTED_MARKER_NAMES を確定した並び順で固定)。
+# 計測対象マーカー名(選択中の部位のマーカーを配信順で並べたもの)。
 # 共有状態・CSV 列・スナップショットなどはすべてこの順序に従う。
+# 計測開始時に set_marker_group() が選択された部位のものへ差し替える。
 MARKER_NAMES = tuple(EXPECTED_MARKER_NAMES)
 
 # 位置情報の先頭列(計測開始からの経過秒 [+ 絶対時刻] + 各マーカー × XYZ)を動的生成する。
@@ -589,6 +624,34 @@ _latest_positions = {
     name: {"x": None, "y": None, "z": None, "valid": False}
     for name in MARKER_NAMES
 }
+
+
+def marker_group_label(key=None):
+    """部位キー("upper"/"lower")の表示名を返す。key 省略で現在の選択。"""
+    g = MARKER_GROUPS.get(key if key is not None else MARKER_GROUP)
+    return g["label"] if g else str(key)
+
+
+def set_marker_group(key):
+    """
+    計測部位(上半身/下半身)を切り替える。
+
+    MARKER_NAMES(=CSV 位置列・欠損判定・スナップショットの対象)と、共有状態の
+    座標スロットをその部位の 7 点で作り直す。計測スレッドが動いていない状態
+    (計測開始の直前)から呼ぶこと。
+    """
+    global MARKER_GROUP, MARKER_NAMES, EXPECTED_MARKER_NAMES
+    if key not in MARKER_GROUPS:
+        raise ValueError("未知の計測部位: {}".format(key))
+    MARKER_GROUP = key
+    EXPECTED_MARKER_NAMES = list(MARKER_GROUPS[key]["names"])
+    MARKER_NAMES = tuple(EXPECTED_MARKER_NAMES)
+    with _pos_lock:
+        _latest_positions.clear()
+        for name in MARKER_NAMES:
+            _latest_positions[name] = {"x": None, "y": None, "z": None,
+                                       "valid": False}
+    return MARKER_NAMES
 
 # 最後にフレームを受信した時刻(ストリーミング途絶検知用)。Lock 下で更新。
 _last_frame_time = [0.0]
@@ -1276,6 +1339,9 @@ class MeasurementController:
         self.points = SCAN_POINTS
         self.freq_grid_hz = FREQ_GRID_HZ
         self.csv_header = CSV_HEADER
+        # 計測部位(上半身/下半身)と、そのマーカー名(配信順)。start() で確定し meta.json に残す。
+        self.marker_group = MARKER_GROUP
+        self.marker_names = list(MARKER_NAMES)
         self.use_optitrack = True   # False で OptiTrack を使わない(VNA のみ計測)
         self.use_camera_sync = True  # False でカメラ動画同期を使わない(WallClock 列/meta.json を出さない)
 
@@ -1308,6 +1374,10 @@ class MeasurementController:
         if self.points <= 1 or self.start_hz == self.stop_hz:
             self.points = 1
             self.stop_hz = self.start_hz
+        # 計測部位は GUI が start() の直前に set_marker_group() で確定させている。
+        # ここで控えておき、CSV ヘッダー生成と meta.json の記録に使う。
+        self.marker_group = MARKER_GROUP
+        self.marker_names = list(MARKER_NAMES)
         self.freq_grid_hz = make_freq_grid(self.start_hz, self.stop_hz, self.points)
         self.csv_header = build_csv_header(
             self.freq_grid_hz, VNA_CHANNEL_NAMES,
@@ -1753,6 +1823,9 @@ class MeasurementController:
         meta = {
             "csv_file": os.path.basename(csv_path),
             "n_samples": n_rows,
+            "marker_group": self.marker_group,             # "upper"(上半身) / "lower"(下半身)
+            "marker_group_label": marker_group_label(self.marker_group),
+            "marker_names": list(self.marker_names),       # CSV の位置列の並び順
             "timestamp_column": "Timestamp",       # 計測開始からの経過秒
             "wallclock_column": "WallClock",        # 絶対時刻(ローカル・ミリ秒)
             "wallclock_format": "%Y-%m-%d %H:%M:%S.%f (ローカル時刻・ミリ秒)",
@@ -1861,8 +1934,10 @@ class App(tk.Tk):
         info = ttk.Label(
             self,
             text=("計測: {}（固定）  /  VNA: {} 台  /  マーカー: {} 個（ラベル認識）\n"
-                  "各 VNA の COM ポートと掃引条件を設定して[計測開始]。全マーカーが揃ったサンプルのみ記録します。"
-                  ).format(VNA_SPARAM, len(VNA_CHANNEL_NAMES), len(MARKER_NAMES)),
+                  "各 VNA の COM ポートと掃引条件、計測部位（上半身/下半身）を設定して[計測開始]。"
+                  "全マーカーが揃ったサンプルのみ記録します。"
+                  ).format(VNA_SPARAM, len(VNA_CHANNEL_NAMES),
+                           len(MARKER_GROUPS[DEFAULT_MARKER_GROUP]["names"])),
             justify="left")
         info.pack(anchor="w", **pad)
 
@@ -1924,6 +1999,26 @@ class App(tk.Tk):
                   text="(この周波数のインピーダンスを各 body について数値表示)"
                   ).pack(side="left")
 
+        # --- 計測部位(上半身 / 下半身)の選択 ---
+        # 計測開始前にどちらを計測するか選ぶ。選んだ側の 7 マーカーだけを記録し、
+        # CSV の位置列・ライブ表示・マーカー欠損判定もその 7 点で行う。
+        body_frame = ttk.Frame(self)
+        body_frame.pack(fill="x", **pad)
+        ttk.Label(body_frame, text="計測部位:").pack(side="left")
+        self.body_var = tk.StringVar(value=DEFAULT_MARKER_GROUP)
+        self.body_radios = []
+        for key in MARKER_GROUPS:
+            rb = ttk.Radiobutton(
+                body_frame, text="{}（{}点）".format(
+                    MARKER_GROUPS[key]["label"], len(MARKER_GROUPS[key]["names"])),
+                value=key, variable=self.body_var, command=self._on_body_change)
+            rb.pack(side="left", padx=4)
+            self.body_radios.append(rb)
+        self.body_markers_var = tk.StringVar(value="")
+        ttk.Label(body_frame, textvariable=self.body_markers_var,
+                  foreground="#555").pack(side="left", padx=6)
+        self._on_body_change()   # マーカー一覧ラベルを初期化
+
         # --- 計測モード(OptiTrack を使うか) ---
         opt_frame = ttk.Frame(self)
         opt_frame.pack(fill="x", **pad)
@@ -1958,7 +2053,7 @@ class App(tk.Tk):
         self.live_var = tk.BooleanVar(value=True)
         self.live_chk = ttk.Checkbutton(
             live_frame,
-            text="計測中にライブ表示を開く（別ウィンドウ：3Dマーカー/肘角度/スミス/カメラ映像。掃引レート非依存で更新）",
+            text="計測中にライブ表示を開く（別ウィンドウ：3Dマーカー/関節角度（肘 or 膝）/スミス/カメラ映像。掃引レート非依存で更新）",
             variable=self.live_var)
         self.live_chk.pack(side="left")
 
@@ -2005,6 +2100,13 @@ class App(tk.Tk):
         self.log.configure(yscrollcommand=scroll.set)
         self.log.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
+
+    # ---- 計測部位の選択が変わったとき(マーカー一覧ラベルの更新) ----
+    def _on_body_change(self):
+        """選択中の部位のマーカー名(配信順)をラベルに表示する。"""
+        key = self.body_var.get()
+        names = MARKER_GROUPS.get(key, {}).get("names", [])
+        self.body_markers_var.set("マーカー（配信順）: " + ", ".join(names))
 
     # ---- FPS 表示テキストの生成 ----
     def _fps_default_text(self):
@@ -2294,6 +2396,16 @@ class App(tk.Tk):
         use_optitrack = bool(self.optitrack_var.get())
         use_camera_sync = bool(self.camera_var.get())
 
+        # 計測部位(上半身/下半身)を確定する。以降の MARKER_NAMES・共有座標スロット・
+        # CSV 位置列・ライブ表示は、ここで選んだ 7 点だけを対象にする。
+        body_key = self.body_var.get()
+        try:
+            set_marker_group(body_key)
+        except ValueError:
+            messagebox.showerror("計測部位エラー",
+                                 "計測部位が選択されていません。上半身か下半身を選んでください。")
+            return
+
         # 新しい掃引条件にあわせてグラフ横軸を作り直す
         self._reconfigure_plot(start_hz, stop_hz, points)
 
@@ -2310,6 +2422,8 @@ class App(tk.Tk):
         self.camera_chk.configure(state="disabled")
         self.camera_index_spin.configure(state="disabled")
         self.live_chk.configure(state="disabled")
+        for rb in self.body_radios:                    # 計測中は部位を変更不可
+            rb.configure(state="disabled")
         self.status_var.set("接続中...")
         self.count_var.set("サンプル数: 0")
         # FPS 計測の初期化
@@ -2334,9 +2448,13 @@ class App(tk.Tk):
                            "テストモード" if com_ports[i] == TEST_MODE else com_ports[i])
             for i in range(len(com_ports)))
         cam_desc = "カメラ同期 ON" if use_camera_sync else "カメラ同期 OFF"
-        msg = "計測を開始しました。{}（{}, {}, {}, {}）".format(
-            ports_desc, VNA_SPARAM, sweep_desc, opt_desc, cam_desc)
+        body_desc = "計測部位: {}".format(marker_group_label(body_key))
+        msg = "計測を開始しました。{}（{}, {}, {}, {}, {}）".format(
+            ports_desc, VNA_SPARAM, sweep_desc, opt_desc, cam_desc, body_desc)
         self._log(msg)
+        # どのマーカーをどの順で拾うかはログに残す(診断ログの並びと突き合わせるため)
+        self._log("{}のマーカー（配信順）: {}".format(
+            marker_group_label(body_key), ", ".join(MARKER_NAMES)))
         # 動画同期 ON のとき: 開始の絶対時刻を残す(webカメラ録画も計測開始と連動して始まる)。
         if use_camera_sync:
             self._log("開始時刻(壁時計): {}".format(_format_wallclock(time.time())))
@@ -2434,7 +2552,8 @@ class App(tk.Tk):
                 get_sweep=get_sweep,
                 get_frame=get_frame,
                 has_video=(self.camera is not None),
-                interval_ms=50)
+                interval_ms=50,
+                body_part=MARKER_GROUP)
         except Exception as e:
             self._log("[ライブ表示] 開けませんでした: {}".format(e))
             self.dashboard = None
@@ -2608,6 +2727,8 @@ class App(tk.Tk):
         self.camera_chk.configure(state="normal")
         self.camera_index_spin.configure(state="normal")
         self.live_chk.configure(state="normal")
+        for rb in self.body_radios:
+            rb.configure(state="normal")
         self.status_var.set("待機中")
         self.fps_var.set(self._fps_default_text())
 
