@@ -81,8 +81,26 @@ import argparse
 import datetime
 from pathlib import Path
 
+# Windows は既定で OS 側の画面拡大率(125%/150%等)を Tk ウィンドウへ丸ごと掛けて
+# 表示することがある。プロセスを DPI-aware にしておかないと、matplotlib 側は
+# figsize=(16, 9) のとおりレイアウト(文字サイズも図の箱もそのフラクション基準)して
+# いるのに、Tk がその出力を拡大率ぶんさらに引き伸ばして表示してしまい、文字だけが
+# 相対的に大きくなって凡例やラベルがカードからはみ出して見える(resize_event も
+# 発火しないため、こちらの再スケール処理では検知できない)。ここで DPI-aware を
+# 宣言し、OS 側の拡大をオフにして matplotlib のレイアウトどおりの見た目にする。
+if sys.platform == 'win32':
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
 import numpy as np
 import pandas as pd
+import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button, Slider, TextBox
 from matplotlib.ticker import MaxNLocator
@@ -584,7 +602,7 @@ def fmt_angle(v):
 #   基準サイズ(既定 10 pt)を上げることでまとめて追従させる。倍率を変えたいときは
 #   FONT_SCALE だけを書き換えればよい。
 # ------------------------------------------------------------------ #
-FONT_SCALE = 2.0
+FONT_SCALE = 2.4
 plt.rcParams['font.size'] = 10.0 * FONT_SCALE
 # フォントは Helvetica(regular)。Helvetica が無い環境では、字幅がほぼ同じ Arial に、
 # それも無ければ DejaVu Sans にフォールバックする(Windows は Arial があるので実質同じ見た目)。
@@ -609,11 +627,9 @@ def fs(size):
 #   各カラム/サブ領域の x・y 範囲をここで一元的に決め、カードも中身もこれを基準に置く。
 # ------------------------------------------------------------------ #
 fig = plt.figure(figsize=(16, 9))
-fig.suptitle(f'Dataset + Video Playback Viewer  ({LAYOUT["label"]})',
-             fontsize=fs(14), fontweight='bold', y=0.965)
 
-# 上段カードの縦範囲
-_TOP_Y0, _TOP_Y1 = 0.130, 0.915
+# 上段カードの縦範囲(見出し行を廃止したぶん、上端を図の上いっぱいまで広げる)
+_TOP_Y0, _TOP_Y1 = 0.130, 0.965
 
 # 左右カラムの x 範囲(画面をほぼ半分ずつ)
 _L_x0, _L_x1 = 0.010, 0.492               # 左カラム(動画 + 3D を 1 枠にまとめる)
@@ -653,7 +669,7 @@ def _add_card(x0, x1, y0, y1):
 _add_card(_L_x0, _L_x1, _TOP_Y0, _TOP_Y1)      # 左カード(動画 + 3D を 1 枠に)
 if HAS_SMITH:
     _add_card(_C_x0, _C_x1, _TOP_Y0, _TOP_Y1)  # スミス+誤差カード(右)
-_BOT_CARD = (0.010, 0.014, 0.990, 0.108)       # 操作系カード (x0, y0, x1, y1)
+_BOT_CARD = (0.010, 0.990, 0.014, 0.108)       # 操作系カード (x0, x1, y0, y1)
 _add_card(*_BOT_CARD)
 
 # --- 左: 動画パネル ---
@@ -700,7 +716,7 @@ else:
 # されない。_blit_regions にこの 1 行を覆う矩形(_HDR_REGION)を足して転送対象に含める。
 _ax3d_x = _B_x0 + 0.040
 _ax3d_w = (_B_x1 - _B_x0) - 0.080
-_ax3d_y = _TOP_Y0 + 0.062                       # 下: 凡例(2 段)のぶんを空ける
+_ax3d_y = _TOP_Y0 + 0.082                       # 下: 凡例(2 段)のぶんを空ける
 _ax3d_h = _ax3d_top - _ax3d_y                   # 上: 時刻・関節角度の 1 行のぶんを空ける
 _AX3D_RECT = [_ax3d_x, _ax3d_y, _ax3d_w, _ax3d_h]
 # 時刻・関節角度の 1 行を覆う blit 転送矩形(図座標)。
@@ -734,7 +750,7 @@ ax.set_xticklabels([]); ax.set_yticklabels([]); ax.set_zticklabels([])
 # 軸名を消したぶん、箱の中の立方体をさらに大きく見せる(既定は周囲の余白が多い)。
 # 古い matplotlib は zoom 引数が無いので無視する。
 try:
-    ax.set_box_aspect(None, zoom=1.3)
+    ax.set_box_aspect(None, zoom=1.15)
 except TypeError:
     pass
 
@@ -775,9 +791,26 @@ bone_lines = [ax.plot([], [], [], '-', color=c, lw=2.2, zorder=4, animated=True)
 
 # マーカー凡例は 3D ビューの下(3D カードの下端)に横並びで置く。枠(囲み)は付けず、
 # 薄めの文字にして“ごちゃつき”を抑える。左カラムは横に広いので 4 列に収める。
-ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.02), ncol=4,
-          fontsize=fs(6.0), columnspacing=1.2, labelspacing=0.4,
-          handletextpad=0.3, frameon=False)
+# 凡例(Legend)は行間・列間などの内部レイアウトを生成時の fontsize から計算して固定
+# するため、あとから中の文字だけ set_fontsize() しても内部の余白は追従しない
+# (ウィンドウを縮めても凡例の高さが縮まらず、下のボタン行にはみ出す)。そのため
+# ウィンドウサイズが変わったときは関数を呼び直して凡例そのものを作り直す
+# (_on_resize から _make_marker_legend(scale) を呼ぶ)。
+_marker_legend = None
+
+
+def _make_marker_legend(scale=1.0):
+    global _marker_legend
+    if _marker_legend is not None:
+        _marker_legend.remove()
+    _marker_legend = ax.legend(
+        loc='upper center', bbox_to_anchor=(0.5, -0.02), ncol=4,
+        fontsize=fs(6.0) * scale, columnspacing=1.2, labelspacing=0.4,
+        handletextpad=0.3, frameon=False)
+    return _marker_legend
+
+
+_make_marker_legend()
 # 時刻・関節角度(上半身=肘 / 下半身=膝)は 3D の箱の外(上)の 1 行に置く(箱の中だと
 # マーカーと重なり、上に 2 行取ると箱が小さくなるため)。時刻は控えめなグレー、
 # 関節角度は左右の色でそれぞれ示す。フレーム数や角度が大きい実データでも枠(左カード)に
@@ -812,20 +845,26 @@ if SMITH_MERGED:
     # 右カラムを上下 2 段(スミス上・相対誤差下)でしっかり埋めるため、スミスは
     # 大きめに取る。aspect='equal' なので実際の円径は箱の短辺で決まる(ここでは高さ)。
     # title_y(円の上)/ ztext_y(円の下 2 行)は箱に合わせた値にする。
-    _MERGED_RECT = [0.598, 0.45, 0.300, 0.40]
+    # 下段(相対誤差グラフ)の横軸ラベルぶんの余白を確保するため、スミス周り一式
+    # (チャート・タイトル・Z 読み出し)を少し上へ寄せておく。ここで一括して寄せた分、
+    # 下の ax_err もそのまま同じ量だけ上へ寄せれば、内部の間隔(Z 読み出しと相対誤差
+    # グラフの間)は変わらずに、グラフ下端とカード下端の余白だけが広がる。
+    _MERGED_RECT = [0.598, 0.48, 0.300, 0.40]
     _MERGED_CX = 0.748
     SMITH_BLOCK = {
-        'leftbody':  dict(rect=_MERGED_RECT, cx=_MERGED_CX, title_y=0.892, ztext_y=0.435),
-        'rightbody': dict(rect=_MERGED_RECT, cx=_MERGED_CX, title_y=0.892, ztext_y=0.398),
+        'leftbody':  dict(rect=_MERGED_RECT, cx=_MERGED_CX, title_y=0.922, ztext_y=0.465),
+        'rightbody': dict(rect=_MERGED_RECT, cx=_MERGED_CX, title_y=0.922, ztext_y=0.428),
     }
 else:
     # 右カラム(カード C)に 2 つ左右並び。各ブロックに中心 x(cx)を持たせ、
     # タイトルは上・Z 読み出しは下。カード上端に収まるようタイトルを少し下げる。
+    # (下段の相対誤差グラフの横軸ラベルぶんの余白を確保するため、上の SMITH_MERGED
+    #  と同様に一式を少し上へ寄せてある)
     SMITH_BLOCK = {
-        'leftbody':  dict(rect=[0.537, 0.585, 0.185, 0.235], cx=0.6295,
-                          title_y=0.892, ztext_y=0.568),
-        'rightbody': dict(rect=[0.772, 0.585, 0.185, 0.235], cx=0.8645,
-                          title_y=0.892, ztext_y=0.568),
+        'leftbody':  dict(rect=[0.537, 0.615, 0.185, 0.235], cx=0.6295,
+                          title_y=0.922, ztext_y=0.598),
+        'rightbody': dict(rect=[0.772, 0.615, 0.185, 0.235], cx=0.8645,
+                          title_y=0.922, ztext_y=0.598),
     }
 
 
@@ -959,10 +998,12 @@ if HAS_ERR:
     _emax = np.nanpercentile(_rel_all, 99) if np.any(np.isfinite(_rel_all)) else 100.0
     # 相対誤差グラフはスミスの下(カード C の下部)に置く。掃引モードはスミス 2 枚ぶんの
     # 幅を使うので、単一周波数モード(1 枚)より横に広げてカードいっぱいに描く。
+    # (上の SMITH_BLOCK と同じ量だけ上へ寄せ、横軸ラベル("Time (s)" 等)がカード下端の
+    #  外へはみ出さない余白を確保している)
     if SINGLE_FREQ:
-        ax_err = fig.add_axes([0.575, 0.180, 0.350, 0.150])
+        ax_err = fig.add_axes([0.575, 0.210, 0.350, 0.150])
     else:
-        ax_err = fig.add_axes([0.545, 0.180, 0.400, 0.150])
+        ax_err = fig.add_axes([0.545, 0.210, 0.400, 0.150])
     ax_err.set_ylim(0, max(float(_emax) * 1.1, 1.0))
     # 縦軸ラベル(回転文字)は枠の外・左隣のカードへ張り出しやすいので置かず、
     # 単位 [%] はタイトルに入れる。縦軸は目盛の数字だけで足りる。
@@ -1066,7 +1107,7 @@ elif HAS_SMITH:
     _finit = float(np.clip(DEFAULT_FREQ_MHZ, _fmin, _fmax))
     # スミスチャート(上)と相対誤差グラフ(下)の間の余白に置く。読み取り対象の周波数を
     # 選ぶスライダーなので、スミスの ★ / Z 読み出しの近くにあるほうが対応が判りやすい。
-    ax_freq = fig.add_axes([0.635, 0.455, 0.230, 0.022])
+    ax_freq = fig.add_axes([0.635, 0.485, 0.230, 0.022])
     freq_slider = Slider(ax_freq, 'Freq (MHz)', _fmin, _fmax,
                          valinit=_finit, valstep=_fstep, color='seagreen', valfmt='%.2f')
     state['freq'] = _finit
@@ -1222,11 +1263,32 @@ def _draw_animated():
             pass               # 一時的な描画例外で再生を止めない
 
 
+def _log_canvas_size(context):
+    """
+    診断用: 実際に描画されているキャンバスの物理ピクセルサイズと、matplotlib が
+    想定しているサイズ(dpi * 図の inch サイズ)を比較して出す。両者がズレていれば
+    OS 側の画面拡大率が Tk ウィンドウへ二重に掛かっている(文字だけ相対的に大きく
+    見え、カードからはみ出す)ことの確認になる。
+    """
+    try:
+        w_px, h_px = fig.canvas.get_width_height()
+    except Exception:
+        return
+    fig_w_in, fig_h_in = fig.get_size_inches()
+    expect_w, expect_h = fig.dpi * fig_w_in, fig.dpi * fig_h_in
+    print(f'[Info] [{context}] canvas 実測: {w_px}x{h_px}px '
+          f'/ dpi={fig.dpi:.1f} x 図サイズ{fig_w_in:.2f}x{fig_h_in:.2f}in '
+          f'= 想定{expect_w:.0f}x{expect_h:.0f}px'
+          + ('' if abs(w_px - expect_w) < 2 and abs(h_px - expect_h) < 2
+             else '  ← 実測と想定がズレています(OS の画面拡大率の影響の可能性)'))
+
+
 def _on_draw(_event=None):
     """
     図全体が描かれたとき(初回/リサイズ/3D 回転)に静的背景をキャッシュし直す。
     全体描画では animated アーティストは描かれないので、ここで描いて画面へ出す。
     """
+    _log_canvas_size('draw_event')
     try:
         state['bg'] = fig.canvas.copy_from_bbox(fig.bbox)
     except Exception:
@@ -1531,6 +1593,62 @@ if HAS_VIDEO:
         except Exception:
             pass
     fig.canvas.mpl_connect('close_event', on_close)
+
+# ------------------------------------------------------------------ #
+# 画面サイズが変わってもラベル/凡例が枠(カード)からはみ出さないようにする
+#   axes は add_axes([x0, y0, w, h]) で図に対する比率(0〜1)で置いているため、
+#   ウィンドウを拡大縮小すれば箱そのものは自動で追従する。だが文字サイズは pt 指定
+#   (絶対値)なので、ウィンドウを縮めると箱に対して相対的に文字が大きくなり、
+#   タイトルや凡例が箱からあふれる(逆に広げると小さすぎて余る)。
+#   → 設計時の基準サイズ(figsize=(16, 9))を基準に、図中の全文字(タイトル・軸ラベル・
+#     目盛・凡例・ウィジェット文字)の pt サイズをウィンドウの拡縮率に合わせて
+#     まとめて再スケールする。
+#
+#   ★注意(Windows の画面拡大率がある環境)★
+#   fig.get_size_inches() の比だけで拡縮率を決めると誤る。TkAgg は、ウィンドウが
+#   OS の拡大率が異なるモニタへ移動/リサイズされたとき、fig.dpi をその場で
+#   書き換える(例: 100 → 150)が、その際 fig.get_size_inches() は実際に描かれる
+#   物理ピクセル数と整合しなくなることがある(実測: dpi=150, 図サイズ 10.67x6.00in
+#   なのに実際のキャンバスは 1066x600px = dpi*inches の 1600x900px より小さい)。
+#   文字は pt(= 1/72 inch)を fig.dpi で物理ピクセルに変換して描かれるため、
+#   「物理ピクセル数」と「dpi」の両方を実測して比を取らないと、dpi だけ増えた分
+#   文字が縮み切らずカードからはみ出す。そこで inches ではなく、実測ピクセル数を
+#   実測 dpi で割った「実効 inch 数」を基準に拡縮率を決める。
+# ------------------------------------------------------------------ #
+_BASE_PX_W, _BASE_PX_H = fig.canvas.get_width_height()
+_BASE_DPI = fig.dpi
+# マーカー凡例(_marker_legend)は resize のたびに作り直す(内部余白を正しく再計算
+# させるため。上のコメント参照)ので、その中の文字は汎用の一括リスケール対象から
+# 除いておく(作り直し後の古いテキストが辞書に残ってもリークするだけで実害は無いが、
+# 二重にスケールが掛からないようにする意味で除外する)。
+_LEGEND_TEXTS = set(_marker_legend.get_texts()) if _marker_legend is not None else set()
+_BASE_FONT_SIZES = {t: t.get_fontsize() for t in fig.findobj(match=matplotlib.text.Text)
+                    if t not in _LEGEND_TEXTS}
+
+
+def _on_resize(_event=None):
+    cur_px_w, cur_px_h = fig.canvas.get_width_height()
+    cur_dpi = fig.dpi
+    # 「物理ピクセル数 / dpi」を実効 inch 数として比べる(dpi 自体の変化も含めて
+    # 補正される。理由は上のコメントを参照)。縦横どちらか狭いほうに合わせる。
+    scale_w = (cur_px_w / cur_dpi) / (_BASE_PX_W / _BASE_DPI)
+    scale_h = (cur_px_h / cur_dpi) / (_BASE_PX_H / _BASE_DPI)
+    scale = min(scale_w, scale_h)
+    scale = float(np.clip(scale, 0.4, 2.5))
+    for txt, base_size in _BASE_FONT_SIZES.items():
+        try:
+            txt.set_fontsize(base_size * scale)
+        except Exception:
+            pass
+    _make_marker_legend(scale)
+    # 文字サイズが変わると凡例・軸の実サイズも変わるので、blit 用の背景/転送領域は
+    # 次回の draw_event(このあとの draw_idle が発火させる)で取り直させる。
+    state['bg'] = None
+    state['regions'] = None
+    fig.canvas.draw_idle()
+
+
+fig.canvas.mpl_connect('resize_event', _on_resize)
 
 # 初期表示
 if HAS_VIDEO:
