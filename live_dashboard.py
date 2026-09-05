@@ -143,6 +143,87 @@ SMITH_GRID_X = (0.2, 0.5, 1.0, 2.0, 5.0)   # 定リアクタンス円 x = X/Z0 (
 # 「その周波数の Γ が時間とともにどう動いたか」を見えるようにする。
 SINGLE_FREQ_TRAIL = 300
 
+# 特性インピーダンス[Ω]。Γ(=S11) から Z を復元して左右の相対誤差を出すのに使う。
+Z0 = 50.0
+
+
+def gamma_to_z(gamma, z0=Z0):
+    """
+    反射係数 Γ(=S11)から Z0 基準のインピーダンス Z = Z0 (1+Γ)/(1-Γ) を求める。
+    Γ≈1(開放)では発散するので、その点は NaN にして比較から外す。
+    """
+    g = np.asarray(gamma, dtype=complex).ravel()
+    den = 1.0 - g
+    bad = ~np.isfinite(g) | (np.abs(den) < 1e-12)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        z = z0 * (1.0 + g) / np.where(bad, 1.0, den)
+    z[bad] = complex(np.nan, np.nan)
+    return z
+
+
+def lr_channel_indices(names):
+    """
+    チャンネル名から (左の index, 右の index) を返す。名前に 'left'/'right' を含むもの
+    (既定では leftbody / rightbody)を探し、揃わなければ None(比較パネルを出さない)。
+    """
+    left = right = None
+    for i, nm in enumerate(names):
+        s = str(nm).lower()
+        if left is None and 'left' in s:
+            left = i
+        if right is None and 'right' in s:
+            right = i
+    if left is None or right is None or left == right:
+        return None
+    return (left, right)
+
+
+def relative_errors(z_left, z_right):
+    """
+    右(z_right)を基準にした左(z_left)のインピーダンス相対誤差[%]を dict で返す。
+
+    掃引モードでは周波数点ごとに誤差を求めてから有効点で平均する(点ごとに Z が
+    大きく変わるため、「平均どうしの比」より「点ごとの比の平均」の方が意味がある)。
+    単一周波数(1点)モードでは、その 1 点の値がそのまま返る。
+      'mag'  : (|Z_L| - |Z_R|) / |Z_R|      ... 大きさの相対誤差(符号つき)
+      'r'    : (R_L  - R_R)  / |R_R|        ... 抵抗分の相対誤差(符号つき)
+      'x'    : (X_L  - X_R)  / |X_R|        ... リアクタンス分の相対誤差(符号つき)
+      'cplx' : |Z_L - Z_R| / |Z_R|          ... 複素差の大きさ(符号なし)
+      'absl' / 'absr' : 各側の |Z| 平均[Ω](表示用)
+    基準側が 0 に近い点は 0 割りになるので、その項目からは除外する。
+    """
+    out = dict(mag=float('nan'), r=float('nan'), x=float('nan'), cplx=float('nan'),
+               absl=float('nan'), absr=float('nan'), n=0)
+    if z_left is None or z_right is None:
+        return out
+    zl = np.asarray(z_left, dtype=complex).ravel()
+    zr = np.asarray(z_right, dtype=complex).ravel()
+    n = min(zl.size, zr.size)
+    if n == 0:
+        return out
+    zl = zl[:n]
+    zr = zr[:n]
+    ok = np.isfinite(zl) & np.isfinite(zr)
+    if not ok.any():
+        return out
+    zl = zl[ok]
+    zr = zr[ok]
+    out['n'] = int(zl.size)
+    out['absl'] = float(np.mean(np.abs(zl)))
+    out['absr'] = float(np.mean(np.abs(zr)))
+
+    def _rel(num, den):
+        m = np.abs(den) > 1e-9
+        if not m.any():
+            return float('nan')
+        return float(np.mean(num[m] / np.abs(den[m])) * 100.0)
+
+    out['mag'] = _rel(np.abs(zl) - np.abs(zr), np.abs(zr))
+    out['r'] = _rel(zl.real - zr.real, zr.real)
+    out['x'] = _rel(zl.imag - zr.imag, zr.imag)
+    out['cplx'] = _rel(np.abs(zl - zr), np.abs(zr))
+    return out
+
 
 def smith_r_circle(r, n=181):
     """
@@ -225,6 +306,9 @@ class LiveDashboard:
         # 「直近サンプルの軌跡 + 現在値」を描く表示に切り替える。
         self.single_freq = (self.freq_grid_hz.size <= 1)
         self._trail = {}   # {ch_index: deque[(re, im)]}(単一周波数モードのみ使用)
+        # 左右のインピーダンス相対誤差パネル用: (左の ch index, 右の ch index)。
+        # 左右が揃わない構成(1台だけ等)では None にしてパネルを出さない。
+        self._lr_idx = lr_channel_indices(self.channel_names)
         self.get_positions = get_positions
         self.get_sweep = get_sweep
         self.get_frame = get_frame
@@ -336,12 +420,13 @@ class LiveDashboard:
             fmax = self.freq_grid_hz.max() / 1e6
         else:
             fmin = fmax = float('nan')
-        # 縦に n 個並べる(右側 30% 幅)
+        # 縦に n 個並べる(右側 30% 幅)。左右比較パネルを出すときはその高さぶん上に詰める。
+        err_h = 0.11 if self._lr_idx is not None else 0.0
         for i, name in enumerate(self.channel_names):
             st = SMITH_STYLE.get(name, dict(color=_FALLBACK_COLORS[i % len(_FALLBACK_COLORS)],
                                             label=name))
-            h = 0.86 / n
-            bottom = 0.06 + (n - 1 - i) * h
+            h = (0.86 - err_h) / n
+            bottom = 0.06 + err_h + (n - 1 - i) * h
             axs = self.fig.add_axes([0.66, bottom + 0.06, 0.30, h - 0.10])
             draw_smith_grid(axs)
             if self.single_freq:
@@ -359,6 +444,18 @@ class LiveDashboard:
             self._smith_start[i] = start_pt
             self._trail[i] = collections.deque(maxlen=SINGLE_FREQ_TRAIL)
 
+        # --- 左右インピーダンスの相対誤差(基準=右)パネル ---
+        # スミスチャートの下に置き、毎ティック blit で更新する。
+        self._zerr_txt = None
+        if self._lr_idx is not None:
+            ax_e = self.fig.add_axes([0.655, 0.015, 0.33, err_h - 0.02])
+            ax_e.axis('off')
+            ax_e.set_xlim(0, 1)
+            ax_e.set_ylim(0, 1)
+            self._zerr_txt = ax_e.text(
+                0.0, 1.0, '', transform=ax_e.transAxes, ha='left', va='top',
+                fontsize=8.5, family='monospace', linespacing=1.45, animated=True)
+
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.win)
         self._tkwidget = self.canvas.get_tk_widget()
         self._tkwidget.pack(fill="both", expand=True)
@@ -370,6 +467,8 @@ class LiveDashboard:
             self._anim.append(self._smith_start[i])
         self._anim += [self._ang_line_r, self._ang_line_l,
                        self._time_txt, self._angle_txt_r, self._angle_txt_l]
+        if self._zerr_txt is not None:
+            self._anim.append(self._zerr_txt)
         if self.has_video:
             self._anim.append(self._video_img)
 
@@ -459,6 +558,40 @@ class LiveDashboard:
         work_ms = (time.perf_counter() - t0) * 1000.0
         self._schedule(max(5, self._fast_ms - work_ms))
 
+    def _zerr_text(self, latest_s11):
+        """
+        左右のインピーダンス相対誤差(基準=右)を表示用の文字列にする。
+        Γ(=S11) から Z=Z0(1+Γ)/(1-Γ) を復元し、右を基準とした左の相対誤差を出す。
+        掃引モードでは周波数点ごとの誤差を平均した値(sweep mean)を示す。
+        図中の文字は英語(matplotlib の既定フォントに日本語が無いため)。
+        """
+        li, ri = self._lr_idx
+        if self.single_freq and self.freq_grid_hz.size:
+            head = 'Impedance Rel. Error   (ref = Right @ {:.4f} MHz)'.format(
+                self.freq_grid_hz[0] / 1e6)
+        else:
+            head = 'Impedance Rel. Error   (ref = Right, sweep mean)'
+        s_l = latest_s11.get(li)
+        s_r = latest_s11.get(ri)
+        if s_l is None or s_r is None:
+            return head + '\n  waiting for both channels ...'
+        e = relative_errors(gamma_to_z(s_l), gamma_to_z(s_r))
+
+        def f(v, sign=True):
+            if not np.isfinite(v):
+                return '  --  '
+            return ('{:+7.2f}' if sign else '{:7.2f}').format(v)
+
+        def g(v):
+            return '  --  ' if not np.isfinite(v) else '{:.1f}'.format(v)
+
+        return '\n'.join((
+            head,
+            '|Z| {} %    L {} / R {} ohm'.format(f(e['mag']), g(e['absl']), g(e['absr'])),
+            'R   {} %    X {} %'.format(f(e['r']), f(e['x'])),
+            '|dZ|/|Z_R| {} %'.format(f(e['cplx'], sign=False)),
+        ))
+
     def _refresh(self):
         """最新の共有状態を各 animated アーティストへ反映する。3D 範囲が広がったら True。"""
         now = time.perf_counter() - self._t0
@@ -514,11 +647,13 @@ class LiveDashboard:
         self._ang_line_l.set_data(t_arr, np.fromiter(self._hist_l, float))
 
         # --- スミスチャート(各チャンネルの最新掃引 Γ=S11) ---
+        latest_s11 = {}          # 相対誤差パネルで使い回す(get_sweep を 2 度呼ばない)
         for i, line in self._smith_lines.items():
             s11 = self.get_sweep(i) if self.get_sweep else None
             if s11 is None:
                 continue
             s11 = np.asarray(s11)
+            latest_s11[i] = s11
             re = s11.real
             im = s11.imag
             mask = np.isfinite(re) & np.isfinite(im)
@@ -544,6 +679,10 @@ class LiveDashboard:
                 self._smith_start[i].set_data([re[mask][0]], [im[mask][0]])
             else:
                 self._smith_start[i].set_data([], [])
+
+        # --- 左右インピーダンスの相対誤差(基準=右)---
+        if self._zerr_txt is not None:
+            self._zerr_txt.set_text(self._zerr_text(latest_s11))
 
         # --- カメラ映像 ---
         if self.has_video and self.get_frame is not None:

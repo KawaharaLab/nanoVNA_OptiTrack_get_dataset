@@ -171,6 +171,7 @@ Z0             = 50.0          # 特性インピーダンス [Ω]
 # 1 台だけ使う場合は ["leftbody"] のように 1 要素にする。
 VNA_CHANNEL_NAMES = ["leftbody", "rightbody"]
 
+
 # --- 交互計測(RF 干渉対策) ---
 # 2 台の nanoVNA を「同時に」掃引すると、両機が同じ周波数帯で同時に送信するため RF が
 # 干渉し、両方のインピーダンスに大きなノイズが乗る。これを防ぐため、既定では実機を
@@ -769,6 +770,54 @@ def s11_sweep_to_z(s11_array, freqs_hz=FREQ_GRID_HZ, z0=Z0):
     ntwk = rf.Network(frequency=freq, s=s, z0=z0)
     z11 = ntwk.z[:, 0, 0]
     return z11.real, z11.imag
+
+
+def format_relative_error(z_left, z_right, freq_mhz=None, ref_name="rightbody"):
+    """
+    右(z_right)を基準にした左(z_left)のインピーダンス相対誤差[%]を 1 行の文字列にする。
+    z_left / z_right は複素インピーダンス Z = R + jX。表示する項目は次の 4 つ:
+      |Z|   : (|Z_L| - |Z_R|) / |Z_R|   ... 大きさの相対誤差(符号つき)
+      R     : (R_L  - R_R)  / |R_R|     ... 抵抗分の相対誤差(符号つき)
+      X     : (X_L  - X_R)  / |X_R|     ... リアクタンス分の相対誤差(符号つき)
+      |ΔZ|  : |Z_L - Z_R|  / |Z_R|      ... 複素差の大きさ(符号なし。R と X のずれを合算)
+    基準側が 0 に近い項目は 0 割りになるため "--" と表示する。
+    """
+    def rel(num, den):
+        if not np.isfinite(num) or not np.isfinite(den) or abs(den) < 1e-9:
+            return "--"
+        return "{:+.2f} %".format(num / abs(den) * 100.0)
+
+    def rel_abs(num, den):
+        if not np.isfinite(num) or not np.isfinite(den) or abs(den) < 1e-9:
+            return "--"
+        return "{:.2f} %".format(num / abs(den) * 100.0)
+
+    head = "相対誤差 (基準={}".format(ref_name)
+    head += " @ {:.4f} MHz)".format(freq_mhz) if freq_mhz is not None else ")"
+    return "{}:  |Z| {}   R {}   X {}   |ΔZ|/|Z| {}".format(
+        head,
+        rel(abs(z_left) - abs(z_right), abs(z_right)),
+        rel(z_left.real - z_right.real, z_right.real),
+        rel(z_left.imag - z_right.imag, z_right.imag),
+        rel_abs(abs(z_left - z_right), abs(z_right)))
+
+
+def lr_channel_indices(names=VNA_CHANNEL_NAMES):
+    """
+    チャンネル名から (左の index, 右の index) を返す。名前に "left"/"right" を含むもの
+    (既定では leftbody / rightbody)を探し、両方が揃わなければ None を返す
+    (1 台だけの構成などでは左右の相対誤差を表示しない)。
+    """
+    left = right = None
+    for i, nm in enumerate(names):
+        low = str(nm).lower()
+        if left is None and "left" in low:
+            left = i
+        if right is None and "right" in low:
+            right = i
+    if left is None or right is None or left == right:
+        return None
+    return (left, right)
 
 
 # =============================================================================
@@ -2119,6 +2168,9 @@ class App(tk.Tk):
             parts.append("{}: {:.1f}".format(name, f))
         return " / ".join(parts) + " FPS"
 
+    # 左右の相対誤差がまだ出せないとき(片方の掃引待ち/読み取り周波数が不正)の表示
+    _RELERR_EMPTY = "相対誤差 (基準=右): --"
+
     # ---- リアルタイムグラフ(スミスチャート)の構築 ----
     def _build_plot(self, pad):
         plot_frame = ttk.LabelFrame(
@@ -2171,6 +2223,15 @@ class App(tk.Tk):
                       font=("", 10, "bold")).pack(anchor="w")
             self.readout_vars.append(var)
 
+        # 左右のインピーダンス相対誤差(基準=右)。読み取り周波数の 1 点で計算して
+        # 「左が右に対してどれだけずれているか」を計測中にそのまま読めるようにする。
+        self._lr_idx = lr_channel_indices(VNA_CHANNEL_NAMES)
+        self.relerr_var = None
+        if self._lr_idx is not None:
+            self.relerr_var = tk.StringVar(value=self._RELERR_EMPTY)
+            ttk.Label(readout_box, textvariable=self.relerr_var, foreground="#444444",
+                      font=("", 10, "bold")).pack(anchor="w", pady=(3, 0))
+
     def _reconfigure_plot(self, start_hz, stop_hz, points):
         """掃引条件の変更にあわせてスミスチャートの周波数グリッドとトレースをリセットする。"""
         self._plot_freq_hz = np.asarray(
@@ -2181,6 +2242,8 @@ class App(tk.Tk):
             self._marker_lines[i].set_data([], [])
             self._smith_trail[i].clear()   # 前回計測の軌跡を持ち越さない
             self.readout_vars[i].set("{}:  Z = --".format(VNA_CHANNEL_NAMES[i]))
+        if getattr(self, "relerr_var", None) is not None:
+            self.relerr_var.set(self._RELERR_EMPTY)
         # 単一周波数モードは「掃引の形」ではなく「1 点が時間とともに動く軌跡」を見る表示になる。
         for ax, name in zip(self._smith_axes, VNA_CHANNEL_NAMES):
             if single:
@@ -2207,6 +2270,8 @@ class App(tk.Tk):
         payload: [(s11_complex, z_r, z_x), ...]（チャンネル順）。メインスレッドから呼ぶこと。
         """
         n = min(len(payload), len(self._trace_lines))
+        z_at = {}          # {ch index: 読み取り周波数での複素 Z}(左右の相対誤差用)
+        f_read_mhz = None  # そのときの読み取り周波数[MHz]
         for i in range(n):
             s11, z_r, z_x = payload[i]
             s11 = np.asarray(s11)
@@ -2234,10 +2299,21 @@ class App(tk.Tk):
                 r = float(z_r[idx])
                 x = float(z_x[idx])
                 f_mhz = float(self._plot_freq_hz[idx]) / 1e6
+                z_at[i] = complex(r, x)
+                f_read_mhz = f_mhz
                 sign = "+" if x >= 0 else "-"
                 self.readout_vars[i].set(
                     "{}:  Z = {:.2f} {} j{:.2f} Ω   |S11|={:.3f}   @ {:.4f} MHz".format(
                         name, r, sign, abs(x), abs(g), f_mhz))
+
+        # 左右のインピーダンス相対誤差(基準=右)。両チャンネルの Z が揃ったときだけ更新する。
+        if getattr(self, "relerr_var", None) is not None:
+            li, ri = self._lr_idx
+            if li in z_at and ri in z_at:
+                self.relerr_var.set(format_relative_error(
+                    z_at[li], z_at[ri], f_read_mhz, VNA_CHANNEL_NAMES[ri]))
+            else:
+                self.relerr_var.set(self._RELERR_EMPTY)
         self.canvas.draw_idle()
 
     # ---- COM ポート一覧のスキャン/再検索 ----
